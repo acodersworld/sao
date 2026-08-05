@@ -85,26 +85,100 @@ strong candidate.
 SAO is statically typed. Programs are rejected when their operations cannot be
 shown to be type-safe.
 
-Local variables may be inferred:
+Local binding types may be inferred:
 
 ```text
-let count = 10;
-let ratio = 0.5;
+const count = 10;
+const ratio = 0.5;
 ```
 
 Types may also be written on the declaration:
 
 ```text
-let count: int = 10;
-let ratio: float = 0.5;
+const count: int = 10;
+const ratio: float = 0.5;
 ```
 
-Mutation is explicit:
+Binding mutability is explicit:
 
 ```text
-let mut position: int = 0;
+mut position: int = 0;
 position += 1;
+
+const origin: int = 0;
+origin = 1; // Type error: a const binding cannot be reassigned.
 ```
+
+`const` and `mut` declare local bindings; SAO has no `let` keyword and no
+unqualified local declaration. A `const` binding cannot be reassigned or used
+to mutate a referenced object. A `mut` binding can be reassigned and permits
+mutation through its reference.
+
+For reference types, `const` is a transitive read-only access capability rather
+than a deep-immutability guarantee:
+
+```text
+mut user = User { name: "Ben" };
+const view = user;       // Allowed: mut access may be reduced to const.
+
+user.name = "Benjamin"; // Allowed through the mut reference.
+view.name = "Robert";   // Type error: view is const.
+view = another_user;    // Type error: the binding is const.
+```
+
+Access through a `const` reference remains const through fields and other
+references reached from it. A `const` reference cannot be assigned or passed to
+a location requiring `mut`. Multiple aliases are allowed, so the object observed
+through `view` may still change through `user` or another `mut` alias. SAO does
+not enforce uniqueness, ownership, borrowing, or lifetimes.
+
+These capability restrictions apply to references. Independently copied value
+types may use a different binding qualifier because changing the copy cannot
+affect the source:
+
+```text
+const original = 10;
+mut copy = original; // Allowed: int is copied by value.
+copy += 1;
+```
+
+Function parameters and implicit bindings such as iterator variables are const
+by default and omit the `const` keyword. A parameter that requires mutable
+access is marked `mut`:
+
+```text
+fn display(user: User) -> () {
+    print(user.name);
+}
+
+fn rename(mut user: User, name: string) -> () {
+    user.name = name;
+}
+```
+
+A `mut` argument may be passed to either parameter form. A `const` argument may
+only be passed to the default const form.
+
+Reference return types are also const by default. Returning mutable access is
+explicit with `mut`:
+
+```text
+fn current_user() -> User {
+    // Returns const access.
+}
+
+fn create_user(name: string) -> mut User {
+    User { name: name }
+}
+```
+
+A function declared to return a const reference may return either const or mut
+access, reducing mut to const when necessary. A function declared `-> mut T`
+must return mut access. The qualifier is part of function and method signatures,
+including anonymous-function types and interface requirements. A return
+capability qualifier is unnecessary for copied value types such as `int`.
+Within a union, `mut` qualifies the immediately following reference member, so
+`-> mut User | none` returns either mutable access to a `User` or `none`.
 
 ### 3.1 Primitive types
 
@@ -143,7 +217,7 @@ and may produce infinity rather than panicking.
 
 Current inference boundary:
 
-- Local variable types may be inferred from their initializer and context.
+- Local binding types may be inferred from their initializer and context.
 - Inference must resolve to one unambiguous type.
 - Inference never synthesizes a union merely because different paths produce
   different types.
@@ -174,9 +248,9 @@ Blocks are expressions. The final expression without a semicolon is the value of
 the block:
 
 ```text
-let distance = {
-    let x = 10.0;
-    let y = 20.0;
+const distance = {
+    const x = 10.0;
+    const y = 20.0;
 
     sqrt(x * x + y * y)
 };
@@ -218,7 +292,7 @@ fn divide(left: float, right: float) -> float {
 resolve to the same single type:
 
 ```text
-let value = if condition {
+const value = if condition {
     42
 } else {
     3.14
@@ -230,7 +304,7 @@ let value = if condition {
 Different branch types require an explicit type that accepts them:
 
 ```text
-let value: int | float = if condition {
+const value: int | float = if condition {
     42
 } else {
     3.14
@@ -247,10 +321,11 @@ Structs are nominal. Their identity comes from their declaration, not merely
 from their fields.
 
 All named and anonymous structs have reference semantics. Constructing a struct
-allocates a garbage-collected object. Assignment, parameter passing, returning,
-and capture copy the reference rather than the object's fields. SAO performs no
-implicit deep copies and has no ownership, borrowing, or move semantics. If
-mutation is permitted, every alias observes changes to the same object.
+allocates a garbage-collected object and initially produces mut access to it.
+Assignment, parameter passing, returning, and capture copy the reference rather
+than the object's fields, subject to the `mut`-to-`const` capability rules. SAO
+performs no implicit deep copies and has no ownership, borrowing, or move
+semantics. Every mutable alias observes and may change the same object.
 
 ```text
 struct Position {
@@ -276,7 +351,7 @@ fn teleport(destination: Position) -> () {
     // ...
 }
 
-let velocity = Velocity { x: 1.0, y: 2.0 };
+const velocity = Velocity { x: 1.0, y: 2.0 };
 teleport(velocity); // Type error.
 ```
 
@@ -285,7 +360,7 @@ Conversions between nominal structs are explicit.
 Struct construction is provisionally written:
 
 ```text
-let position = Position {
+const position = Position {
     x: 10.0,
     y: 20.0,
 };
@@ -299,9 +374,9 @@ Anonymous structs use the same model. A `struct { ... }` expression declares a
 hidden nominal type and constructs a value of that type:
 
 ```text
-let position = struct {
-    let x: float = 10.0;
-    let y: float = 20.0;
+const position = struct {
+    x: float = 10.0;
+    y: float = 20.0;
 
     fn magnitude(self) -> float {
         sqrt(self.x * self.x + self.y * self.y)
@@ -313,8 +388,28 @@ The source program cannot name the anonymous struct's generated type, but local
 inference may retain that one exact hidden type. It may be passed to any
 structural interface that its methods satisfy.
 
-The method receiver `self` is a reference to the original object. Field
-mutability and the permissions granted through `self` are not yet defined.
+Fields do not have individual `const` or `mut` qualifiers. A field is writable
+when reached through a `mut` reference and transitively read-only when reached
+through a `const` reference. Reference-valued field initialization and
+assignment must not convert const access back to mut; a const reference cannot
+be placed where later mutable field access would recover mut capability.
+
+The method receiver `self` is a const reference to the original object by
+default. A method requiring mutable access declares `mut self`:
+
+```text
+fn describe(self) -> string {
+    self.name
+}
+
+fn rename(mut self, name: string) -> () {
+    self.name = name;
+}
+```
+
+A const method may be called through either capability. A `mut self` method may
+only be called through a mut reference. Receiver capability is part of a method
+signature and participates in interface matching.
 
 ## 6. Go-like structural interfaces
 
@@ -371,8 +466,8 @@ interface Greeter {
     fn greet(self, name: string) -> string;
 }
 
-let greeter = Greeter {
-    let prefix: string = "Hello";
+const greeter = Greeter {
+    prefix: string = "Hello";
 
     fn greet(self, name: string) -> string {
         self.prefix + ", " + name
@@ -390,7 +485,9 @@ Anonymous interface object rules:
 - `Interface { ... }` constructs a hidden implementation.
 - General `struct { ... }` expressions construct unconstrained anonymous
   structs.
-- `let` declarations at object scope define hidden fields.
+- Field initializers at object scope define hidden fields and are written
+  `name: Type = expression;`. The type annotation may be omitted when it can be
+  inferred unambiguously.
 - Hidden field types may be inferred or explicitly annotated.
 - All required interface methods must be present.
 - Method return types remain explicit.
@@ -424,9 +521,9 @@ anonymous struct shares the same capture environment.
 Capture rules:
 
 - Captures are discovered automatically from free-variable references.
-- An immutable `let` binding is captured as the value it holds when the
+- A `const` binding is captured as the value it holds when the
   anonymous value is created.
-- A mutable `let mut` binding is captured as a shared binding. Mutations are
+- A `mut` binding is captured as a shared binding. Mutations are
   visible to the outer scope and to every anonymous value that captures it.
 - A captured binding remains alive for as long as any capturing value can use
   it, even after its original lexical scope has returned.
@@ -436,15 +533,15 @@ Capture rules:
 - Parameters and locals inside a method or anonymous function shadow captures
   with the same name.
 
-Explicit fields and captures are distinct. A `let` declared at anonymous-struct
-scope is an owned field and is accessed through `self`; a bare reference to an
-outer binding is a capture:
+Explicit fields and captures are distinct. A field initializer at
+anonymous-struct scope creates owned storage accessed through `self`; a bare
+reference to an outer binding is a capture:
 
 ```text
-let prefix = "log: ";
+const prefix = "log: ";
 
-let formatter = struct {
-    let suffix = "\n";
+const formatter = struct {
+    suffix = "\n";
 
     fn format(self, message: string) -> string {
         prefix + message + self.suffix
@@ -462,9 +559,9 @@ Anonymous functions are expressions written with `fn` and an explicit
 signature:
 
 ```text
-let factor = 1.5;
+const factor = 1.5;
 
-let scale = fn(value: float) -> float {
+const scale = fn(value: float) -> float {
     value * factor
 };
 ```
@@ -476,9 +573,9 @@ captured environment.
 Mutable captures are shared:
 
 ```text
-let mut count = 0;
+mut count = 0;
 
-let next = fn() -> int {
+const next = fn() -> int {
     count += 1;
     count
 };
@@ -514,7 +611,7 @@ only value. Types are not implicitly optional: absence must be included
 explicitly with a union.
 
 ```text
-let result: int | none = none;
+const result: int | none = none;
 ```
 
 An optional value is therefore an ordinary union such as `int | none`; SAO does
@@ -524,8 +621,8 @@ member require the same narrowing as other union types.
 SAO uses `&` for intersection types:
 
 ```text
-fn copy(stream: Reader & Writer) -> () {
-    let data = stream.read(4096);
+fn copy(mut stream: Reader & Writer) -> () {
+    const data = stream.read(4096);
     stream.write(data);
 }
 ```
@@ -534,12 +631,12 @@ A value of `Reader & Writer` must satisfy both interfaces. Intersections can als
 be used for anonymous implementations:
 
 ```text
-let stream = Reader & Writer {
-    fn read(self, count: int) -> Bytes {
+mut stream = Reader & Writer {
+    fn read(mut self, count: int) -> Bytes {
         // ...
     }
 
-    fn write(self, data: Bytes) -> int {
+    fn write(mut self, data: Bytes) -> int {
         // ...
     }
 };
@@ -582,7 +679,7 @@ The postfix `?` operator propagates an error without exceptions:
 
 ```text
 fn caller() -> int | Error<string> {
-    let value = myfunc()?;
+    const value = myfunc()?;
     value + 1
 }
 ```
@@ -597,7 +694,7 @@ Error payloads can use ordinary SAO types and unions:
 
 ```text
 fn load() -> Config | Error<ParseError | IoError> {
-    let text = read_file("config.sao")?;
+    const text = read_file("config.sao")?;
     parse(text)
 }
 ```
@@ -629,7 +726,7 @@ for item in items {
     // Iterator loop.
 }
 
-for let mut index = 0; index < 10; index += 1 {
+for mut index = 0; index < 10; index += 1 {
     // Traditional three-clause loop.
 }
 ```
@@ -641,8 +738,8 @@ Every loop form is an expression and may produce a value with `break value`.
 An infinite loop can only complete by breaking or transferring control elsewhere:
 
 ```text
-let command = loop {
-    let input = read_line();
+const command = loop {
+    const input = read_line();
 
     if input != "" {
         break input;
@@ -660,7 +757,7 @@ executing `break`. When such a loop is used to produce a non-unit value, it must
 have an `else` block that supplies the natural-completion value:
 
 ```text
-let admin: User | none = for user in users {
+const admin: User | none = for user in users {
     if user.is_admin {
         break user;
     }
@@ -675,7 +772,7 @@ The `else` block executes only when the loop completes naturally, not after a
 Traditional loops follow the same rule:
 
 ```text
-let divisor = for let mut candidate = 2;
+const divisor = for mut candidate = 2;
                   candidate < value;
                   candidate += 1
 {
@@ -708,7 +805,7 @@ let divisor = for let mut candidate = 2;
 Labels allow a nested loop to produce the result of an outer loop:
 
 ```text
-let result: Cell | none = outer: for row in grid {
+const result: Cell | none = outer: for row in grid {
     for cell in row {
         if cell.matches(target) {
             break outer cell;
@@ -728,7 +825,7 @@ SAO has Go-like `defer` syntax with lexical block scope:
 
 ```text
 fn read_file(path: string) -> string {
-    let file = File.open(path);
+    mut file = File.open(path);
     defer file.close();
 
     file.read_all()
@@ -761,7 +858,7 @@ iteration:
 
 ```text
 for path in paths {
-    let file = File.open(path);
+    mut file = File.open(path);
     defer file.close();
 
     process(file);
@@ -781,8 +878,8 @@ SAO's semantics should not depend on non-standard C extensions.
 Expression blocks can lower to temporaries:
 
 ```text
-let result = {
-    let value = calculate();
+const result = {
+    const value = calculate();
     value + 1
 };
 ```
@@ -906,21 +1003,19 @@ does not need to support them.
 
 The following decisions are intentionally unresolved:
 
-1. **Mutation:** field mutability, whether `let` only prevents rebinding, and
-   whether methods need an explicit mutable receiver form.
-2. **Numeric and text details:** numeric conversion rules, floating-point edge
+1. **Numeric and text details:** numeric conversion rules, floating-point edge
    cases, string encoding and indexing, and the byte-sequence API.
-3. **Union layout:** specialized unions versus a universal tagged `Value`.
-4. **Interface values:** equality, downcasting, and runtime type metadata.
-5. **Generics:** syntax, constraints, inference, monomorphization, and interface
+2. **Union layout:** specialized unions versus a universal tagged `Value`.
+3. **Interface values:** equality, downcasting, and runtime type metadata.
+4. **Generics:** syntax, constraints, inference, monomorphization, and interface
    interaction.
-6. **Modules:** imports, visibility, access control, and separate compilation.
-7. **Pattern matching:** whether and when it joins the initial implementation.
-8. **Closure representation:** exact environment layout, thread safety, and
+5. **Modules:** imports, visibility, access control, and separate compilation.
+6. **Pattern matching:** whether and when it joins the initial implementation.
+7. **Closure representation:** exact environment layout, thread safety, and
    possible explicit capture-list syntax.
-9. **Coroutines:** syntax, yielded and resumed value types, cancellation,
+8. **Coroutines:** syntax, yielded and resumed value types, cancellation,
    abandonment, cleanup, and whether coroutines are stackless or stackful.
-10. **Concurrency and async:** intentionally postponed; their relationship to
+9. **Concurrency and async:** intentionally postponed; their relationship to
     coroutines remains to be designed.
 
 ## 15. Current language sketch
@@ -930,29 +1025,29 @@ error syntax remain illustrative:
 
 ```text
 interface Reader {
-    fn read(self, count: int) -> Bytes;
+    fn read(mut self, count: int) -> Bytes;
 }
 
 interface Writer {
-    fn write(self, data: Bytes) -> int;
+    fn write(mut self, data: Bytes) -> int;
 }
 
 struct Buffer {
     data: Bytes,
     position: int,
 
-    fn read(self, count: int) -> Bytes {
+    fn read(mut self, count: int) -> Bytes {
         // Implementation omitted.
     }
 
-    fn write(self, data: Bytes) -> int {
+    fn write(mut self, data: Bytes) -> int {
         // Implementation omitted.
     }
 }
 
-fn find_non_empty(streams: List<Reader>) -> Reader | none {
-    for stream in streams {
-        let data = stream.read(1);
+fn find_non_empty(mut streams: List<Reader>) -> mut Reader | none {
+    for mut stream in streams {
+        const data = stream.read(1);
 
         if !data.is_empty() {
             break stream;
@@ -962,14 +1057,14 @@ fn find_non_empty(streams: List<Reader>) -> Reader | none {
     }
 }
 
-fn copy_once(stream: Reader & Writer) -> int {
-    let data = stream.read(4096);
+fn copy_once(mut stream: Reader & Writer) -> int {
+    const data = stream.read(4096);
     stream.write(data)
 }
 
-fn prefixed_writer(prefix: Bytes, destination: Writer) -> Writer {
+fn prefixed_writer(prefix: Bytes, mut destination: Writer) -> mut Writer {
     Writer {
-        fn write(self, data: Bytes) -> int {
+        fn write(mut self, data: Bytes) -> int {
             destination.write(prefix + data)
         }
     }
@@ -982,7 +1077,7 @@ fn make_prefixer(prefix: Bytes) -> fn(Bytes) -> Bytes {
 }
 
 fn write_file(path: string, data: Bytes) -> int {
-    let file = File.create(path);
+    mut file = File.create(path);
     defer file.close();
 
     file.write(data)
