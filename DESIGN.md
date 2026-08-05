@@ -944,7 +944,38 @@ pointers remain stable and the portable C backend stays straightforward. More
 advanced collectors may be considered later without changing the language's
 observable memory-safety guarantees.
 
-### 12.2 Provisional value representations
+### 12.2 Specialized union representation
+
+The initial C backend uses a specialized representation for every distinct
+normalized union type. It does not use a universal tagged `Value` representation.
+
+A union is normalized by flattening nested unions and removing duplicate member
+types. The backend generates one layout for the resulting member set:
+
+```text
++------+----------------------------------+
+| tag  | payload sized for largest member |
++------+----------------------------------+
+```
+
+Initial union-layout rules:
+
+- Every materialized union has an explicit tag identifying its active member.
+- The payload has the size and alignment required by the largest member.
+- Primitive members such as `int` and `float` remain unboxed in the payload.
+- `none` has a tag but requires no payload data.
+- Converting a narrower union to a wider union remaps the tag and copies its
+  active payload.
+- Compiler-generated GC tracing switches on the tag and traces only the active
+  member when that member contains references.
+- The first implementation does not use null-pointer niches, pointer tagging,
+  NaN boxing, or other compact encodings.
+
+The IR represents union construction, projection, and conversion without
+embedding this layout. A future interpreter or other backend may use a different
+internal representation without changing SAO semantics.
+
+### 12.3 Other provisional value representations
 
 Other runtime representations are not finalized.
 
@@ -952,8 +983,6 @@ Likely initial representations include:
 
 - `int` and `float` values represented as unboxed 64-bit values.
 - Struct values represented as stable pointers to garbage-collected objects.
-- Union values represented by a tag and payload when a runtime distinction is
-  necessary.
 - Interface values represented by an object/data pointer and method-table
   pointer.
 - Anonymous interface objects represented by compiler-generated structs and
@@ -969,8 +998,8 @@ Conceptual interface representation:
 +--------------+----------------------+
 ```
 
-These layouts remain provisional and will be refined alongside SAO's value and
-receiver semantics.
+These other layouts remain provisional and will be refined as the implementation
+develops.
 
 ## 13. Deferred features
 
@@ -1005,17 +1034,16 @@ The following decisions are intentionally unresolved:
 
 1. **Numeric and text details:** numeric conversion rules, floating-point edge
    cases, string encoding and indexing, and the byte-sequence API.
-2. **Union layout:** specialized unions versus a universal tagged `Value`.
-3. **Interface values:** equality, downcasting, and runtime type metadata.
-4. **Generics:** syntax, constraints, inference, monomorphization, and interface
+2. **Interface values:** equality, downcasting, and runtime type metadata.
+3. **Generics:** syntax, constraints, inference, monomorphization, and interface
    interaction.
-5. **Modules:** imports, visibility, access control, and separate compilation.
-6. **Pattern matching:** whether and when it joins the initial implementation.
-7. **Closure representation:** exact environment layout, thread safety, and
+4. **Modules:** imports, visibility, access control, and separate compilation.
+5. **Pattern matching:** whether and when it joins the initial implementation.
+6. **Closure representation:** exact environment layout, thread safety, and
    possible explicit capture-list syntax.
-8. **Coroutines:** syntax, yielded and resumed value types, cancellation,
+7. **Coroutines:** syntax, yielded and resumed value types, cancellation,
    abandonment, cleanup, and whether coroutines are stackless or stackful.
-9. **Concurrency and async:** intentionally postponed; their relationship to
+8. **Concurrency and async:** intentionally postponed; their relationship to
     coroutines remains to be designed.
 
 ## 15. Current language sketch
