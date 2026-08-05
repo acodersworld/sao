@@ -190,8 +190,9 @@ SAO has a deliberately small, fixed primitive set:
   initially no other floating-point widths.
 - `bool` has the values `true` and `false`. Conditions require `bool`; SAO has
   no implicit truthiness conversions.
-- `char` is one Unicode scalar value rather than an eight-bit byte.
-- `string` is a garbage-collected Unicode text type.
+- `char` is a one-byte ASCII value in the range 0 through 127.
+- `string` is a garbage-collected immutable sequence of one-byte ASCII
+  characters.
 - `()` is the unit type and has one value, also written `()`.
 - `none` is the singleton absence type and value described with unions in
   Section 8.
@@ -201,8 +202,8 @@ The names `int` and `float` expose their fixed meanings directly; `i64` and
 `int`, and floating-point literals have type `float`. An integer literal outside
 the `int` range is a compile-time error.
 
-Binary data will use a separate byte-sequence abstraction rather than another
-scalar primitive. Its exact name and API remain to be designed.
+Binary data uses the separate built-in `bytes` sequence type described below;
+it is not another scalar primitive.
 
 ### 3.2 Integer arithmetic
 
@@ -214,6 +215,103 @@ APIs.
 Division by zero, dividing the minimum `int` by `-1`, and a shift count outside
 the range `0` through `63` also panic. Floating-point overflow follows IEEE 754
 and may produce infinity rather than panicking.
+
+### 3.3 Explicit conversions
+
+SAO performs no implicit numeric conversions. `int` and `float` remain distinct
+through assignment, argument passing, returns, arithmetic, comparisons, and
+contextual typing:
+
+```text
+const count: int = 10;
+const ratio: float = 0.5;
+
+const invalid = count + ratio;          // Type error.
+const valid = float(count) + ratio;     // Explicit conversion.
+const integer: int = int(ratio);        // Explicit conversion.
+```
+
+Literals also retain their natural types rather than being coerced by an
+annotation:
+
+```text
+const invalid: float = 1;   // Type error: 1 has type int.
+const valid: float = 1.0;
+```
+
+The initial conversion syntax treats a target primitive type as a conversion
+function, such as `float(value)`, `int(value)`, `char(value)`, or
+`string(value)`. Text parsing is not a numeric conversion; parsing functions
+return an explicit error union for invalid input.
+
+`int(value)` converts a finite, in-range `float` by truncating toward zero:
+
+```text
+int(3.9)   // 3
+int(-3.9)  // -3
+```
+
+Negative floating-point zero converts to integer zero. Conversion from NaN,
+positive or negative infinity, or a value outside the `int` range panics. An
+invalid constant conversion is a compile-time diagnostic when detectable.
+
+`float(value)` converts an `int` to the closest representable binary64 value,
+using round-to-nearest with ties to even when precision is lost. `char(value)`
+accepts only an integer from 0 through 127 and panics otherwise.
+
+### 3.4 Floating-point behavior
+
+Float arithmetic follows strict IEEE 754 binary64 semantics:
+
+- Overflow produces positive or negative infinity.
+- Underflow produces a subnormal value or signed zero.
+- Floating-point division by zero produces infinity or NaN rather than
+  panicking.
+- NaN compares unequal to every value, including itself.
+- Ordered comparisons involving NaN are false.
+- Positive and negative zero compare equal.
+- Ordinary operations use round-to-nearest with ties to even.
+- The backend must not enable unsafe fast-math transformations or silently use
+  extra intermediate precision.
+
+### 3.5 ASCII strings and byte sequences
+
+SAO deliberately does not provide Unicode text semantics. A `char` occupies one
+byte but permits only ASCII values 0 through 127. A `string` stores an explicit
+length and a contiguous sequence of `char` values. Embedded zero characters are
+valid because strings are not sentinel-terminated.
+
+String rules:
+
+- String and character literals must contain only ASCII; other characters are
+  compile-time diagnostics.
+- `string[index]` performs constant-time character indexing and returns `char`.
+- An out-of-range string index panics.
+- String length and encoded byte length are identical and available in constant
+  time.
+- Strings are immutable. A `mut` string binding may be rebound, but its existing
+  contents cannot be modified.
+- Concatenation creates a new string.
+
+The built-in `bytes` type is a garbage-collected sequence of arbitrary byte
+values from 0 through 255. It is separate from `string`:
+
+- `bytes[index]` returns an `int` in the range 0 through 255.
+- Indexed assignment accepts only an `int` in that range and panics otherwise.
+- Out-of-range indexing panics.
+- A `const bytes` reference is transitively read-only.
+- A `mut bytes` reference supports indexed mutation, append, extend, and resize.
+- `length()` returns the byte count in constant time.
+- Slicing initially creates an independent copy.
+- Files and other binary I/O use `bytes`.
+
+ASCII conversion is explicit. Encoding always succeeds; decoding fails when a
+byte exceeds 127:
+
+```text
+ascii.encode(text) -> mut bytes
+ascii.decode(data) -> string | Error<string>
+```
 
 Current inference boundary:
 
@@ -690,11 +788,11 @@ be used for anonymous implementations:
 
 ```text
 mut stream = Reader & Writer {
-    fn read(mut self, count: int) -> Bytes {
+    fn read(mut self, count: int) -> bytes {
         // ...
     }
 
-    fn write(mut self, data: Bytes) -> int {
+    fn write(mut self, data: bytes) -> int {
         // ...
     }
 };
@@ -1040,6 +1138,12 @@ Other runtime representations are not finalized.
 Likely initial representations include:
 
 - `int` and `float` values represented as unboxed 64-bit values.
+- `char` values represented as unboxed unsigned bytes restricted to 0 through
+  127.
+- `string` values represented as stable pointers to garbage-collected
+  length-plus-ASCII-data objects.
+- `bytes` values represented as stable pointers to garbage-collected mutable
+  byte buffers.
 - Struct values represented as stable pointers to garbage-collected objects.
 - Interface values represented by an object/data pointer and method-table
   pointer.
@@ -1090,14 +1194,12 @@ does not need to support them.
 
 The following decisions are intentionally unresolved:
 
-1. **Numeric and text details:** numeric conversion rules, floating-point edge
-   cases, string encoding and indexing, and the byte-sequence API.
-2. **Interface values:** equality, downcasting, and runtime type metadata.
-3. **Generics:** syntax, constraints, inference, monomorphization, and interface
+1. **Interface values:** equality, downcasting, and runtime type metadata.
+2. **Generics:** syntax, constraints, inference, monomorphization, and interface
    interaction.
-4. **Modules:** imports, visibility, access control, and separate compilation.
-5. **Pattern matching:** whether and when it joins the initial implementation.
-6. **Coroutines:** syntax, yielded and resumed value types, cancellation,
+3. **Modules:** imports, visibility, access control, and separate compilation.
+4. **Pattern matching:** whether and when it joins the initial implementation.
+5. **Coroutines:** syntax, yielded and resumed value types, cancellation,
    abandonment, cleanup, and whether coroutines are stackless or stackful.
 
 ## 15. Current language sketch
@@ -1107,22 +1209,22 @@ error syntax remain illustrative:
 
 ```text
 interface Reader {
-    fn read(mut self, count: int) -> Bytes;
+    fn read(mut self, count: int) -> bytes;
 }
 
 interface Writer {
-    fn write(mut self, data: Bytes) -> int;
+    fn write(mut self, data: bytes) -> int;
 }
 
 struct Buffer {
-    data: Bytes,
+    data: bytes,
     position: int,
 
-    fn read(mut self, count: int) -> Bytes {
+    fn read(mut self, count: int) -> bytes {
         // Implementation omitted.
     }
 
-    fn write(mut self, data: Bytes) -> int {
+    fn write(mut self, data: bytes) -> int {
         // Implementation omitted.
     }
 }
@@ -1144,21 +1246,21 @@ fn copy_once(mut stream: Reader & Writer) -> int {
     stream.write(data)
 }
 
-fn prefixed_writer(prefix: Bytes, mut destination: Writer) -> mut Writer {
+fn prefixed_writer(prefix: bytes, mut destination: Writer) -> mut Writer {
     Writer {
-        fn write(mut self, data: Bytes) -> int {
+        fn write(mut self, data: bytes) -> int {
             destination.write(prefix + data)
         }
     }
 }
 
-fn make_prefixer(prefix: Bytes) -> fn(Bytes) -> Bytes {
-    fn(data: Bytes) -> Bytes {
+fn make_prefixer(prefix: bytes) -> fn(bytes) -> bytes {
+    fn(data: bytes) -> bytes {
         prefix + data
     }
 }
 
-fn write_file(path: string, data: Bytes) -> int {
+fn write_file(path: string, data: bytes) -> int {
     mut file = File.create(path);
     defer file.close();
 
