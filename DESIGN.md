@@ -521,10 +521,13 @@ anonymous struct shares the same capture environment.
 Capture rules:
 
 - Captures are discovered automatically from free-variable references.
-- A `const` binding is captured as the value it holds when the
-  anonymous value is created.
-- A `mut` binding is captured as a shared binding. Mutations are
-  visible to the outer scope and to every anonymous value that captures it.
+- Capture lists are always implicit; SAO has no explicit capture-list syntax.
+- A `const` binding is captured as the value it holds when the anonymous value
+  is created. Value types are copied directly; reference values copy the
+  reference and preserve its access capability.
+- A captured `mut` binding is lifted into a shared garbage-collected cell.
+  Mutations are visible to the outer scope and to every anonymous value that
+  captures it.
 - A captured binding remains alive for as long as any capturing value can use
   it, even after its original lexical scope has returned.
 - Captures are hidden storage and do not become fields accessible through an
@@ -549,9 +552,9 @@ const formatter = struct {
 };
 ```
 
-The implementation may lift mutable captured bindings into shared
-garbage-collected heap cells. The exact cell and environment layouts remain an
-implementation detail, but they must preserve these observable semantics.
+Mutable captured bindings are always represented by shared garbage-collected
+heap cells. The original scope and every capturing anonymous value access the
+same cell.
 
 ### 7.3 Anonymous functions
 
@@ -586,8 +589,63 @@ next(); // 2
 ```
 
 If several anonymous functions capture the same mutable binding, they observe
-the same storage. Explicit capture lists are deferred; SAO has no ownership
-transfer or `move` capture modifier.
+the same storage. SAO has no ownership-transfer or `move` capture modifier.
+
+A `const` binding containing an anonymous function does not make that function
+pure. Calling it may still mutate a `mut` binding captured by the function.
+
+### 7.4 Closure and environment representation
+
+Every anonymous-function expression has a compiler-generated environment type.
+An anonymous function value has a uniform two-word representation:
+
+```text
++--------------+---------------------+
+| code pointer | environment pointer |
++--------------+---------------------+
+```
+
+The code pointer uses the function value's statically known signature and
+accepts the environment pointer as a hidden first argument. The environment is
+a non-moving garbage-collected object specialized for that expression:
+
+```text
++---------------------------+
+| GC object header          |
++---------------------------+
+| directly stored captures  |
+| shared-cell pointers      |
+| ...                       |
++---------------------------+
+```
+
+The environment stores `const` captures directly and stores a pointer to the
+shared cell for each `mut` capture. Compiler-generated tracing metadata records
+which slots contain references. Environment field order, padding, and byte
+offsets are backend-private details. A non-capturing anonymous function retains
+the same two-word callable representation but uses an empty environment.
+
+Anonymous structs do not need a separate environment allocation. Their
+compiler-generated garbage-collected object contains declared fields and hidden
+captures together:
+
+```text
++------------------+
+| GC object header |
+| declared fields  |
+| hidden captures  |
++------------------+
+```
+
+Every method receives that object as `self`, so all methods share the same
+captures. Interface-constrained anonymous structs use this same representation
+behind their interface value.
+
+SAO execution is single-threaded. Closure environments, shared capture cells,
+and collector state use no atomic operations, locks, or thread-safety marker
+types. Future shared-memory concurrency would require an explicit new design;
+these values are not implicitly safe to share with concurrently executing SAO
+threads.
 
 ## 8. Union and intersection types
 
@@ -987,8 +1045,6 @@ Likely initial representations include:
   pointer.
 - Anonymous interface objects represented by compiler-generated structs and
   method tables.
-- Anonymous functions represented by a code pointer and captured-environment
-  pointer, or an equivalent backend-specific layout.
 
 Conceptual interface representation:
 
@@ -1016,6 +1072,7 @@ core:
 - A Cranelift JIT or native object backend.
 - A built-in linker or executable writer.
 - First-class coroutines or generators.
+- Native threads, shared-memory concurrency, and async scheduling.
 
 Coroutine syntax and semantics are deferred from the first implementation, but
 they are an intended future language feature. The IR and runtime should make it
@@ -1023,7 +1080,8 @@ possible to preserve suspended activation state, captured references, and
 lexical cleanup scopes. Suspension itself should not be treated as leaving a
 scope: deferred actions would run when the coroutine completes or is otherwise
 closed, not merely when it yields. Cancellation and abandonment semantics remain
-to be designed.
+to be designed. Coroutines remain single-threaded and do not imply parallel
+execution.
 
 The IR should avoid preventing these additions, but the first implementation
 does not need to support them.
@@ -1039,12 +1097,8 @@ The following decisions are intentionally unresolved:
    interaction.
 4. **Modules:** imports, visibility, access control, and separate compilation.
 5. **Pattern matching:** whether and when it joins the initial implementation.
-6. **Closure representation:** exact environment layout, thread safety, and
-   possible explicit capture-list syntax.
-7. **Coroutines:** syntax, yielded and resumed value types, cancellation,
+6. **Coroutines:** syntax, yielded and resumed value types, cancellation,
    abandonment, cleanup, and whether coroutines are stackless or stackful.
-8. **Concurrency and async:** intentionally postponed; their relationship to
-    coroutines remains to be designed.
 
 ## 15. Current language sketch
 
@@ -1113,7 +1167,6 @@ fn write_file(path: string, data: Bytes) -> int {
 ```
 
 The anonymous writer and function examples use automatic lexical capture. Their
-observable behaviour is specified, while their exact environment layout remains
-open. Their environments are garbage-collected. The file example shows the
-intended lexical cleanup behaviour without allowing a resource to escape its
-scope.
+environments use the specialized garbage-collected layouts described above. The
+file example shows the intended lexical cleanup behaviour without allowing a
+resource to escape its scope.
