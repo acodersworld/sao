@@ -2,7 +2,7 @@
 
 Status: early design notes  
 Working name: SAO  
-Last updated: 2026-08-05
+Last updated: 2026-08-06
 
 This document records the current direction for SAO, a statically typed,
 expression-oriented toy language. It distinguishes agreed design decisions from
@@ -25,6 +25,10 @@ SAO should be:
 
 The first implementation should favour clear semantics and good diagnostics over
 advanced optimization.
+
+SAO functions execute synchronously from call to return. The language does not
+provide coroutines, generators, async functions, `co`, or `yield`, and the IR and
+runtime do not need to preserve suspended function activations.
 
 ## 2. Compilation model
 
@@ -51,11 +55,6 @@ interpreter or a Cranelift JIT/AOT backend in the future:
 source -> typed IR ----+-> C backend -> clang/gcc -> executable
                        +-> Cranelift backend (future)
 ```
-
-Although coroutines are deferred, the IR should not assume that every function
-activation runs continuously from call to return. Control flow, live locals,
-and lexical cleanup scopes should remain explicit enough that a future lowering
-pass can transform a suspendable function into a resumable state machine.
 
 The C compiler driver is responsible for assembling and linking. SAO does not
 initially need its own linker.
@@ -324,7 +323,9 @@ Current inference boundary:
 - Function return types are never inferred.
 - Anonymous function parameter and return types are explicit in the function
   expression; contextual lambda signature inference is deferred.
-- Generic inference is deferred.
+- User-defined generic declarations and general-purpose generic inference are
+  not part of the initial language. Built-in parameterized types such as
+  `Error<T>` have their own limited inference rules.
 
 For example:
 
@@ -339,6 +340,51 @@ fn print_user(user: User) -> () {
 ```
 
 The unit type is provisionally spelled `()`.
+
+### 3.6 Equality
+
+Equality is value-based and deep. It is never defined as garbage-collected
+object-pointer identity.
+
+The operands of `==` and `!=` must have the same type, disregarding only their
+access capability. SAO does not implicitly widen either operand or compare
+unrelated nominal or interface types merely because their runtime values might
+overlap:
+
+```text
+const first = Position { x: 1.0, y: 2.0 };
+const second = Position { x: 1.0, y: 2.0 };
+
+first == second // true, despite being separately allocated objects
+```
+
+Deep equality recursively compares the value's stored contents:
+
+- Primitive values compare according to their primitive equality rules.
+- Strings compare their character contents and bytes values compare their byte
+  contents.
+- Struct values of the same nominal type compare their fields recursively;
+  methods are not data and do not participate.
+- Anonymous structs compare their declared fields and hidden captures when they
+  have the same compiler-generated nominal type.
+- Union values compare equal when they have the same active member and their
+  payloads compare equal. Two `none` values compare equal.
+- Interface values may be compared only when their static interface types are
+  the same. Values with different concrete runtime types compare unequal;
+  values with the same concrete runtime type use that type's generated deep
+  equality operation, including hidden fields and captures.
+
+Access qualifiers do not change value equality. A `mut Position` and a const
+`Position` may therefore be compared without granting mutable access through
+the const reference.
+
+Pointer identity must not stand in for comparing stored values; for example, an
+object containing NaN is not made equal to itself merely because both operands
+refer to the same allocation. Deep comparison must be cycle-safe because
+garbage-collected object graphs may contain cycles. It keeps track of object
+pairs already being compared so recursive cycles terminate. Object-sharing
+topology is not itself part of the value: a shared subobject and two separately
+allocated but deeply equal subobjects compare equally.
 
 ## 4. Expression-oriented blocks
 
@@ -553,6 +599,74 @@ them. Method matching, variance, and visibility still need formal
 specification. The initial direction is exact signature matching and no method
 overloading.
 
+### 6.1 Runtime method identity and interface dispatch
+
+Every concrete struct type, including a compiler-generated anonymous type, has
+one runtime type descriptor. Its identity is unique even when another nominal
+type has the same fields and methods. The descriptor contains the type's GC
+tracing information, diagnostic identity, generated deep-equality operation,
+and a single sorted array of all interface-callable methods.
+
+Each method has a canonical method identity derived from:
+
+- Its name.
+- Whether its receiver is const or `mut`.
+- Its ordered parameter types and access capabilities.
+- Its return type and access capability.
+
+Parameter names, the owning concrete struct, and the interface requesting the
+method are not part of this identity. Consequently, one concrete method can
+satisfy the same requirement in any number of structural interfaces.
+
+The initial whole-program compiler interns canonical method signatures and
+assigns them collision-free integer IDs within the linked program. A future
+separate-compilation scheme may use stable signature hashes, but a hash match
+must then be verified against the canonical signature so correctness never
+depends on the absence of a hash collision.
+
+A method entry conceptually contains:
+
+```text
++-----------+------------------+
+| method ID | function pointer |
++-----------+------------------+
+```
+
+There is one such method array per concrete type, not per object and not per
+interface that the type happens to satisfy. For a small method set the backend
+may use a sequential search; for a larger sorted set it may use binary search.
+The threshold is an implementation detail.
+
+Because every initial interface implementation is a garbage-collected struct,
+an interface value uses the same object pointer as the concrete struct
+reference. Dispatch loads the object's type descriptor, looks up the canonical
+method ID, and indirectly calls the resulting function. Converting a concrete
+reference to an interface therefore creates no wrapper and no interface-specific
+method table. Intersection types use the same representation and lookup path.
+
+The portable C backend must generate appropriately typed receiver-adapter
+functions rather than call through an incompatible C function-pointer type.
+The adapter accepts an erased object pointer, converts it to the concrete
+receiver type, and calls the implementation with the method signature expected
+at that call site.
+
+Static struct-to-interface conversions are checked by the compiler. A missing
+method during a statically valid interface call is therefore a compiler or
+runtime invariant failure, not a recoverable program condition.
+
+Runtime type tests use the same metadata:
+
+- `value is NamedStruct` compares the concrete type descriptor with the named
+  struct's descriptor and narrows to that exact nominal type on success.
+- `value is Interface` checks that the concrete method array contains every
+  required canonical method ID. On success, the value is narrowed to the
+  intersection of its existing interface type and the tested interface.
+
+Narrowing preserves the source access capability. Testing or downcasting a
+const interface reference can never recover `mut` access. Anonymous concrete
+types have descriptors and can be tested against additional interfaces, but
+cannot be named for an exact concrete-type test in source code.
+
 ## 7. Anonymous structs, functions, and interface objects
 
 ### 7.1 Interface-constrained anonymous structs
@@ -600,12 +714,12 @@ bindings from their surrounding lexical scope. Captures do not need to be
 redeclared as fields:
 
 ```text
-interface Predicate<T> {
-    fn test(self, value: T) -> bool;
+interface IntPredicate {
+    fn test(self, value: int) -> bool;
 }
 
-fn greater_than(limit: int) -> Predicate<int> {
-    Predicate<int> {
+fn greater_than(limit: int) -> IntPredicate {
+    IntPredicate {
         fn test(self, value: int) -> bool {
             value > limit
         }
@@ -808,13 +922,14 @@ interface ReadWriter {
 ```
 
 Runtime interface narrowing, such as narrowing a `Reader` to
-`Reader & Writer` after `value is Writer`, is a desired future feature but not
-required for the first implementation.
+`Reader & Writer` after `value is Writer`, uses the runtime method metadata
+described in Section 6.1.
 
 ### 8.1 Recoverable errors and propagation
 
-Recoverable errors are ordinary union values. SAO provides a built-in nominal
-generic type `Error<T>` whose value carries error information of type `T`:
+Recoverable errors are ordinary union values. SAO provides the built-in nominal
+parameterized type `Error<T>`, whose value carries error information of type
+`T`:
 
 ```text
 fn myfunc() -> int | Error<string> {
@@ -826,10 +941,34 @@ fn myfunc() -> int | Error<string> {
 }
 ```
 
-`Error<T>` is distinct from its payload type and from every non-error member of
-the union. The built-in generic does not depend on user-defined generics being
-available in the first implementation. `Error(value)` is the initial
-construction syntax.
+SAO does not initially support user-defined generic structs, functions, or
+interfaces. `Error<T>` is a compiler-known type constructor with dedicated
+type-checking and lowering rules, not an instance of a general source-language
+generic facility. Other built-in parameterized types may be added later without
+enabling user-defined generics.
+
+Each `Error<T>` instantiation is distinct from its payload type, from every
+non-error member of a union, and from `Error<U>` when `T` and `U` differ.
+`Error(value)` is the initial construction syntax. Without an expected type,
+the payload type is the exact type of `value`:
+
+```text
+const error = Error("operation failed"); // Error<string>
+```
+
+An expected `Error<T>` type may instead guide construction when the value is
+assignable to `T`. The compiler does not invent a payload union without such an
+expected type.
+
+The payload held by an `Error<T>` is immutable. If the payload is a reference,
+accessing it cannot grant more than const access. This permits the built-in
+widening conversion `Error<A>` to `Error<B>` whenever `A` is assignable to `B`.
+This covariance is a specific rule for `Error`, not a general variance feature:
+
+```text
+const specific: Error<IoError> = Error(IoError { /* ... */ });
+const combined: Error<IoError | ParseError> = specific;
+```
 
 The postfix `?` operator propagates an error without exceptions:
 
@@ -843,8 +982,9 @@ fn caller() -> int | Error<string> {
 For an operand of type `S | Error<E>`, `?` evaluates the operand once. If it is
 an `S`, the expression produces that value with type `S`. If it is an
 `Error<E>`, the current function returns that error immediately. The enclosing
-function's declared return type must accept the propagated `Error<E>`. `S` may
-itself be a union of several non-error types.
+function's declared return type must accept the propagated `Error<E>`, including
+through the built-in payload-widening conversion. `S` may itself be a union of
+several non-error types.
 
 Error payloads can use ordinary SAO types and unions:
 
@@ -1133,7 +1273,8 @@ internal representation without changing SAO semantics.
 
 ### 12.3 Other provisional value representations
 
-Other runtime representations are not finalized.
+Other runtime representations are not finalized. Interface representation and
+dispatch follow the decisions in Section 6.1.
 
 Likely initial representations include:
 
@@ -1145,17 +1286,29 @@ Likely initial representations include:
 - `bytes` values represented as stable pointers to garbage-collected mutable
   byte buffers.
 - Struct values represented as stable pointers to garbage-collected objects.
-- Interface values represented by an object/data pointer and method-table
-  pointer.
+- Struct objects carrying a pointer to their concrete runtime type descriptor in
+  the GC object header.
+- Interface values represented by the same stable object pointer used by a
+  concrete struct reference. The descriptor and method dictionary are reached
+  through the object header.
 - Anonymous interface objects represented by compiler-generated structs and
-  method tables.
+  the same shared per-concrete-type method dictionary.
 
-Conceptual interface representation:
+Conceptual interface representation and dispatch metadata:
 
 ```text
-+--------------+----------------------+
-| data pointer | method-table pointer |
-+--------------+----------------------+
++----------------+       +-----------------------+
+| object pointer | ----> | GC object header      |
++----------------+       | type descriptor ------+----+
+                         | object fields         |    |
+                         +-----------------------+    |
+                                                      v
+                         +-----------------------------+
+                         | concrete type identity      |
+                         | GC tracing metadata         |
+                         | deep-equality operation     |
+                         | sorted method dictionary    |
+                         +-----------------------------+
 ```
 
 These other layouts remain provisional and will be refined as the implementation
@@ -1170,22 +1323,12 @@ core:
 - A `satisfies` operator that preserves an anonymous object's exact hidden type.
 - Nominal data-carrying enums.
 - Exhaustive pattern matching.
-- Runtime interface tests and intersection-aware narrowing.
-- Generic interfaces and associated types.
+- User-defined generic structs, functions, and interfaces, including generic
+  constraints, general-purpose generic inference, and associated types.
 - `errdefer`.
 - A Cranelift JIT or native object backend.
 - A built-in linker or executable writer.
-- First-class coroutines or generators.
-- Native threads, shared-memory concurrency, and async scheduling.
-
-Coroutine syntax and semantics are deferred from the first implementation, but
-they are an intended future language feature. The IR and runtime should make it
-possible to preserve suspended activation state, captured references, and
-lexical cleanup scopes. Suspension itself should not be treated as leaving a
-scope: deferred actions would run when the coroutine completes or is otherwise
-closed, not merely when it yields. Cancellation and abandonment semantics remain
-to be designed. Coroutines remain single-threaded and do not imply parallel
-execution.
+- Native threads and shared-memory concurrency.
 
 The IR should avoid preventing these additions, but the first implementation
 does not need to support them.
@@ -1194,13 +1337,8 @@ does not need to support them.
 
 The following decisions are intentionally unresolved:
 
-1. **Interface values:** equality, downcasting, and runtime type metadata.
-2. **Generics:** syntax, constraints, inference, monomorphization, and interface
-   interaction.
-3. **Modules:** imports, visibility, access control, and separate compilation.
-4. **Pattern matching:** whether and when it joins the initial implementation.
-5. **Coroutines:** syntax, yielded and resumed value types, cancellation,
-   abandonment, cleanup, and whether coroutines are stackless or stackful.
+1. **Modules:** imports, visibility, access control, and separate compilation.
+2. **Pattern matching:** whether and when it joins the initial implementation.
 
 ## 15. Current language sketch
 
@@ -1229,12 +1367,10 @@ struct Buffer {
     }
 }
 
-fn find_non_empty(mut streams: List<Reader>) -> mut Reader | none {
-    for mut stream in streams {
-        const data = stream.read(1);
-
-        if !data.is_empty() {
-            break stream;
+fn find_nonzero(data: bytes) -> int | none {
+    for value in data {
+        if value != 0 {
+            break value;
         }
     } else {
         none
