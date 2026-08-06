@@ -701,10 +701,11 @@ direction is exact signature matching and no method overloading.
 ### 6.1 Runtime method identity and interface dispatch
 
 Every concrete struct type, including a compiler-generated anonymous type, has
-one runtime type descriptor. Its identity is unique even when another nominal
-type has the same fields and methods. The descriptor contains the type's GC
-tracing information, diagnostic identity, and a single sorted array of all
-interface-callable methods.
+one runtime vtable. Its address is the concrete runtime type identity and is
+unique even when another nominal type has the same fields and methods. The
+vtable also contains the type's GC tracing function, diagnostic identity, and a
+single sorted array of all interface-callable methods. The type descriptor and
+method table are therefore one shared object, not separate per-object pointers.
 
 Each method has a canonical method identity derived from:
 
@@ -738,10 +739,10 @@ The threshold is an implementation detail.
 
 Because every initial interface implementation is a garbage-collected struct,
 an interface value uses the same object pointer as the concrete struct
-reference. Dispatch loads the object's type descriptor, looks up the canonical
-method ID, and indirectly calls the resulting function. Converting a concrete
-reference to an interface therefore creates no wrapper and no interface-specific
-method table. Intersection types use the same representation and lookup path.
+reference. Dispatch loads the object's vtable, looks up the canonical method ID,
+and indirectly calls the resulting function. Converting a concrete reference to
+an interface therefore creates no wrapper and no interface-specific method
+table. Intersection types use the same representation and lookup path.
 
 The portable C backend must generate appropriately typed receiver-adapter
 functions rather than call through an incompatible C function-pointer type.
@@ -755,16 +756,16 @@ runtime invariant failure, not a recoverable program condition.
 
 Runtime type tests use the same metadata:
 
-- `value is NamedStruct` compares the concrete type descriptor with the named
-  struct's descriptor and narrows to that exact nominal type on success.
+- `value is NamedStruct` compares the concrete vtable pointer with the named
+  struct's vtable and narrows to that exact nominal type on success.
 - `value is Interface` checks that the concrete method array contains every
   required canonical method ID. On success, the value is narrowed to the
   intersection of its existing interface type and the tested interface.
 
 Narrowing preserves the source access capability. Testing or downcasting a
 const interface reference can never recover `mut` access. Anonymous concrete
-types have descriptors and can be tested against additional interfaces, but
-cannot be named for an exact concrete-type test in source code.
+types have vtables and can be tested against additional interfaces, but cannot
+be named for an exact concrete-type test in source code.
 
 ## 7. Anonymous structs, functions, and interface objects
 
@@ -934,7 +935,8 @@ The environment stores `const` captures directly and stores a pointer to the
 shared cell for each `mut` capture. Compiler-generated tracing metadata records
 which slots contain references. Environment field order, padding, and byte
 offsets are backend-private details. A non-capturing anonymous function retains
-the same two-word callable representation but uses an empty environment.
+the same two-word callable representation, uses a null environment pointer, and
+requires no environment allocation.
 
 Anonymous structs do not need a separate environment allocation. Their
 compiler-generated garbage-collected object contains declared fields and hidden
@@ -1059,7 +1061,7 @@ if result is none {
 ```
 
 A union-member test inspects the union's active tag. A nominal type test on an
-interface value compares its concrete runtime type descriptor. An interface
+interface value compares its concrete runtime vtable pointer. An interface
 test on another interface value consults the concrete type's method metadata and
 narrows the true branch to an intersection. A failed runtime interface test
 does not create a negative interface type, so its false branch retains the
@@ -1387,6 +1389,9 @@ Initial collector rules:
 - Reference cycles are collected naturally.
 - The first implementation has no user-defined destructors, finalizers, weak
   references, generational collection, or incremental collection.
+- A vtable may contain a runtime-only release function for auxiliary raw
+  allocations such as string and `bytes` buffers. It cannot invoke SAO code and
+  is not a user-visible destructor or finalizer.
 - `defer` provides deterministic resource cleanup. Garbage collection reclaims
   memory and must not be relied on to close files, release locks, or perform
   other timely cleanup.
@@ -1427,48 +1432,64 @@ The IR represents union construction, projection, and conversion without
 embedding this layout. A future interpreter or other backend may use a different
 internal representation without changing SAO semantics.
 
-### 12.3 Other provisional value representations
+### 12.3 Concrete value representations
 
-Other runtime representations are not finalized. Interface representation and
-dispatch follow the decisions in Section 6.1.
-
-Likely initial representations include:
-
-- `int` and `float` values represented as unboxed 64-bit values.
-- `char` values represented as unboxed unsigned bytes restricted to 0 through
-  127.
-- `string` values represented as stable pointers to garbage-collected mutable
-  sequence objects containing a length, capacity, and replaceable ASCII storage
-  pointer, using the same outer-object model as `bytes`.
-- `bytes` values represented as stable pointers to garbage-collected mutable
-  byte buffers.
-- Struct values represented as stable pointers to garbage-collected objects.
-- Struct objects carrying a pointer to their concrete runtime type descriptor in
-  the GC object header.
-- Interface values represented by the same stable object pointer used by a
-  concrete struct reference. The descriptor and method dictionary are reached
-  through the object header.
-- Anonymous interface objects represented by compiler-generated structs and
-  the same shared per-concrete-type method dictionary.
-
-Conceptual interface representation and dispatch metadata:
+Every garbage-collected allocation begins with a common object header. The
+object pointer addresses the start of this header, whose first word is the
+vtable pointer:
 
 ```text
-+----------------+       +-----------------------+
-| object pointer | ----> | GC object header      |
-+----------------+       | type descriptor ------+----+
-                         | object fields         |    |
-                         +-----------------------+    |
-                                                      v
-                         +-----------------------------+
-                         | concrete type identity      |
-                         | GC tracing metadata         |
-                         | sorted method dictionary    |
-                         +-----------------------------+
++-------------------+
+| vtable pointer    |
+| next GC object    |
+| allocation size   |
+| mark state        |
++-------------------+
 ```
 
-These other layouts remain provisional and will be refined as the implementation
-develops.
+The vtable combines concrete type identity, diagnostic information, a generated
+GC tracing function, an optional runtime-only auxiliary-storage release
+function, and the sorted method dictionary. Runtime-only object kinds such as
+closure environments and shared capture cells use vtables with empty method
+dictionaries.
+
+`int` and `float` are unboxed 64-bit values. `bool` is an unboxed Boolean, and
+`char` is an unboxed unsigned byte restricted to 0 through 127.
+
+Both `string` and `bytes` values are stable pointers to mutable sequence objects:
+
+```text
++-------------------+
+| common GC header  |
+| length            |
+| capacity          |
+| data pointer      |
++-------------------+
+```
+
+The data pointer refers to raw storage obtained with `malloc` and grown with
+`realloc`. Resizing can change the data pointer without changing the outer
+object, so every alias observes the new length and contents. When the collector
+sweeps the outer object, its runtime release function frees the raw buffer
+before the object itself. String storage contains ASCII bytes; `bytes` storage
+contains unrestricted byte values.
+
+A struct value is a stable pointer to one garbage-collected object. Declared
+fields follow the common header in declaration order, with backend-required
+padding. Anonymous structs place hidden captures after their declared fields.
+Every instance points to its concrete type's shared vtable; no method table is
+stored directly in an instance.
+
+An anonymous-function value is two words: a signature-specific code pointer and
+an environment pointer. Capturing functions point to a garbage-collected
+environment object. Non-capturing functions use a null environment pointer and
+allocate no environment. The compiler traces only the environment word; code
+pointers are not GC references.
+
+An interface or intersection value is exactly the same one-word object pointer
+as its underlying struct reference. Dispatch follows the object header's vtable
+pointer and searches its sorted method dictionary. Anonymous interface objects
+are compiler-generated structs with the same representation.
 
 ## 13. Deferred features
 
