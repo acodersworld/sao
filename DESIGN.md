@@ -925,7 +925,58 @@ Runtime interface narrowing, such as narrowing a `Reader` to
 `Reader & Writer` after `value is Writer`, uses the runtime method metadata
 described in Section 6.1.
 
-### 8.1 Recoverable errors and propagation
+### 8.1 Flow-sensitive type narrowing
+
+The initial language uses `is` tests and ordinary `if` expressions rather than
+a general pattern-matching construct. A successful test narrows the tested
+binding within the true branch:
+
+```text
+fn display(value: int | float | none) -> () {
+    if value is int {
+        // value has type int here.
+        print(string(value));
+    } else if value is float {
+        // value has type float here.
+        print(string(value));
+    } else {
+        // value has type none here.
+        print("none");
+    }
+}
+```
+
+When a test selects a normalized union member, the false branch removes that
+member from the binding's type. This subtraction continues through an `else if`
+chain, so the final `else` contains the remaining members. `none` is tested in
+the same way as any other union member:
+
+```text
+if result is none {
+    // result is none.
+} else {
+    // none has been removed from result's type.
+}
+```
+
+A union-member test inspects the union's active tag. A nominal type test on an
+interface value compares its concrete runtime type descriptor. An interface
+test on another interface value consults the concrete type's method metadata and
+narrows the true branch to an intersection. A failed runtime interface test
+does not create a negative interface type, so its false branch retains the
+original interface type.
+
+Narrowing applies to the existing binding, does not evaluate its initializer
+again, and preserves its access capability. It can never recover `mut` access
+from a const reference.
+
+General `match` expressions, destructuring patterns, literal patterns, guards,
+and nested patterns are not part of the initial language. Exhaustive union
+dispatch is expressed with `if`/`else if`/`else`; a union-only exhaustive
+`match` may be added later as ergonomic syntax over the same tag tests and
+projections.
+
+### 8.2 Recoverable errors and propagation
 
 Recoverable errors are ordinary union values. SAO provides the built-in nominal
 parameterized type `Error<T>`, whose value carries error information of type
@@ -968,6 +1019,19 @@ This covariance is a specific rule for `Error`, not a general variance feature:
 ```text
 const specific: Error<IoError> = Error(IoError { /* ... */ });
 const combined: Error<IoError | ParseError> = specific;
+```
+
+The payload is available through the built-in const field `value`. Error unions
+can therefore be handled with ordinary narrowing:
+
+```text
+const result = myfunc();
+
+if result is Error<string> {
+    print(result.value);
+} else {
+    print(string(result));
+}
 ```
 
 The postfix `?` operator propagates an error without exceptions:
@@ -1322,7 +1386,7 @@ core:
 - Interface extension/default methods.
 - A `satisfies` operator that preserves an anonymous object's exact hidden type.
 - Nominal data-carrying enums.
-- Exhaustive pattern matching.
+- General `match` expressions and exhaustive pattern matching.
 - User-defined generic structs, functions, and interfaces, including generic
   constraints, general-purpose generic inference, and associated types.
 - `errdefer`.
@@ -1335,10 +1399,9 @@ does not need to support them.
 
 ## 14. Open design questions
 
-The following decisions are intentionally unresolved:
+The following decision is intentionally unresolved:
 
 1. **Modules:** imports, visibility, access control, and separate compilation.
-2. **Pattern matching:** whether and when it joins the initial implementation.
 
 ## 15. Current language sketch
 
