@@ -240,11 +240,12 @@ by structs or interfaces, and operands are never implicitly converted.
 | `&`, `\|`, `^`, `<<`, `>>` | `int`, `int` | `int` |
 | `~` | `int` | `int` |
 
-`==` and `!=` use the same-type deep-equality rules in Section 3.7 rather than
-numeric coercion or user-defined overloading. Strings support `+`, `==`, and
-`!=`, but not ordering. `bytes` values do not support `+`; binary concatenation
-uses the explicit built-in `bytes.concat(left, right)` operation, which creates
-a new mutable byte sequence.
+`==` and `!=` are available only when both operands have the same primitive
+type, as defined in Section 3.7. They do not perform numeric coercion or invoke
+user-defined operations. Strings support `+`, `==`, and `!=`, but not ordering.
+`bytes` values support neither equality nor `+`; binary concatenation uses the
+explicit built-in `bytes.concat(left, right)` operation, which creates a new
+mutable byte sequence.
 
 All operator operands are evaluated from left to right. `&&` and `||`
 short-circuit and evaluate their right operand only when required. Chained
@@ -411,48 +412,28 @@ The unit type is provisionally spelled `()`.
 
 ### 3.7 Equality
 
-Equality is value-based and deep. It is never defined as garbage-collected
-object-pointer identity.
+Equality is deliberately limited to primitive values. The operands of `==` and
+`!=` must have the same primitive type; there is no implicit conversion or
+user-defined equality.
 
-The operands of `==` and `!=` must have the same type, disregarding only their
-access capability. SAO does not implicitly widen either operand or compare
-unrelated nominal or interface types merely because their runtime values might
-overlap:
+- `int`, `bool`, and `char` compare their values.
+- `float` uses IEEE equality: NaN is unequal to every value, including itself,
+  and positive and negative zero compare equal.
+- `string` compares character contents, not its runtime representation or
+  storage address.
+- The sole values of `()` and `none` compare equal to values of their respective
+  types.
+- `!=` is the logical negation of `==`.
 
-```text
-const first = Position { x: 1.0, y: 2.0 };
-const second = Position { x: 1.0, y: 2.0 };
+Equality is not defined for `bytes`, named or anonymous structs, interfaces,
+callable values, unions, intersections, or `Error<T>`. Attempting to compare
+such values is a compile-time error. A union must first be narrowed to a
+primitive member before that member can be compared; a union does not become
+comparable merely because all of its members are primitive.
 
-first == second // true, despite being separately allocated objects
-```
-
-Deep equality recursively compares the value's stored contents:
-
-- Primitive values compare according to their primitive equality rules.
-- Strings compare their character contents and bytes values compare their byte
-  contents.
-- Struct values of the same nominal type compare their fields recursively;
-  methods are not data and do not participate.
-- Anonymous structs compare their declared fields and hidden captures when they
-  have the same compiler-generated nominal type.
-- Union values compare equal when they have the same active member and their
-  payloads compare equal. Two `none` values compare equal.
-- Interface values may be compared only when their static interface types are
-  the same. Values with different concrete runtime types compare unequal;
-  values with the same concrete runtime type use that type's generated deep
-  equality operation, including hidden fields and captures.
-
-Access qualifiers do not change value equality. A `mut Position` and a const
-`Position` may therefore be compared without granting mutable access through
-the const reference.
-
-Pointer identity must not stand in for comparing stored values; for example, an
-object containing NaN is not made equal to itself merely because both operands
-refer to the same allocation. Deep comparison must be cycle-safe because
-garbage-collected object graphs may contain cycles. It keeps track of object
-pairs already being compared so recursive cycles terminate. Object-sharing
-topology is not itself part of the value: a shared subobject and two separately
-allocated but deeply equal subobjects compare equally.
+SAO has no general object-identity or pointer-equality operator. Runtime object
+pointers used to implement garbage-collected values and interfaces are not
+observable through `==` or `!=`.
 
 ## 4. Expression-oriented blocks
 
@@ -721,8 +702,8 @@ direction is exact signature matching and no method overloading.
 Every concrete struct type, including a compiler-generated anonymous type, has
 one runtime type descriptor. Its identity is unique even when another nominal
 type has the same fields and methods. The descriptor contains the type's GC
-tracing information, diagnostic identity, generated deep-equality operation,
-and a single sorted array of all interface-callable methods.
+tracing information, diagnostic identity, and a single sorted array of all
+interface-callable methods.
 
 Each method has a canonical method identity derived from:
 
@@ -1519,7 +1500,6 @@ Conceptual interface representation and dispatch metadata:
                          +-----------------------------+
                          | concrete type identity      |
                          | GC tracing metadata         |
-                         | deep-equality operation     |
                          | sorted method dictionary    |
                          +-----------------------------+
 ```
