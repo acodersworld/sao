@@ -18,6 +18,7 @@ SAO should be:
 - Flexible enough to express union and intersection types.
 - Nominal for data definitions and structural for behavioural interfaces.
 - Equipped with first-class anonymous functions and capturing anonymous structs.
+- Equipped with explicitly scheduled cooperative coroutines and typed queues.
 - Pleasant for small programs and experimentation.
 - Implementable through a backend-neutral IR.
 - Initially compilable through portable C using an external compiler driver such
@@ -26,9 +27,12 @@ SAO should be:
 The first implementation should favour clear semantics and good diagnostics over
 advanced optimization.
 
-SAO functions execute synchronously from call to return. The language does not
-provide coroutines, generators, async functions, `co`, or `yield`, and the IR and
-runtime do not need to preserve suspended function activations.
+SAO execution is strictly single-threaded but supports cooperatively scheduled
+coroutines. An ordinary call remains part of the current coroutine; if that call
+eventually executes `yield()`, the whole calling coroutine is suspended. No
+coroutine runs concurrently with another, and the scheduler can change the
+running coroutine only at an explicit `yield()` or when a non-main coroutine
+returns. SAO does not provide preemptive threads, generators, or async functions.
 
 An initial SAO program consists of one source file. All named declarations share
 that file's program namespace. The language does not initially provide modules,
@@ -1301,7 +1305,114 @@ const divisor = for mut candidate = 2;
 SAO has no loop labels. `break` and `continue` always target the innermost
 enclosing loop.
 
-## 10. Lexical `defer`
+## 10. Cooperative coroutines and queues
+
+SAO provides single-threaded cooperative coroutines. A coroutine is started by
+placing `co` before an ordinary function or method call:
+
+```text
+co run_worker(messages);
+co service.process(request);
+```
+
+`co` uses call-only syntax. It prepares the call immediately using the same
+left-to-right evaluation order as an ordinary call: the function value or method
+receiver is evaluated first, followed by its arguments. The resulting function,
+receiver, and argument values are saved in a new coroutine, which is appended to
+the ready queue. The called function body does not begin executing as part of
+the `co` statement.
+
+The called function may have any return type. Its eventual return value,
+including an `Error<T>`, is discarded. The `co` statement itself produces `()`.
+There are initially no coroutine handles, joins, cancellation operations, or
+parent-child lifetime relationships.
+
+The program begins with `main` as its initial coroutine. Ready coroutines are
+scheduled in first-in, first-out order. The built-in function:
+
+```text
+yield() -> ()
+```
+
+appends the current coroutine to the end of the ready queue and resumes the
+oldest other ready coroutine. If there is no other ready coroutine, `yield()`
+returns immediately. A coroutine that does not yield can starve every other
+coroutine.
+
+Returning from a non-main coroutine discards its result and resumes the oldest
+ready coroutine. Once `main` has completed its lexical deferred actions and
+returns, the process terminates immediately and abandons every remaining
+coroutine, whether ready or suspended. Deferred actions belonging to abandoned
+coroutines do not run.
+
+`yield()` is the only voluntary scheduling point. Creating a coroutine, sending
+or receiving through a queue, allocating memory, and performing I/O do not
+implicitly yield. A blocking operating-system or C runtime call therefore blocks
+the entire SAO program. A panic in any coroutine follows the ordinary panic rule
+and terminates the entire process without unwinding any coroutine.
+
+Yielding is transitive through ordinary calls. If `outer` calls `inner` and
+`inner` executes `yield()`, both activations remain suspended as part of the same
+coroutine:
+
+```text
+fn outer() -> () {
+    inner();
+}
+
+fn inner() -> () {
+    yield();
+}
+```
+
+### 10.1 Queues
+
+Coroutines communicate through the compiler-known built-in reference type
+`Queue<T>`. Like `Error<T>`, this is a dedicated parameterized type and does not
+enable user-defined generics. A fresh queue is constructed with:
+
+```text
+mut messages = Queue<int>();
+```
+
+Queues are unbounded and preserve first-in, first-out message order. Their
+initial operations are conceptually:
+
+```text
+fn send(mut self, value: T) -> ();
+fn try_receive(mut self) -> T | none;
+```
+
+`send` appends a value and completes without scheduling another coroutine.
+`try_receive` removes and returns the oldest value when one exists, or returns
+`none` immediately when the queue is empty. It never waits and never invokes the
+scheduler. A function waiting for a message must explicitly call `yield()` and
+try again:
+
+```text
+const message: int = loop {
+    const received = messages.try_receive();
+
+    if received is int {
+        break received;
+    }
+
+    yield();
+};
+```
+
+The initial `Queue<T>` requires that `T` not contain `none`; otherwise an empty
+queue could not be distinguished from a successfully received `none` value.
+A future explicitly tagged receive-result type may remove this restriction.
+
+Sending follows ordinary assignment semantics. Independently copied value types
+are copied into the queue; reference values copy their object reference and
+preserve the access capability admitted by `T`. Queue references themselves may
+be shared between coroutines under SAO's existing aliasing and capability rules.
+Because scheduling never occurs during a queue operation, each operation
+completes before another coroutine can access the queue.
+
+## 11. Lexical `defer`
 
 SAO has call-only `defer` syntax with lexical block scope:
 
@@ -1349,6 +1460,13 @@ Error propagation is an ordinary early return and performs lexical cleanup.
 Panics terminate without unwinding, so deferred actions do not run after a
 panic begins.
 
+A deferred call may itself execute `yield()`, directly or through another call.
+In that case the coroutine suspends while exiting the scope. After it resumes,
+that deferred call completes and the remaining deferred calls continue in
+reverse registration order. If a deferred call in `main` yields, other ready
+coroutines may run before `main` finishes; once all of `main`'s deferred calls
+complete and `main` returns, the remaining coroutines are abandoned.
+
 Lexical scope means a defer inside a loop iteration runs at the end of that
 iteration:
 
@@ -1361,7 +1479,7 @@ for path in paths {
 }
 ```
 
-## 11. Backend-oriented lowering
+## 12. Backend-oriented lowering
 
 SAO's semantics should not depend on non-standard C extensions.
 
@@ -1388,6 +1506,29 @@ Loop expressions similarly lower to a result temporary plus ordinary branches.
 The IR, rather than the C syntax, should represent block parameters, loop result
 values, and cleanup edges.
 
+The initial coroutine implementation uses explicit compiler-generated activation
+frames rather than native C stack suspension. Every generated C function accepts
+a pointer to a frame struct containing its parameters, source locals,
+intermediate values, saved deferred calls, caller link, and current execution
+state. The first implementation may retain every local in the frame for
+simplicity; a later optimization may retain only values live across possible
+suspension points.
+
+Every function uses a uniform resumable calling protocol, including functions
+that never yield. A function that directly executes `yield()`, or that can call
+another function which may yield, is lowered as a state machine with resume
+states around its suspension-capable operations. This transitive rule applies to
+ordinary calls, recursion, anonymous-function calls, and interface dispatch. The
+uniform protocol avoids exposing a coroutine effect in source function types and
+allows a single callable value or interface requirement to refer to both
+yielding and non-yielding implementations.
+
+Each coroutine owns a linked chain of activation frames representing its SAO
+call stack. `yield()` preserves that chain and returns control to the runtime
+scheduler. Resumption invokes the top frame at its saved state. Returning from a
+function removes its frame and delivers its result to the saved caller state;
+returning from the coroutine's root frame completes that coroutine.
+
 Generated C includes standard `#line` directives that map generated statements
 back to their originating SAO file and line. C compiler diagnostics and debug
 locations therefore refer to the SAO source rather than the generated C file.
@@ -1404,9 +1545,9 @@ without first invoking C undefined behaviour. It must also preserve SAO's
 defined evaluation order rather than accidentally inheriting C's unspecified
 or undefined behaviour.
 
-## 12. Runtime representation and memory management
+## 13. Runtime representation and memory management
 
-### 12.1 Initial memory-management model
+### 13.1 Initial memory-management model
 
 SAO will initially use a simple tracing garbage collector rather than reference
 counting. The intended first implementation is a single-threaded,
@@ -1416,14 +1557,16 @@ Initial collector rules:
 
 - Heap allocations are managed by the collector.
 - Compiler-generated metadata identifies references held by heap objects.
-- The C backend provides precise roots through compiler-generated shadow-stack
-  frames. Each active generated function links a frame containing its live GC
-  references into the runtime shadow stack and unlinks it before returning.
-  The collector does not conservatively scan the native C stack.
+- Compiler-generated coroutine activation frames are traced heap objects. Each
+  coroutine roots the top of its linked frame chain, and the scheduler roots the
+  running coroutine and every coroutine in the ready queue. Frame metadata uses
+  the saved execution state to identify initialized live references. The
+  collector does not conservatively scan the native C stack.
 - Collection occurs only at well-defined safe points, initially allocation
   points.
 - Anonymous-function environments, anonymous-struct environments, and shared
-  cells created for mutable captures are ordinary traced heap objects.
+  cells created for mutable captures are ordinary traced heap objects. Coroutine
+  objects, activation frames, queues, and queued values are traced as well.
 - Reference cycles are collected naturally.
 - The first implementation has no user-defined destructors, finalizers, weak
   references, generational collection, or incremental collection.
@@ -1439,7 +1582,7 @@ pointers remain stable and the portable C backend stays straightforward. More
 advanced collectors may be considered later without changing the language's
 observable memory-safety guarantees.
 
-### 12.2 Specialized union representation
+### 13.2 Specialized union representation
 
 The initial C backend uses a specialized representation for every distinct
 normalized union type. It does not use a universal tagged `Value` representation.
@@ -1470,7 +1613,7 @@ The IR represents union construction, projection, and conversion without
 embedding this layout. A future interpreter or other backend may use a different
 internal representation without changing SAO semantics.
 
-### 12.3 Concrete value representations
+### 13.3 Concrete value representations
 
 Every garbage-collected allocation begins with a common object header. The
 object pointer addresses the start of this header, whose first word is the
@@ -1488,8 +1631,8 @@ vtable pointer:
 The vtable combines concrete type identity, diagnostic information, a generated
 GC tracing function, an optional runtime-only auxiliary-storage release
 function, and the sorted method dictionary. Runtime-only object kinds such as
-closure environments and shared capture cells use vtables with empty method
-dictionaries.
+closure environments, shared capture cells, coroutine activation frames, and
+queues use vtables with empty method dictionaries.
 
 `int` and `float` are unboxed 64-bit values. `bool` is an unboxed Boolean, and
 `char` is an unboxed unsigned byte restricted to 0 through 127.
@@ -1529,7 +1672,12 @@ as its underlying struct reference. Dispatch follows the object header's vtable
 pointer and searches its sorted method dictionary. Anonymous interface objects
 are compiler-generated structs with the same representation.
 
-## 13. Deferred features
+A queue object stores its length, capacity, head position, and a pointer to raw
+ring-buffer storage specialized for its element type. Its generated tracing
+function visits the occupied elements that contain references. Its runtime
+release function frees the raw buffer when the collector sweeps the queue.
+
+## 14. Deferred features
 
 These ideas are desirable but are explicitly not part of the immediate language
 core:
@@ -1544,13 +1692,15 @@ core:
 - A Cranelift JIT or native object backend.
 - A built-in linker or executable writer.
 - Native threads and shared-memory concurrency.
+- Coroutine handles, joining, cancellation, blocking queue operations, and
+  scheduler preemption.
 - Modules, imports, visibility and access control, external package management,
   and separate compilation.
 
 The IR should avoid preventing these additions, but the first implementation
 does not need to support them.
 
-## 14. Current language sketch
+## 15. Current language sketch
 
 The following example combines the currently agreed ideas. File APIs remain
 illustrative and are not part of the initial built-in surface:
