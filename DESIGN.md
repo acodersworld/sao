@@ -187,8 +187,8 @@ SAO has a deliberately small, fixed primitive set:
 - `bool` has the values `true` and `false`. Conditions require `bool`; SAO has
   no implicit truthiness conversions.
 - `char` is a one-byte ASCII value in the range 0 through 127.
-- `string` is a garbage-collected immutable sequence of one-byte ASCII
-  characters.
+- `string` is a garbage-collected mutable sequence of one-byte ASCII
+  characters. It is a reference type despite being part of the primitive set.
 - `()` is the unit type and has one value, also written `()`.
 - `none` is the singleton absence type and value described with unions in
   Section 8.
@@ -262,8 +262,8 @@ Assignment and compound assignment produce `()`. Compound forms `+=`, `-=`,
 `*=`, `/=`, and `%=` use the corresponding operator rules and require a mutable
 destination. The bitwise compound forms `&=`, `|=`, `^=`, `<<=`, and `>>=` are
 also available for `int`. A compound-assignment destination is evaluated once,
-before its right operand. `+=` on a mutable string binding concatenates into a
-new string and rebinds the destination; it does not mutate the existing string.
+before its right operand. `+=` through mut access to a string appends the right
+string to the existing object; all aliases observe the mutation.
 
 Examples of rejected implicit conversions include:
 
@@ -344,13 +344,20 @@ String rules:
 
 - String and character literals must contain only ASCII; other characters are
   compile-time diagnostics.
+- Evaluating a string literal creates a fresh mutable string object. Binding it
+  with `const` reduces that access to a read-only reference; literals are not
+  shared mutable singleton objects.
 - `string[index]` performs constant-time character indexing and returns `char`.
-- An out-of-range string index panics.
+- Indexed assignment through mut access accepts a `char`.
+- Out-of-range indexing or indexed assignment panics.
 - String length and encoded byte length are identical and available in constant
   time.
-- Strings are immutable. A `mut` string binding may be rebound, but its existing
-  contents cannot be modified.
-- Concatenation creates a new string.
+- A const string reference is transitively read-only. A mut string reference
+  supports indexed mutation, append, extend, and resize.
+- Assignment, parameter passing, returning, and capture copy the string object
+  reference. Mutations are visible through every alias to that object.
+- Concatenation with `+` creates a new mutable string and does not modify either
+  operand.
 
 The built-in `bytes` type is a garbage-collected sequence of arbitrary byte
 values from 0 through 255. It is separate from `string`:
@@ -406,7 +413,8 @@ The unit type and its sole value are both spelled `()`.
 ### 3.7 Equality
 
 Equality is deliberately limited to primitive values. The operands of `==` and
-`!=` must have the same primitive type; there is no implicit conversion or
+`!=` must have the same primitive base type; differing const and mut access to a
+string does not prevent comparison. There is no implicit conversion or
 user-defined equality.
 
 - `int`, `bool`, and `char` compare their values.
@@ -1429,8 +1437,9 @@ Likely initial representations include:
 - `int` and `float` values represented as unboxed 64-bit values.
 - `char` values represented as unboxed unsigned bytes restricted to 0 through
   127.
-- `string` values represented as stable pointers to garbage-collected
-  length-plus-ASCII-data objects.
+- `string` values represented as stable pointers to garbage-collected mutable
+  sequence objects containing a length, capacity, and replaceable ASCII storage
+  pointer, using the same outer-object model as `bytes`.
 - `bytes` values represented as stable pointers to garbage-collected mutable
   byte buffers.
 - Struct values represented as stable pointers to garbage-collected objects.
