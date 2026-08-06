@@ -1279,7 +1279,7 @@ part of the intended loop design.
 
 ## 10. Lexical `defer`
 
-SAO has Go-like `defer` syntax with lexical block scope:
+SAO has call-only `defer` syntax with lexical block scope:
 
 ```text
 fn read_file(path: string) -> string {
@@ -1304,27 +1304,16 @@ only if execution reaches it. A function body, an `if` branch, a loop body or
 iteration, and a standalone expression block therefore each establish their own
 defer scope.
 
-For a deferred call, the function or method value, receiver, and arguments are
-evaluated immediately at the defer statement and saved. Only the invocation is
-delayed:
+The only valid form is `defer` followed by a function or method call. A block or
+any other statement or expression is rejected. The function or method value,
+receiver, and arguments are evaluated immediately at the defer statement and
+saved. Only the invocation is delayed, and its eventual result is discarded:
 
 ```text
 mut value = 1;
 defer print(value); // Saves 1.
 value = 2;
 // Prints 1 when this block exits.
-```
-
-The contents of a deferred block are instead evaluated when the block exits.
-References to surrounding bindings use their values at that later time:
-
-```text
-mut value = 1;
-defer {
-    print(value);
-}
-value = 2;
-// Prints 2 when this block exits.
 ```
 
 Before an early transfer, any associated value expression is evaluated first,
@@ -1335,15 +1324,6 @@ and then the transfer occurs. This applies to `return expression`,
 Error propagation is an ordinary early return and performs lexical cleanup.
 Panics terminate without unwinding, so deferred actions do not run after a
 panic begins.
-
-Block form is also supported:
-
-```text
-defer {
-    transaction.release_lock();
-    logger.debug("lock released");
-}
-```
 
 Lexical scope means a defer inside a loop iteration runs at the end of that
 iteration:
@@ -1356,10 +1336,6 @@ for path in paths {
     process(file);
 }
 ```
-
-Still to specify:
-
-- Restrictions on control flow inside deferred blocks.
 
 ## 11. Backend-oriented lowering
 
