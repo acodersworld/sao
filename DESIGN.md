@@ -80,8 +80,7 @@ Compiler selection should eventually follow this order:
 4. `gcc` if available.
 5. A clear diagnostic explaining that `emit-c` remains available.
 
-The compiler implementation language has not been finalized. Rust remains a
-strong candidate.
+The SAO compiler is implemented in Rust.
 
 ## 3. Static typing and inference
 
@@ -408,7 +407,7 @@ fn print_user(user: User) -> () {
 }
 ```
 
-The unit type is provisionally spelled `()`.
+The unit type and its sole value are both spelled `()`.
 
 ### 3.7 Equality
 
@@ -1258,24 +1257,8 @@ const divisor = for mut candidate = 2;
   `else`.
 - `continue` does not contribute a result value.
 
-### 9.4 Labeled loops
-
-Labels allow a nested loop to produce the result of an outer loop:
-
-```text
-const result: Cell | none = outer: for row in grid {
-    for cell in row {
-        if cell.matches(target) {
-            break outer cell;
-        }
-    }
-} else {
-    none
-};
-```
-
-The exact label grammar is provisional, but labels and labeled value breaks are
-part of the intended loop design.
+SAO has no loop labels. `break` and `continue` always target the innermost
+enclosing loop.
 
 ## 10. Lexical `defer`
 
