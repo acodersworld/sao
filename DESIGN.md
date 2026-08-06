@@ -67,12 +67,16 @@ The initial compiler exposes one build command:
 
 ```text
 sao build --cc clang program.sao
+sao build --debug --cc clang program.sao
 ```
 
 `--cc` is required and names the C compiler executable to invoke. The compiler
 is selected explicitly; SAO does not consult the `CC` environment variable or
 automatically search for Clang or GCC. Another compatible compiler may be used
 by passing its executable name or path to `--cc`.
+
+Builds are optimized release builds by default. The optional `--debug` flag
+selects an unoptimized build with debug information.
 
 The SAO compiler is implemented in Rust.
 
@@ -1013,14 +1017,8 @@ mut stream = Reader & Writer {
 };
 ```
 
-Named interface composition may eventually use embedded interfaces:
-
-```text
-interface ReadWriter {
-    Reader;
-    Writer;
-}
-```
+SAO has no named interface-composition syntax. Call sites express combined
+requirements directly with intersection types such as `Reader & Writer`.
 
 Runtime interface narrowing, such as narrowing a `Reader` to
 `Reader & Writer` after `value is Writer`, uses the runtime method metadata
@@ -1351,14 +1349,15 @@ Loop expressions similarly lower to a result temporary plus ordinary branches.
 The IR, rather than the C syntax, should represent block parameters, loop result
 values, and cleanup edges.
 
-Generated C should eventually include `#line` directives so compiler diagnostics
-refer back to the original SAO source.
+Generated C includes standard `#line` directives that map generated statements
+back to their originating SAO file and line. C compiler diagnostics and debug
+locations therefore refer to the SAO source rather than the generated C file.
 
-Debug and release builds can initially map to conventional C compiler modes:
+Build mode maps to these C compiler flags:
 
 ```text
-debug:   -O0 -g
-release: -O2
+default:  -O2
+--debug:  -O0 -g
 ```
 
 The backend must implement SAO's trapping integer overflow and shift bounds
