@@ -80,6 +80,19 @@ selects an unoptimized build with debug information.
 
 The SAO compiler is implemented in Rust.
 
+Every runnable program declares exactly one top-level entry function with this
+signature:
+
+```text
+fn main() -> () {
+    // Program body.
+}
+```
+
+`main` takes no arguments and must return `()`. Normal completion returns process
+status zero; a panic returns a nonzero status. A missing entry function or a
+different `main` signature is a compile-time error.
+
 ## 3. Static typing and inference
 
 SAO is statically typed. Programs are rejected when their operations cannot be
@@ -248,6 +261,17 @@ All operator operands are evaluated from left to right. `&&` and `||`
 short-circuit and evaluate their right operand only when required. Chained
 comparisons are not a special form, so `a < b < c` is rejected because the
 first comparison produces `bool`.
+
+For operators that SAO shares with C, precedence and associativity follow C.
+From highest to lowest, the binary precedence groups are multiplicative,
+additive, shifts, relational (including `is`), equality, bitwise AND, bitwise
+XOR, bitwise OR, logical AND, and logical OR. Binary operators associate left.
+Postfix calls, member access, indexing, and `?` bind more tightly than unary
+operators; parentheses override precedence.
+
+SAO does not adopt C's unspecified function-argument evaluation order. An
+ordinary call evaluates its function value, or its method receiver, first and
+then evaluates arguments from left to right before invoking the function.
 
 Integer division truncates toward zero. Integer remainder is defined by
 `left == (left / right) * right + (left % right)` and has the dividend's sign
@@ -439,6 +463,21 @@ comparable merely because all of its members are primitive.
 SAO has no general object-identity or pointer-equality operator. Runtime object
 pointers used to implement garbage-collected values and interfaces are not
 observable through `==` or `!=`.
+
+### 3.8 Initial output built-in
+
+The initial general-purpose output API consists only of:
+
+```text
+print(text: string) -> ()
+println(text: string) -> ()
+```
+
+`print` writes the string's contents exactly to standard output and does not add
+a newline. `println` writes the contents followed by exactly one newline. Other
+primitive values must first be converted explicitly to `string`. File and other
+I/O APIs will be designed separately and are not part of this initial built-in
+surface.
 
 ## 4. Expression-oriented blocks
 
@@ -1295,10 +1334,10 @@ receiver, and arguments are evaluated immediately at the defer statement and
 saved. Only the invocation is delayed, and its eventual result is discarded:
 
 ```text
-mut value = 1;
-defer print(value); // Saves 1.
-value = 2;
-// Prints 1 when this block exits.
+mut value = "first";
+defer print(value); // Saves the first string object.
+value = "second";
+// Prints "first" when this block exits.
 ```
 
 Before an early transfer, any associated value expression is evaluated first,
@@ -1513,8 +1552,8 @@ does not need to support them.
 
 ## 14. Current language sketch
 
-The following example combines the currently agreed ideas. Some library types and
-error syntax remain illustrative:
+The following example combines the currently agreed ideas. File APIs remain
+illustrative and are not part of the initial built-in surface:
 
 ```text
 interface Reader {
