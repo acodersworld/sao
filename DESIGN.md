@@ -30,6 +30,10 @@ SAO functions execute synchronously from call to return. The language does not
 provide coroutines, generators, async functions, `co`, or `yield`, and the IR and
 runtime do not need to preserve suspended function activations.
 
+An initial SAO program consists of one source file. All named declarations share
+that file's program namespace. The language does not initially provide modules,
+imports, access-control modifiers, external packages, or separate compilation.
+
 ## 2. Compilation model
 
 The intended compiler pipeline is:
@@ -211,11 +215,73 @@ diagnostic; overflow at runtime causes an immediate panic in every build mode.
 There are no initial checked, wrapping, overflowing, or saturating arithmetic
 APIs.
 
-Division by zero, dividing the minimum `int` by `-1`, and a shift count outside
-the range `0` through `63` also panic. Floating-point overflow follows IEEE 754
-and may produce infinity rather than panicking.
+Division or remainder by zero, dividing or taking the remainder of the minimum
+`int` by `-1`, and a shift count outside the range `0` through `63` also panic.
+Floating-point overflow follows IEEE 754 and may produce infinity rather than
+panicking.
 
-### 3.3 Explicit conversions
+### 3.3 Operators
+
+SAO has a small fixed operator set. Operators cannot be declared or overloaded
+by structs or interfaces, and operands are never implicitly converted.
+
+| Operators | Operand types | Result type |
+| --- | --- | --- |
+| `+` | `int`, `int` | `int` |
+| `+` | `float`, `float` | `float` |
+| `+` | `string`, `string` | `string` |
+| `-`, `*`, `/` | `int`, `int` | `int` |
+| `-`, `*`, `/` | `float`, `float` | `float` |
+| `%` | `int`, `int` | `int` |
+| unary `-` | `int` or `float` | the operand type |
+| `<`, `<=`, `>`, `>=` | two `int`, two `float`, or two `char` values | `bool` |
+| `!` | `bool` | `bool` |
+| `&&`, `\|\|` | `bool`, `bool` | `bool` |
+| `&`, `\|`, `^`, `<<`, `>>` | `int`, `int` | `int` |
+| `~` | `int` | `int` |
+
+`==` and `!=` use the same-type deep-equality rules in Section 3.7 rather than
+numeric coercion or user-defined overloading. Strings support `+`, `==`, and
+`!=`, but not ordering. `bytes` values do not support `+`; binary concatenation
+uses the explicit built-in `bytes.concat(left, right)` operation, which creates
+a new mutable byte sequence.
+
+All operator operands are evaluated from left to right. `&&` and `||`
+short-circuit and evaluate their right operand only when required. Chained
+comparisons are not a special form, so `a < b < c` is rejected because the
+first comparison produces `bool`.
+
+Integer division truncates toward zero. Integer remainder is defined by
+`left == (left / right) * right + (left % right)` and has the dividend's sign
+when nonzero. The trapping cases in Section 3.2 apply before the backend performs
+an operation that could invoke C undefined behaviour.
+
+Bitwise integer operations use the two's-complement 64-bit representation of
+`int`. Left shift inserts zero bits and discards bits shifted past the high end;
+it does not perform an arithmetic-overflow check. Right shift is arithmetic and
+replicates the sign bit. A shift count outside `0` through `63` panics.
+
+SAO has no unary `+`, `++`, or `--`, and initially has no floating-point
+remainder operator.
+
+Assignment and compound assignment produce `()`. Compound forms `+=`, `-=`,
+`*=`, `/=`, and `%=` use the corresponding operator rules and require a mutable
+destination. The bitwise compound forms `&=`, `|=`, `^=`, `<<=`, and `>>=` are
+also available for `int`. A compound-assignment destination is evaluated once,
+before its right operand. `+=` on a mutable string binding concatenates into a
+new string and rebinds the destination; it does not mutate the existing string.
+
+Examples of rejected implicit conversions include:
+
+```text
+1 + 2.0
+1 == 1.0
+'a' + 1
+"count: " + 10
+true + true
+```
+
+### 3.4 Explicit conversions
 
 SAO performs no implicit numeric conversions. `int` and `float` remain distinct
 through assignment, argument passing, returns, arithmetic, comparisons, and
@@ -258,7 +324,7 @@ invalid constant conversion is a compile-time diagnostic when detectable.
 using round-to-nearest with ties to even when precision is lost. `char(value)`
 accepts only an integer from 0 through 127 and panics otherwise.
 
-### 3.4 Floating-point behavior
+### 3.5 Floating-point behavior
 
 Float arithmetic follows strict IEEE 754 binary64 semantics:
 
@@ -273,7 +339,7 @@ Float arithmetic follows strict IEEE 754 binary64 semantics:
 - The backend must not enable unsafe fast-math transformations or silently use
   extra intermediate precision.
 
-### 3.5 ASCII strings and byte sequences
+### 3.6 ASCII strings and byte sequences
 
 SAO deliberately does not provide Unicode text semantics. A `char` occupies one
 byte but permits only ASCII values 0 through 127. A `string` stores an explicit
@@ -302,6 +368,8 @@ values from 0 through 255. It is separate from `string`:
 - A `mut bytes` reference supports indexed mutation, append, extend, and resize.
 - `length()` returns the byte count in constant time.
 - Slicing initially creates an independent copy.
+- `bytes.concat(left, right)` creates a new mutable byte sequence containing the
+  contents of `left` followed by `right`.
 - Files and other binary I/O use `bytes`.
 
 ASCII conversion is explicit. Encoding always succeeds; decoding fails when a
@@ -341,7 +409,7 @@ fn print_user(user: User) -> () {
 
 The unit type is provisionally spelled `()`.
 
-### 3.6 Equality
+### 3.7 Equality
 
 Equality is value-based and deep. It is never defined as garbage-collected
 object-pointer identity.
@@ -501,7 +569,7 @@ teleport(velocity); // Type error.
 
 Conversions between nominal structs are explicit.
 
-Struct construction is provisionally written:
+Struct construction is written:
 
 ```text
 const position = Position {
@@ -509,6 +577,53 @@ const position = Position {
     y: 20.0,
 };
 ```
+
+Construction uses named fields. Every declared field must be initialized exactly
+once; missing, duplicate, and unknown fields are compile-time errors. Field
+initializers may appear in any order and are evaluated from top to bottom in the
+order written in the construction expression, not in declaration order:
+
+```text
+const position = Position {
+    y: calculate_y(), // Evaluated first.
+    x: calculate_x(), // Evaluated second.
+};
+```
+
+Field labels do not introduce local bindings, so one initializer cannot refer to
+an earlier initializer merely by using its field name. Each initializer must be
+assignable to the declared field type and must obey the reference-capability
+rules.
+
+Named struct declarations may refer to themselves and to structs declared later
+in the same program. Recursive and mutually recursive struct types have finite
+layouts because struct values are references:
+
+```text
+struct Node {
+    value: int,
+    next: Node | none,
+}
+```
+
+The binding receiving a constructed value does not enter scope until its entire
+initializer completes. A construction expression has no implicit `self`, and a
+partially initialized object cannot be referenced or passed to SAO code. Cyclic
+object graphs are instead created in multiple steps through mutable references:
+
+```text
+mut node = Node {
+    value: 1,
+    next: none,
+};
+
+node.next = node;
+```
+
+The implementation may allocate and root the object before evaluating its field
+initializers, but that partially initialized storage is not observable by the
+source program. A field initializer that exits through `?` leaves the incomplete
+allocation unreachable and eligible for garbage collection.
 
 Methods are declared directly in the struct body alongside its fields. SAO has
 no separate `impl` block and does not attach methods to a struct after its
@@ -527,6 +642,9 @@ const position = struct {
     }
 };
 ```
+
+Anonymous-struct field initializers follow the same top-to-bottom source order
+and partial-initialization rules as named struct construction.
 
 The source program cannot name the anonymous struct's generated type, but local
 inference may retain that one exact hidden type. It may be passed to any
@@ -595,9 +713,8 @@ Nominal structs and structural interfaces deliberately coexist:
   behaviour.
 
 Methods can only be declared inside the named or anonymous struct that owns
-them. Method matching, variance, and visibility still need formal
-specification. The initial direction is exact signature matching and no method
-overloading.
+them. Method matching and variance still need formal specification. The initial
+direction is exact signature matching and no method overloading.
 
 ### 6.1 Runtime method identity and interface dispatch
 
@@ -1200,6 +1317,40 @@ Deferred actions execute:
 - Before `break` or `continue` exits their scope.
 - Before `?` propagation exits their scope.
 
+`defer` is permitted in the statement list of every executable lexical block.
+It belongs to the innermost block containing the statement and is registered
+only if execution reaches it. A function body, an `if` branch, a loop body or
+iteration, and a standalone expression block therefore each establish their own
+defer scope.
+
+For a deferred call, the function or method value, receiver, and arguments are
+evaluated immediately at the defer statement and saved. Only the invocation is
+delayed:
+
+```text
+mut value = 1;
+defer print(value); // Saves 1.
+value = 2;
+// Prints 1 when this block exits.
+```
+
+The contents of a deferred block are instead evaluated when the block exits.
+References to surrounding bindings use their values at that later time:
+
+```text
+mut value = 1;
+defer {
+    print(value);
+}
+value = 2;
+// Prints 2 when this block exits.
+```
+
+Before an early transfer, any associated value expression is evaluated first,
+then the deferred actions for each exited scope run from innermost to outermost,
+and then the transfer occurs. This applies to `return expression`,
+`break expression`, and error propagation with `?`.
+
 Error propagation is an ordinary early return and performs lexical cleanup.
 Panics terminate without unwinding, so deferred actions do not run after a
 panic begins.
@@ -1227,8 +1378,6 @@ for path in paths {
 
 Still to specify:
 
-- Whether deferred call arguments are evaluated at registration or execution.
-- Whether `defer` is allowed at every block scope.
 - Restrictions on control flow inside deferred blocks.
 
 ## 11. Backend-oriented lowering
@@ -1393,17 +1542,13 @@ core:
 - A Cranelift JIT or native object backend.
 - A built-in linker or executable writer.
 - Native threads and shared-memory concurrency.
+- Modules, imports, visibility and access control, external package management,
+  and separate compilation.
 
 The IR should avoid preventing these additions, but the first implementation
 does not need to support them.
 
-## 14. Open design questions
-
-The following decision is intentionally unresolved:
-
-1. **Modules:** imports, visibility, access control, and separate compilation.
-
-## 15. Current language sketch
+## 14. Current language sketch
 
 The following example combines the currently agreed ideas. Some library types and
 error syntax remain illustrative:
@@ -1448,14 +1593,14 @@ fn copy_once(mut stream: Reader & Writer) -> int {
 fn prefixed_writer(prefix: bytes, mut destination: Writer) -> mut Writer {
     Writer {
         fn write(mut self, data: bytes) -> int {
-            destination.write(prefix + data)
+            destination.write(bytes.concat(prefix, data))
         }
     }
 }
 
 fn make_prefixer(prefix: bytes) -> fn(bytes) -> bytes {
     fn(data: bytes) -> bytes {
-        prefix + data
+        bytes.concat(prefix, data)
     }
 }
 
