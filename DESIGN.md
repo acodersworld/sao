@@ -63,22 +63,16 @@ source -> typed IR ----+-> C backend -> clang/gcc -> executable
 The C compiler driver is responsible for assembling and linking. SAO does not
 initially need its own linker.
 
-Possible commands:
+The initial compiler exposes one build command:
 
 ```text
-sao emit-c program.sao
-sao build program.sao
 sao build --cc clang program.sao
-sao build --cc gcc program.sao
 ```
 
-Compiler selection should eventually follow this order:
-
-1. An explicit `--cc` argument.
-2. The `CC` environment variable.
-3. `clang` if available.
-4. `gcc` if available.
-5. A clear diagnostic explaining that `emit-c` remains available.
+`--cc` is required and names the C compiler executable to invoke. The compiler
+is selected explicitly; SAO does not consult the `CC` environment variable or
+automatically search for Clang or GCC. Another compatible compiler may be used
+by passing its executable name or path to `--cc`.
 
 The SAO compiler is implemented in Rust.
 
@@ -1374,9 +1368,10 @@ Initial collector rules:
 
 - Heap allocations are managed by the collector.
 - Compiler-generated metadata identifies references held by heap objects.
-- The C backend must provide precise roots, likely through compiler-generated
-  shadow-stack frames, rather than relying on conservative scanning of the C
-  stack.
+- The C backend provides precise roots through compiler-generated shadow-stack
+  frames. Each active generated function links a frame containing its live GC
+  references into the runtime shadow stack and unlinks it before returning.
+  The collector does not conservatively scan the native C stack.
 - Collection occurs only at well-defined safe points, initially allocation
   points.
 - Anonymous-function environments, anonymous-struct environments, and shared
