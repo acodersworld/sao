@@ -133,6 +133,25 @@ static SaoFunctionResult empty_function(
     };
 }
 
+static SaoFunctionResult invalid_status_function(
+    SaoTask *task,
+    SaoScheduler *scheduler,
+    void *frame,
+    SaoValue previous
+)
+{
+    (void) task;
+    (void) frame;
+    (void) previous;
+
+    assert(scheduler == NULL);
+
+    return (SaoFunctionResult) {
+        .status = (SaoFunctionStatus) -1,
+        .value = sao_value_unit(),
+    };
+}
+
 static size_t test_frame_record_size(size_t frame_size)
 {
     const size_t alignment = TEST_FRAME_ALIGNMENT;
@@ -173,6 +192,52 @@ static SaoFunctionResult yielding_function(
         .status = SAO_FUNCTION_RETURN,
         .value = sao_value_int(7),
     };
+}
+
+static void crash_frame_overflow(void)
+{
+    SaoTask task;
+    unsigned char frame = 0;
+
+    assert(sao_task_init(&task, 1));
+    (void) sao_task_push_function(
+        &task,
+        empty_function,
+        &frame,
+        SIZE_MAX
+    );
+    sao_task_deinit(&task);
+}
+
+static void crash_invalid_status(void)
+{
+    SaoTask task;
+
+    assert(sao_task_init(&task, 0));
+    assert(sao_task_push_function(
+        &task,
+        invalid_status_function,
+        NULL,
+        0
+    ));
+    (void) sao_task_run(&task, NULL);
+    sao_task_deinit(&task);
+}
+
+static void test_frame_overflow_crashes(void)
+{
+    sao_test_assert_crashes(
+        crash_frame_overflow,
+        "sao: task frame size overflow\n"
+    );
+}
+
+static void test_invalid_status_crashes(void)
+{
+    sao_test_assert_crashes(
+        crash_invalid_status,
+        "sao: invalid function status\n"
+    );
 }
 
 static void test_call_and_return(void)
@@ -296,8 +361,10 @@ static void test_stack_capacity(void)
 {
     SaoTask task;
     TestYieldFrame frame = {0};
+    size_t frame_capacity =
+        test_frame_record_size(sizeof(frame)) * SAO_TASK_STACK_CAPACITY;
 
-    assert(sao_task_init(&task, 0));
+    assert(sao_task_init(&task, frame_capacity));
 
     for (size_t index = 0; index < SAO_TASK_STACK_CAPACITY; index += 1) {
         assert(sao_task_push_function(
@@ -329,6 +396,8 @@ int main(void)
     sao_test_init();
 
     ADD_TEST(test_value_constructors);
+    ADD_TEST(test_frame_overflow_crashes);
+    ADD_TEST(test_invalid_status_crashes);
     ADD_TEST(test_empty_task);
     ADD_TEST(test_call_and_return);
     ADD_TEST(test_yield_and_resume);

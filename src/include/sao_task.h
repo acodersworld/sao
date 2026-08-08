@@ -10,7 +10,7 @@ enum {
     SAO_TASK_STACK_CAPACITY = 1024,
 };
 
-#define SAO_TASK_DEFAULT_FRAME_CAPACITY (1024u * 1024u)
+#define SAO_TASK_DEFAULT_FRAME_CAPACITY (8u * 1024u)
 
 typedef enum SaoTaskStatus {
     SAO_TASK_RUNNING,

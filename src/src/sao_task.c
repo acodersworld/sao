@@ -1,8 +1,9 @@
 #include "sao_task.h"
 
+#include "sao_crash.h"
+
 #include <assert.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,8 +18,7 @@ static size_t sao_frame_record_size(size_t frame_size)
     const size_t alignment = SAO_FRAME_ALIGNMENT;
 
     if (frame_size > SIZE_MAX - sizeof(size_t)) {
-        fprintf(stderr, "sao: task frame size overflow\n");
-        exit(EXIT_FAILURE);
+        sao_crash("task frame size overflow");
     }
 
     size_t size = frame_size + sizeof(size_t);
@@ -28,8 +28,7 @@ static size_t sao_frame_record_size(size_t frame_size)
         size_t padding = alignment - remainder;
 
         if (size > SIZE_MAX - padding) {
-            fprintf(stderr, "sao: task frame size overflow\n");
-            exit(EXIT_FAILURE);
+            sao_crash("task frame size overflow");
         }
 
         size += padding;
@@ -175,6 +174,9 @@ SaoTaskStatus sao_task_run(SaoTask *task, SaoScheduler *scheduler)
 
             previous = result.value;
             break;
+
+        default:
+            sao_crash("invalid function status");
         }
     }
 

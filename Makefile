@@ -13,11 +13,11 @@ TEST_BINARIES := \
 	$(SCHEDULER_TEST_BINARY) \
 	$(SCHEDULER_TASK_TEST_BINARY) \
 	$(TASK_TEST_BINARY)
-
 LIST_TEST_SOURCES := \
 	src/src/sao_list.c \
 	tests/sao_list_test.c
 SCHEDULER_TEST_SOURCES := \
+	src/src/sao_crash.c \
 	src/src/sao_list.c \
 	src/src/sao_scheduler.c \
 	src/src/sao_task.c \
@@ -25,6 +25,7 @@ SCHEDULER_TEST_SOURCES := \
 	tests/sao_test.c \
 	tests/sao_scheduler_test.c
 SCHEDULER_TASK_TEST_SOURCES := \
+	src/src/sao_crash.c \
 	src/src/sao_list.c \
 	src/src/sao_scheduler.c \
 	src/src/sao_task.c \
@@ -32,6 +33,7 @@ SCHEDULER_TASK_TEST_SOURCES := \
 	tests/sao_test.c \
 	tests/sao_scheduler_task_test.c
 TASK_TEST_SOURCES := \
+	src/src/sao_crash.c \
 	src/src/sao_list.c \
 	src/src/sao_task.c \
 	src/src/sao_value.c \
@@ -65,4 +67,4 @@ test: $(TEST_BINARIES)
 	./$(TASK_TEST_BINARY)
 
 clean:
-	$(RM) $(TEST_BINARIES)
+	$(RM) $(TEST_BINARIES) $(BUILD_DIR)/sao_crash_test

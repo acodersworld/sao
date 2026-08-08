@@ -35,6 +35,25 @@ static SaoFunctionResult sequence_function(
     };
 }
 
+static SaoFunctionResult recursive_run_function(
+    SaoTask *task,
+    SaoScheduler *scheduler,
+    void *frame,
+    SaoValue previous
+)
+{
+    (void) task;
+    (void) frame;
+    (void) previous;
+
+    sao_scheduler_run(scheduler);
+
+    return (SaoFunctionResult) {
+        .status = SAO_FUNCTION_RETURN,
+        .value = sao_value_unit(),
+    };
+}
+
 static bool push_sequence(
     SaoScheduler *scheduler,
     int id,
@@ -88,6 +107,30 @@ static void test_empty_scheduler(void)
     assert(scheduler.main_task == NULL);
     assert(scheduler.current_task == NULL);
     assert(sao_list_is_empty(&scheduler.ready));
+}
+
+static void crash_recursive_scheduler_run(void)
+{
+    SaoScheduler scheduler;
+    sao_scheduler_init(&scheduler);
+
+    assert(sao_scheduler_push_task(
+        &scheduler,
+        recursive_run_function,
+        NULL,
+        0,
+        0
+    ));
+    sao_scheduler_run(&scheduler);
+    sao_scheduler_deinit(&scheduler);
+}
+
+static void test_recursive_run_crashes(void)
+{
+    sao_test_assert_crashes(
+        crash_recursive_scheduler_run,
+        "sao: recursive scheduler run\n"
+    );
 }
 
 static void test_first_successful_task_is_main(void)
@@ -235,6 +278,7 @@ int main(void)
     sao_test_init();
 
     ADD_TEST(test_empty_scheduler);
+    ADD_TEST(test_recursive_run_crashes);
     ADD_TEST(test_first_successful_task_is_main);
     ADD_TEST(test_fifo_round_robin);
     ADD_TEST(test_non_main_completion);

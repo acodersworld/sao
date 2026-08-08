@@ -15,6 +15,11 @@ void sao_test_init(void);
 
 void sao_test_add(SaoTest *test);
 
+void sao_test_assert_crashes(
+    SaoTestFunction function,
+    const char *expected_error
+);
+
 int sao_test_run_all(void);
 
 #define ADD_TEST(test_function)                     \

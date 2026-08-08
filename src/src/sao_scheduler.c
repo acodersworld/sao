@@ -1,5 +1,7 @@
 #include "sao_scheduler.h"
 
+#include "sao_crash.h"
+
 #include <assert.h>
 #include <stdlib.h>
 
@@ -16,7 +18,9 @@ static void sao_scheduler_destroy_task(SaoSchedulerTask *scheduled_task)
 
 static void sao_scheduler_clear_tasks(SaoScheduler *scheduler)
 {
-    assert(scheduler->current_task == NULL);
+    if (scheduler->current_task != NULL) {
+        sao_crash("cannot deinitialize a running scheduler");
+    }
 
     SaoListLink *link;
 
@@ -83,7 +87,10 @@ bool sao_scheduler_push_task(
 void sao_scheduler_run(SaoScheduler *scheduler)
 {
     assert(scheduler != NULL);
-    assert(scheduler->current_task == NULL);
+
+    if (scheduler->current_task != NULL) {
+        sao_crash("recursive scheduler run");
+    }
 
     while (scheduler->main_task != NULL) {
         SaoListLink *link = sao_list_pop_front(&scheduler->ready);
