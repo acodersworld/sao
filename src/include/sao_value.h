@@ -24,4 +24,14 @@ typedef struct SaoValue {
     };
 } SaoValue;
 
+SaoValue sao_value_unit(void);
+
+SaoValue sao_value_int(int64_t value);
+
+SaoValue sao_value_float(double value);
+
+SaoValue sao_value_byte(uint8_t value);
+
+SaoValue sao_value_object(SaoObject *value);
+
 #endif

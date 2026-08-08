@@ -1,21 +1,22 @@
 #ifndef SAO_FUNCTION_H
 #define SAO_FUNCTION_H
 
-#include "sao_task.h"
 #include "sao_value.h"
 
-typedef enum SaoStepStatus {
-    SAO_STEP_CALL,
-    SAO_STEP_YIELD,
-    SAO_STEP_RETURN,
-} SaoStepStatus;
+typedef struct SaoTask SaoTask;
 
-typedef struct SaoStepResult {
-    SaoStepStatus status;
+typedef enum SaoFunctionStatus {
+    SAO_FUNCTION_CALL,
+    SAO_FUNCTION_YIELD,
+    SAO_FUNCTION_RETURN,
+} SaoFunctionStatus;
+
+typedef struct SaoFunctionResult {
+    SaoFunctionStatus status;
     SaoValue value;
-} SaoStepResult;
+} SaoFunctionResult;
 
-typedef SaoStepResult (*SaoFunction)(
+typedef SaoFunctionResult (*SaoFunction)(
     SaoTask *task,
     void *frame,
     SaoValue previous
