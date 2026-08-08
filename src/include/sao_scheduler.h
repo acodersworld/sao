@@ -12,6 +12,7 @@ typedef struct SaoSchedulerTask SaoSchedulerTask;
 struct SaoScheduler {
     SaoList ready;
     SaoSchedulerTask *main_task;
+    SaoSchedulerTask *current_task;
 };
 
 void sao_scheduler_init(SaoScheduler *scheduler);

@@ -35,6 +35,7 @@ static SaoFunctionResult child_function(
     (void) previous;
 
     assert(scheduler != NULL);
+    assert(scheduler->current_task != NULL);
     ChildFrame *frame = raw_frame;
     record_event(frame->log, 3);
 
@@ -55,6 +56,7 @@ static SaoFunctionResult parent_function(
     (void) previous;
 
     assert(scheduler != NULL);
+    assert(scheduler->current_task != NULL);
     ParentFrame *frame = raw_frame;
 
     if (frame->state == 0) {
@@ -117,6 +119,7 @@ static void test_function_can_schedule_task(void)
     }
 
     assert(scheduler.main_task == NULL);
+    assert(scheduler.current_task == NULL);
     assert(scheduler.ready.size == 0);
     sao_scheduler_deinit(&scheduler);
 }

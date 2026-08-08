@@ -79,12 +79,14 @@ static void test_empty_scheduler(void)
     sao_scheduler_init(&scheduler);
 
     assert(scheduler.main_task == NULL);
+    assert(scheduler.current_task == NULL);
     assert(sao_list_is_empty(&scheduler.ready));
 
     sao_scheduler_run(&scheduler);
     sao_scheduler_deinit(&scheduler);
 
     assert(scheduler.main_task == NULL);
+    assert(scheduler.current_task == NULL);
     assert(sao_list_is_empty(&scheduler.ready));
 }
 

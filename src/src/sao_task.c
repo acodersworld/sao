@@ -1,6 +1,8 @@
 #include "sao_task.h"
 
 #include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,11 +15,24 @@
 static size_t sao_frame_record_size(size_t frame_size)
 {
     const size_t alignment = SAO_FRAME_ALIGNMENT;
+
+    if (frame_size > SIZE_MAX - sizeof(size_t)) {
+        fprintf(stderr, "sao: task frame size overflow\n");
+        exit(EXIT_FAILURE);
+    }
+
     size_t size = frame_size + sizeof(size_t);
     size_t remainder = size % alignment;
 
     if (remainder != 0) {
-        size += alignment - remainder;
+        size_t padding = alignment - remainder;
+
+        if (size > SIZE_MAX - padding) {
+            fprintf(stderr, "sao: task frame size overflow\n");
+            exit(EXIT_FAILURE);
+        }
+
+        size += padding;
     }
 
     return size;

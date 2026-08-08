@@ -16,6 +16,8 @@ static void sao_scheduler_destroy_task(SaoSchedulerTask *scheduled_task)
 
 static void sao_scheduler_clear_tasks(SaoScheduler *scheduler)
 {
+    assert(scheduler->current_task == NULL);
+
     SaoListLink *link;
 
     while ((link = sao_list_pop_front(&scheduler->ready)) != NULL) {
@@ -32,6 +34,7 @@ void sao_scheduler_init(SaoScheduler *scheduler)
 
     sao_list_init(&scheduler->ready);
     scheduler->main_task = NULL;
+    scheduler->current_task = NULL;
 }
 
 bool sao_scheduler_push_task(
@@ -80,13 +83,16 @@ bool sao_scheduler_push_task(
 void sao_scheduler_run(SaoScheduler *scheduler)
 {
     assert(scheduler != NULL);
+    assert(scheduler->current_task == NULL);
 
     while (scheduler->main_task != NULL) {
         SaoListLink *link = sao_list_pop_front(&scheduler->ready);
         assert(link != NULL);
 
         SaoSchedulerTask *scheduled_task = (SaoSchedulerTask *) link;
+        scheduler->current_task = scheduled_task;
         SaoTaskStatus status = sao_task_run(&scheduled_task->task, scheduler);
+        scheduler->current_task = NULL;
 
         if (status == SAO_TASK_RUNNING) {
             sao_list_push_back(&scheduler->ready, &scheduled_task->link);
