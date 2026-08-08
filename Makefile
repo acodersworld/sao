@@ -6,8 +6,8 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Werror
 BUILD_DIR := build
 TEST_BINARY := $(BUILD_DIR)/sao_task_test
 TEST_SOURCES := \
-	src/sao_task.c \
-	src/sao_value.c \
+	src/src/sao_task.c \
+	src/src/sao_value.c \
 	tests/sao_task_test.c
 HEADERS := $(wildcard src/include/*.h)
 
