@@ -1,3 +1,4 @@
+#include "sao_list.h"
 #include "sao_task.h"
 
 #include <assert.h>
@@ -13,23 +14,17 @@
 typedef void (*TestFunction)(void);
 
 typedef struct Test {
+    SaoListLink link;
     const char *name;
     TestFunction function;
-    struct Test *next;
 } Test;
 
-static Test *test_head;
-static Test *test_tail;
+static SaoList tests;
 
 static void add_test(Test *test)
 {
-    if (test_tail == NULL) {
-        test_head = test;
-    } else {
-        test_tail->next = test;
-    }
-
-    test_tail = test;
+    sao_list_link_init(&test->link);
+    sao_list_push_back(&tests, &test->link);
 }
 
 #define ADD_TEST(test_function)                     \
@@ -44,8 +39,10 @@ static void add_test(Test *test)
 static int run_tests(void)
 {
     size_t passed = 0;
+    SaoListLink *link;
 
-    for (Test *test = test_head; test != NULL; test = test->next) {
+    while ((link = sao_list_pop_front(&tests)) != NULL) {
+        Test *test = (Test *) link;
         printf("[ RUN  ] %s\n", test->name);
         fflush(stdout);
         test->function();
@@ -364,6 +361,8 @@ static void test_stack_capacity(void)
 
 int main(void)
 {
+    sao_list_init(&tests);
+
     ADD_TEST(test_value_constructors);
     ADD_TEST(test_empty_task);
     ADD_TEST(test_call_and_return);
