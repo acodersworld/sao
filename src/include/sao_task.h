@@ -10,24 +10,31 @@ enum {
     SAO_TASK_STACK_CAPACITY = 1024,
 };
 
+#define SAO_TASK_DEFAULT_FRAME_CAPACITY (1024u * 1024u)
+
 typedef enum SaoTaskStatus {
     SAO_TASK_RUNNING,
     SAO_TASK_FINISHED,
 } SaoTaskStatus;
 
-typedef struct SaoFrame {
-    SaoFunction function;
-    void *frame;
-} SaoFrame;
-
 struct SaoTask {
-    SaoFrame stack[SAO_TASK_STACK_CAPACITY];
+    SaoFunction functions[SAO_TASK_STACK_CAPACITY];
+    unsigned char *frame_stack;
+    size_t frame_capacity;
+    size_t frame_top;
     size_t depth;
 };
 
-void sao_task_init(SaoTask *task, SaoFunction function, void *frame);
+bool sao_task_init(SaoTask *task, size_t frame_capacity);
 
-bool sao_task_push(SaoTask *task, SaoFunction function, void *frame);
+void sao_task_deinit(SaoTask *task);
+
+bool sao_task_push_function(
+    SaoTask *task,
+    SaoFunction function,
+    const void *frame,
+    size_t frame_size
+);
 
 SaoTaskStatus sao_task_run(SaoTask *task);
 
