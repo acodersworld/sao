@@ -46,6 +46,7 @@ static void test_value_constructors(void)
 
 static SaoFunctionResult child_function(
     SaoTask *task,
+    SaoScheduler *scheduler,
     void *raw_frame,
     SaoValue previous
 )
@@ -53,6 +54,7 @@ static SaoFunctionResult child_function(
     (void) task;
     (void) previous;
 
+    assert(scheduler == NULL);
     assert((uintptr_t) raw_frame % TEST_FRAME_ALIGNMENT == 0);
     TestChildFrame *frame = raw_frame;
 
@@ -64,10 +66,12 @@ static SaoFunctionResult child_function(
 
 static SaoFunctionResult root_function(
     SaoTask *task,
+    SaoScheduler *scheduler,
     void *raw_frame,
     SaoValue previous
 )
 {
+    assert(scheduler == NULL);
     assert((uintptr_t) raw_frame % TEST_FRAME_ALIGNMENT == 0);
     TestRootFrame *frame = raw_frame;
 
@@ -112,6 +116,7 @@ static SaoFunctionResult root_function(
 
 static SaoFunctionResult empty_function(
     SaoTask *task,
+    SaoScheduler *scheduler,
     void *frame,
     SaoValue previous
 )
@@ -119,6 +124,7 @@ static SaoFunctionResult empty_function(
     (void) task;
     (void) previous;
 
+    assert(scheduler == NULL);
     assert((uintptr_t) frame % TEST_FRAME_ALIGNMENT == 0);
 
     return (SaoFunctionResult) {
@@ -142,6 +148,7 @@ static size_t test_frame_record_size(size_t frame_size)
 
 static SaoFunctionResult yielding_function(
     SaoTask *task,
+    SaoScheduler *scheduler,
     void *raw_frame,
     SaoValue previous
 )
@@ -149,6 +156,7 @@ static SaoFunctionResult yielding_function(
     (void) task;
     (void) previous;
 
+    assert(scheduler == NULL);
     assert((uintptr_t) raw_frame % TEST_FRAME_ALIGNMENT == 0);
     TestYieldFrame *frame = raw_frame;
 
@@ -197,7 +205,7 @@ static void test_call_and_return(void)
 
     // The copied root frame sees state == 0, calls the child, receives 41,
     // writes 42 through its copied result pointer, and then yields.
-    SaoTaskStatus yielded = sao_task_run(&task);
+    SaoTaskStatus yielded = sao_task_run(&task, NULL);
 
     assert(yielded == SAO_TASK_RUNNING);
     assert(result == 42);
@@ -208,7 +216,7 @@ static void test_call_and_return(void)
     assert(task.frame_top == root_frame_top);
 
     // Resuming lets the root return and empties both task stacks.
-    SaoTaskStatus status = sao_task_run(&task);
+    SaoTaskStatus status = sao_task_run(&task, NULL);
 
     assert(status == SAO_TASK_FINISHED);
     assert(result == 42);
@@ -233,11 +241,11 @@ static void test_yield_and_resume(void)
 
     frame.state = 99;
 
-    SaoTaskStatus yielded = sao_task_run(&task);
+    SaoTaskStatus yielded = sao_task_run(&task, NULL);
     assert(yielded == SAO_TASK_RUNNING);
     assert(task.depth == 1);
 
-    SaoTaskStatus returned = sao_task_run(&task);
+    SaoTaskStatus returned = sao_task_run(&task, NULL);
     assert(returned == SAO_TASK_FINISHED);
     assert(task.depth == 0);
 
@@ -252,7 +260,7 @@ static void test_empty_task(void)
     assert(task.frame_capacity == SAO_TASK_DEFAULT_FRAME_CAPACITY);
     assert(task.frame_top == 0);
     assert(task.depth == 0);
-    assert(sao_task_run(&task) == SAO_TASK_FINISHED);
+    assert(sao_task_run(&task, NULL) == SAO_TASK_FINISHED);
 
     sao_task_deinit(&task);
     assert(task.frame_stack == NULL);
@@ -279,7 +287,7 @@ static void test_frame_capacity(void)
     assert(task.depth == depth);
     assert(task.frame_top == frame_top);
 
-    assert(sao_task_run(&task) == SAO_TASK_FINISHED);
+    assert(sao_task_run(&task, NULL) == SAO_TASK_FINISHED);
     assert(task.frame_top == 0);
     sao_task_deinit(&task);
 }

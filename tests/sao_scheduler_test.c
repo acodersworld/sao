@@ -13,6 +13,7 @@ typedef struct SequenceFrame {
 
 static SaoFunctionResult sequence_function(
     SaoTask *task,
+    SaoScheduler *scheduler,
     void *raw_frame,
     SaoValue previous
 )
@@ -20,6 +21,7 @@ static SaoFunctionResult sequence_function(
     (void) task;
     (void) previous;
 
+    assert(scheduler != NULL);
     SequenceFrame *frame = raw_frame;
     frame->step += 1;
     frame->events[*frame->event_count] = frame->id * 10 + frame->step;

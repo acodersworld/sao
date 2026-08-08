@@ -127,7 +127,7 @@ bool sao_task_push_function(
     return true;
 }
 
-SaoTaskStatus sao_task_run(SaoTask *task)
+SaoTaskStatus sao_task_run(SaoTask *task, SaoScheduler *scheduler)
 {
     assert(task != NULL);
 
@@ -137,7 +137,7 @@ SaoTaskStatus sao_task_run(SaoTask *task)
         size_t depth = task->depth;
         SaoFunction function = task->functions[depth - 1];
         void *frame = sao_task_top_frame(task);
-        SaoFunctionResult result = function(task, frame, previous);
+        SaoFunctionResult result = function(task, scheduler, frame, previous);
 
         previous = sao_value_unit();
 

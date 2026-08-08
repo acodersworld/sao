@@ -4,6 +4,7 @@
 #include "sao_value.h"
 
 typedef struct SaoTask SaoTask;
+typedef struct SaoScheduler SaoScheduler;
 
 typedef enum SaoFunctionStatus {
     SAO_FUNCTION_CALL,
@@ -18,6 +19,7 @@ typedef struct SaoFunctionResult {
 
 typedef SaoFunctionResult (*SaoFunction)(
     SaoTask *task,
+    SaoScheduler *scheduler,
     void *frame,
     SaoValue previous
 );

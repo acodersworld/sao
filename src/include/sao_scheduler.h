@@ -9,10 +9,10 @@
 
 typedef struct SaoSchedulerTask SaoSchedulerTask;
 
-typedef struct SaoScheduler {
+struct SaoScheduler {
     SaoList ready;
     SaoSchedulerTask *main_task;
-} SaoScheduler;
+};
 
 void sao_scheduler_init(SaoScheduler *scheduler);
 

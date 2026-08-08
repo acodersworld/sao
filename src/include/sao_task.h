@@ -36,6 +36,6 @@ bool sao_task_push_function(
     size_t frame_size
 );
 
-SaoTaskStatus sao_task_run(SaoTask *task);
+SaoTaskStatus sao_task_run(SaoTask *task, SaoScheduler *scheduler);
 
 #endif

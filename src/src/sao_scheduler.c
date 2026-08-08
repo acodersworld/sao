@@ -86,7 +86,7 @@ void sao_scheduler_run(SaoScheduler *scheduler)
         assert(link != NULL);
 
         SaoSchedulerTask *scheduled_task = (SaoSchedulerTask *) link;
-        SaoTaskStatus status = sao_task_run(&scheduled_task->task);
+        SaoTaskStatus status = sao_task_run(&scheduled_task->task, scheduler);
 
         if (status == SAO_TASK_RUNNING) {
             sao_list_push_back(&scheduler->ready, &scheduled_task->link);
