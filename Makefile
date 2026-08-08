@@ -20,13 +20,15 @@ SCHEDULER_TEST_SOURCES := \
 	src/src/sao_scheduler.c \
 	src/src/sao_task.c \
 	src/src/sao_value.c \
+	tests/sao_test.c \
 	tests/sao_scheduler_test.c
 TASK_TEST_SOURCES := \
 	src/src/sao_list.c \
 	src/src/sao_task.c \
 	src/src/sao_value.c \
+	tests/sao_test.c \
 	tests/sao_task_test.c
-HEADERS := $(wildcard src/include/*.h)
+HEADERS := $(wildcard src/include/*.h) $(wildcard tests/*.h)
 
 .PHONY: all test clean
 

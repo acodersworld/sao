@@ -41,6 +41,7 @@ static void push_three(
     sao_list_push_back(list, &first->link);
     sao_list_push_back(list, &second->link);
     sao_list_push_back(list, &third->link);
+    assert(list->size == 3);
 }
 
 static void test_empty_list(void)
@@ -56,8 +57,10 @@ static void test_empty_list(void)
     assert(list.head.prev == &list.head);
     assert(list.tail.next == &list.tail);
     assert(list.tail.prev == &list.head);
+    assert(list.size == 0);
     assert(sao_list_is_empty(&list));
     assert(sao_list_pop_front(&list) == NULL);
+    assert(list.size == 0);
 }
 
 static void test_fifo_order(void)
@@ -69,53 +72,11 @@ static void test_fifo_order(void)
     push_three(&list, &first, &second, &third);
 
     assert(pop_node(&list)->value == 1);
+    assert(list.size == 2);
     assert(pop_node(&list)->value == 2);
+    assert(list.size == 1);
     assert(pop_node(&list)->value == 3);
-    assert(sao_list_is_empty(&list));
-}
-
-static void test_remove_first(void)
-{
-    SaoList list;
-    TestNode first;
-    TestNode second;
-    TestNode third;
-    push_three(&list, &first, &second, &third);
-
-    sao_list_remove(&first.link);
-
-    assert(pop_node(&list)->value == 2);
-    assert(pop_node(&list)->value == 3);
-    assert(sao_list_is_empty(&list));
-}
-
-static void test_remove_middle(void)
-{
-    SaoList list;
-    TestNode first;
-    TestNode second;
-    TestNode third;
-    push_three(&list, &first, &second, &third);
-
-    sao_list_remove(&second.link);
-
-    assert(pop_node(&list)->value == 1);
-    assert(pop_node(&list)->value == 3);
-    assert(sao_list_is_empty(&list));
-}
-
-static void test_remove_last(void)
-{
-    SaoList list;
-    TestNode first;
-    TestNode second;
-    TestNode third;
-    push_three(&list, &first, &second, &third);
-
-    sao_list_remove(&third.link);
-
-    assert(pop_node(&list)->value == 1);
-    assert(pop_node(&list)->value == 2);
+    assert(list.size == 0);
     assert(sao_list_is_empty(&list));
 }
 
@@ -127,12 +88,16 @@ static void test_reuse_removed_link(void)
     init_node(&node, 7);
 
     sao_list_push_back(&list, &node.link);
+    assert(list.size == 1);
     assert(pop_node(&list) == &node);
+    assert(list.size == 0);
     assert(node.link.next == &node.link);
     assert(node.link.prev == &node.link);
 
     sao_list_push_back(&list, &node.link);
+    assert(list.size == 1);
     assert(pop_node(&list) == &node);
+    assert(list.size == 0);
     assert(sao_list_is_empty(&list));
 }
 
@@ -140,11 +105,8 @@ int main(void)
 {
     RUN_TEST(test_empty_list);
     RUN_TEST(test_fifo_order);
-    RUN_TEST(test_remove_first);
-    RUN_TEST(test_remove_middle);
-    RUN_TEST(test_remove_last);
     RUN_TEST(test_reuse_removed_link);
 
-    printf("[ PASS ] all 6 tests\n");
+    printf("[ PASS ] all 3 tests\n");
     return 0;
 }

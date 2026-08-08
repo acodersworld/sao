@@ -11,6 +11,7 @@ void sao_list_init(SaoList *list)
     list->head.prev = &list->head;
     list->tail.next = &list->tail;
     list->tail.prev = &list->head;
+    list->size = 0;
 }
 
 void sao_list_link_init(SaoListLink *link)
@@ -41,6 +42,7 @@ void sao_list_push_back(SaoList *list, SaoListLink *link)
     link->prev = previous;
     previous->next = link;
     list->tail.prev = link;
+    list->size += 1;
 }
 
 SaoListLink *sao_list_pop_front(SaoList *list)
@@ -50,22 +52,15 @@ SaoListLink *sao_list_pop_front(SaoList *list)
     SaoListLink *link = list->head.next;
 
     if (link == &list->tail) {
+        assert(list->size == 0);
         return NULL;
     }
 
-    sao_list_remove(link);
-    return link;
-}
-
-void sao_list_remove(SaoListLink *link)
-{
-    assert(link != NULL);
-    assert(link->next != NULL);
-    assert(link->prev != NULL);
-    assert(link->next != link);
-    assert(link->prev != link);
+    assert(list->size > 0);
 
     link->prev->next = link->next;
     link->next->prev = link->prev;
     sao_list_link_init(link);
+    list->size -= 1;
+    return link;
 }

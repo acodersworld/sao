@@ -1,4 +1,4 @@
-#include "sao_list.h"
+#include "sao_test.h"
 #include "sao_task.h"
 
 #include <assert.h>
@@ -10,49 +10,6 @@
 #else
 #define TEST_FRAME_ALIGNMENT _Alignof(max_align_t)
 #endif
-
-typedef void (*TestFunction)(void);
-
-typedef struct Test {
-    SaoListLink link;
-    const char *name;
-    TestFunction function;
-} Test;
-
-static SaoList tests;
-
-static void add_test(Test *test)
-{
-    sao_list_link_init(&test->link);
-    sao_list_push_back(&tests, &test->link);
-}
-
-#define ADD_TEST(test_function)                     \
-    do {                                            \
-        static Test test = {                        \
-            .name = #test_function,                 \
-            .function = test_function,              \
-        };                                          \
-        add_test(&test);                            \
-    } while (0)
-
-static int run_tests(void)
-{
-    size_t passed = 0;
-    SaoListLink *link;
-
-    while ((link = sao_list_pop_front(&tests)) != NULL) {
-        Test *test = (Test *) link;
-        printf("[ RUN  ] %s\n", test->name);
-        fflush(stdout);
-        test->function();
-        printf("[ PASS ] %s\n", test->name);
-        passed += 1;
-    }
-
-    printf("[ PASS ] all %zu tests\n", passed);
-    return 0;
-}
 
 typedef struct TestChildFrame {
     int value;
@@ -361,7 +318,7 @@ static void test_stack_capacity(void)
 
 int main(void)
 {
-    sao_list_init(&tests);
+    sao_test_init();
 
     ADD_TEST(test_value_constructors);
     ADD_TEST(test_empty_task);
@@ -370,5 +327,5 @@ int main(void)
     ADD_TEST(test_frame_capacity);
     ADD_TEST(test_stack_capacity);
 
-    return run_tests();
+    return sao_test_run_all();
 }

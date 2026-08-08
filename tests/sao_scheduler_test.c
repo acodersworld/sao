@@ -1,15 +1,7 @@
 #include "sao_scheduler.h"
+#include "sao_test.h"
 
 #include <assert.h>
-#include <stdio.h>
-
-#define RUN_TEST(test)                     \
-    do {                                   \
-        printf("[ RUN  ] %s\n", #test);    \
-        fflush(stdout);                    \
-        test();                            \
-        printf("[ PASS ] %s\n", #test);    \
-    } while (0)
 
 typedef struct SequenceFrame {
     int id;
@@ -236,15 +228,16 @@ static void test_scheduler_reuse(void)
 
 int main(void)
 {
-    RUN_TEST(test_empty_scheduler);
-    RUN_TEST(test_first_successful_task_is_main);
-    RUN_TEST(test_fifo_round_robin);
-    RUN_TEST(test_non_main_completion);
-    RUN_TEST(test_main_completion_abandons_tasks);
-    RUN_TEST(test_sole_task_resumes_immediately);
-    RUN_TEST(test_deinit_abandons_unrun_tasks);
-    RUN_TEST(test_scheduler_reuse);
+    sao_test_init();
 
-    printf("[ PASS ] all 8 tests\n");
-    return 0;
+    ADD_TEST(test_empty_scheduler);
+    ADD_TEST(test_first_successful_task_is_main);
+    ADD_TEST(test_fifo_round_robin);
+    ADD_TEST(test_non_main_completion);
+    ADD_TEST(test_main_completion_abandons_tasks);
+    ADD_TEST(test_sole_task_resumes_immediately);
+    ADD_TEST(test_deinit_abandons_unrun_tasks);
+    ADD_TEST(test_scheduler_reuse);
+
+    return sao_test_run_all();
 }
