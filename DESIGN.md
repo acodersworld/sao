@@ -2,7 +2,7 @@
 
 Status: early design notes  
 Working name: SAO  
-Last updated: 2026-08-06
+Last updated: 2026-08-09
 
 This document records the current direction for SAO, a statically typed,
 expression-oriented toy language. It distinguishes agreed design decisions from
@@ -25,3 +25,4 @@ provisional syntax and ideas intentionally deferred until later.
 13. [13. Runtime representation and memory management](design/13-runtime-representation-and-memory-management.md)
 14. [14. Deferred features](design/14-deferred-features.md)
 15. [15. Current language sketch](design/15-current-language-sketch.md)
+16. [16. Lexical grammar](design/16-lexical-grammar.md)

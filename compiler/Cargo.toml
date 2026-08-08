@@ -1,0 +1,11 @@
+[package]
+name = "sao-compiler"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+logos.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
