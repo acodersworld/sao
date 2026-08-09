@@ -291,7 +291,7 @@ impl Token {
     }
 
     #[must_use]
-    pub fn text<'source>(self, source: &'source str) -> &'source str {
+    pub fn text(self, source: &str) -> &str {
         &source[self.span.start..self.span.end]
     }
 }
