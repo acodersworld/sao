@@ -1,8 +1,8 @@
 use std::iter::Peekable;
 
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, Expression, ExpressionKind, LiteralKind, PrimitiveType,
-    TypeKind, TypeSyntax, UnaryOperator,
+    AssignmentOperator, BinaryOperator, BindingMutability, Expression, ExpressionKind, LiteralKind,
+    PrimitiveType, Statement, StatementKind, TypeKind, TypeSyntax, UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -95,6 +95,29 @@ where
     Ok(type_syntax)
 }
 
+/// Parses one complete statement token stream.
+///
+/// The iterator may be the lexer itself and is expected to yield its explicit
+/// [`TokenKind::Eof`] token.
+pub fn parse_statement<I>(tokens: I) -> ParseResult<Statement>
+where
+    I: Iterator<Item = Result<Token, LexError>>,
+{
+    let mut parser = Parser::new(tokens);
+    let statement = parser.statement()?;
+    let token = parser.current()?;
+
+    if token.kind != TokenKind::Eof {
+        return Err(ParseError {
+            kind: ParseErrorKind::UnexpectedToken { found: token.kind },
+            span: token.span,
+        }
+        .into());
+    }
+
+    Ok(statement)
+}
+
 struct Parser<I>
 where
     I: Iterator<Item = Result<Token, LexError>>,
@@ -116,6 +139,46 @@ where
             pending: None,
             last_end: 0,
         }
+    }
+
+    fn statement(&mut self) -> ParseResult<Statement> {
+        match self.current()?.kind {
+            TokenKind::Const => self.binding_statement(BindingMutability::Const),
+            TokenKind::Mut => self.binding_statement(BindingMutability::Mut),
+            _ => self.expression_statement(),
+        }
+    }
+
+    fn binding_statement(&mut self, mutability: BindingMutability) -> ParseResult<Statement> {
+        let keyword = self.advance()?;
+        let name = self.expect(TokenKind::Identifier)?;
+        let type_annotation = if self.current()?.kind == TokenKind::Colon {
+            self.advance()?;
+            Some(self.type_expression()?)
+        } else {
+            None
+        };
+
+        self.expect(TokenKind::Assign)?;
+        let initializer = self.expression(LOWEST_BINDING_POWER)?;
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+
+        Ok(Statement::new(
+            StatementKind::Binding {
+                mutability,
+                name: name.span,
+                type_annotation,
+                initializer,
+            },
+            Span::new(keyword.span.start, semicolon.span.end),
+        ))
+    }
+
+    fn expression_statement(&mut self) -> ParseResult<Statement> {
+        let expression = self.expression(LOWEST_BINDING_POWER)?;
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+        let span = Span::new(expression.span.start, semicolon.span.end);
+        Ok(Statement::new(StatementKind::Expression(expression), span))
     }
 
     fn type_expression(&mut self) -> ParseResult<TypeSyntax> {
@@ -763,6 +826,10 @@ mod tests {
         parse_type(Lexer::new(source))
     }
 
+    fn parse_statement_source(source: &str) -> ParseResult<Statement> {
+        parse_statement(Lexer::new(source))
+    }
+
     fn integer(span: Span) -> Expression {
         Expression::new(ExpressionKind::Literal(LiteralKind::Integer), span)
     }
@@ -781,6 +848,170 @@ mod tests {
             },
             span,
         )
+    }
+
+    #[test]
+    fn parses_const_binding_with_an_inferred_type() {
+        assert_eq!(
+            parse_statement_source("const count = 10;"),
+            Ok(Statement::new(
+                StatementKind::Binding {
+                    mutability: BindingMutability::Const,
+                    name: Span::new(6, 11),
+                    type_annotation: None,
+                    initializer: integer(Span::new(14, 16)),
+                },
+                Span::new(0, 17),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_mut_binding_with_an_explicit_type() {
+        let statement = parse_statement_source("mut value: int = 1 + 2;")
+            .expect("annotated mutable binding should parse");
+        let StatementKind::Binding {
+            mutability,
+            name,
+            type_annotation: Some(type_annotation),
+            initializer,
+        } = statement.kind
+        else {
+            panic!("expected an annotated binding statement");
+        };
+
+        assert_eq!(mutability, BindingMutability::Mut);
+        assert_eq!(name, Span::new(4, 9));
+        assert_eq!(
+            type_annotation,
+            TypeSyntax::new(TypeKind::Primitive(PrimitiveType::Int), Span::new(11, 14),)
+        );
+        assert!(matches!(
+            initializer.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+        assert_eq!(initializer.span, Span::new(17, 22));
+        assert_eq!(statement.span, Span::new(0, 23));
+    }
+
+    #[test]
+    fn binding_initializers_reuse_the_complete_expression_parser() {
+        let statement = parse_statement_source("const item = service.worker(1)[0]?;")
+            .expect("binding initializer should parse");
+        let StatementKind::Binding { initializer, .. } = statement.kind else {
+            panic!("expected a binding statement");
+        };
+
+        let ExpressionKind::Try { expression } = initializer.kind else {
+            panic!("expected Try at the initializer root");
+        };
+        let ExpressionKind::Index { object, .. } = expression.kind else {
+            panic!("expected indexing before Try");
+        };
+        assert!(matches!(object.kind, ExpressionKind::Call { .. }));
+    }
+
+    #[test]
+    fn parses_semicolon_terminated_expression_statements() {
+        let statement =
+            parse_statement_source("target += value * 2;").expect("expression should parse");
+        let StatementKind::Expression(expression) = statement.kind else {
+            panic!("expected an expression statement");
+        };
+
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::Assignment {
+                operator: AssignmentOperator::Add,
+                value,
+                ..
+            } if matches!(
+                value.kind,
+                ExpressionKind::Binary {
+                    operator: BinaryOperator::Multiply,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(expression.span, Span::new(0, 19));
+        assert_eq!(statement.span, Span::new(0, 20));
+    }
+
+    #[test]
+    fn reports_malformed_binding_statements() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "const = 1;",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Assign,
+                },
+                Span::new(6, 7),
+            ),
+            (
+                "const value;",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Assign,
+                    found: TokenKind::Semicolon,
+                },
+                Span::new(11, 12),
+            ),
+            (
+                "const value = ;",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Semicolon,
+                },
+                Span::new(14, 15),
+            ),
+            (
+                "mut value: = 1;",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::Assign,
+                },
+                Span::new(11, 12),
+            ),
+        ] {
+            assert_eq!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn statements_require_a_semicolon() {
+        for source in ["const value = 1", "value"] {
+            assert!(matches!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::ExpectedToken {
+                        expected: TokenKind::Semicolon,
+                        found: TokenKind::Eof,
+                    },
+                    ..
+                }))
+            ));
+        }
+    }
+
+    #[test]
+    fn statement_entry_point_rejects_trailing_input() {
+        assert_eq!(
+            parse_statement_source("first; second;"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::UnexpectedToken {
+                    found: TokenKind::Identifier,
+                },
+                span: Span::new(7, 13),
+            }))
+        );
     }
 
     #[test]

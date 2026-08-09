@@ -2,9 +2,9 @@ use std::io::{self, BufRead, Write};
 
 use sao_compiler::lexer::{Lexer, Span};
 use sao_compiler::parser::{
-    FrontendError, ParseError, ParseErrorKind, parse_expression, parse_type,
+    FrontendError, ParseError, ParseErrorKind, parse_expression, parse_statement, parse_type,
 };
-use sao_compiler::pretty::{format_expression, format_type};
+use sao_compiler::pretty::{format_expression, format_statement, format_type};
 
 fn main() -> io::Result<()> {
     let stdin = io::stdin();
@@ -16,7 +16,7 @@ fn main() -> io::Result<()> {
     writeln!(output, "SAO AST REPL")?;
     writeln!(
         output,
-        "Enter an expression, or use :type TYPE. Type :help for commands."
+        "Enter an expression, or use :stmt STATEMENT or :type TYPE. Type :help for commands."
     )?;
 
     loop {
@@ -43,6 +43,12 @@ fn main() -> io::Result<()> {
                         writeln!(output, "usage: :type TYPE")?;
                     } else {
                         print_type(&mut output, type_source)?;
+                    }
+                } else if let Some(statement_source) = command_argument(source, ":stmt") {
+                    if statement_source.is_empty() {
+                        writeln!(output, "usage: :stmt STATEMENT")?;
+                    } else {
+                        print_statement(&mut output, statement_source)?;
                     }
                 } else if let Some(expression_source) = command_argument(source, ":expr") {
                     if expression_source.is_empty() {
@@ -79,6 +85,7 @@ fn command_argument<'source>(source: &'source str, command: &str) -> Option<&'so
 fn print_help(output: &mut impl Write) -> io::Result<()> {
     writeln!(output, "Commands:")?;
     writeln!(output, "  :expr EXPRESSION  parse an expression")?;
+    writeln!(output, "  :stmt STATEMENT   parse a statement")?;
     writeln!(output, "  :type TYPE        parse a type expression")?;
     writeln!(output, "  :help             show this help")?;
     writeln!(output, "  :quit or :q       exit")?;
@@ -88,6 +95,13 @@ fn print_help(output: &mut impl Write) -> io::Result<()> {
 fn print_expression(output: &mut impl Write, source: &str) -> io::Result<()> {
     match parse_expression(Lexer::new(source)) {
         Ok(expression) => writeln!(output, "{}", format_expression(source, &expression)),
+        Err(error) => print_error(output, source, error),
+    }
+}
+
+fn print_statement(output: &mut impl Write, source: &str) -> io::Result<()> {
+    match parse_statement(Lexer::new(source)) {
+        Ok(statement) => writeln!(output, "{}", format_statement(source, &statement)),
         Err(error) => print_error(output, source, error),
     }
 }
@@ -144,5 +158,10 @@ mod tests {
         assert_eq!(command_argument(":type int", ":type"), Some("int"));
         assert_eq!(command_argument(":type", ":type"), Some(""));
         assert_eq!(command_argument(":typescript", ":type"), None);
+        assert_eq!(
+            command_argument(":stmt const value = 1;", ":stmt"),
+            Some("const value = 1;")
+        );
+        assert_eq!(command_argument(":statement", ":stmt"), None);
     }
 }

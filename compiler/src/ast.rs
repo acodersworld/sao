@@ -28,6 +28,39 @@ impl TypeSyntax {
     }
 }
 
+/// A statement in the source-level syntax tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement {
+    pub kind: StatementKind,
+    pub span: Span,
+}
+
+impl Statement {
+    #[must_use]
+    pub const fn new(kind: StatementKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+/// The syntax represented by a [`Statement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementKind {
+    Binding {
+        mutability: BindingMutability,
+        name: Span,
+        type_annotation: Option<TypeSyntax>,
+        initializer: Expression,
+    },
+    Expression(Expression),
+}
+
+/// Whether a local binding was introduced with `const` or `mut`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingMutability {
+    Const,
+    Mut,
+}
+
 /// The syntax represented by a [`TypeSyntax`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {

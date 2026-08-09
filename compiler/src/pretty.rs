@@ -1,6 +1,6 @@
 use std::fmt::{Arguments, Write};
 
-use crate::ast::{Expression, ExpressionKind, TypeKind, TypeSyntax};
+use crate::ast::{Expression, ExpressionKind, Statement, StatementKind, TypeKind, TypeSyntax};
 use crate::lexer::Span;
 
 /// Formats an expression as an indented syntax tree.
@@ -19,6 +19,50 @@ pub fn format_type(source: &str, type_syntax: &TypeSyntax) -> String {
     format_type_into(&mut output, source, type_syntax, 0);
     output.truncate(output.len().saturating_sub(1));
     output
+}
+
+/// Formats a statement as an indented syntax tree.
+#[must_use]
+pub fn format_statement(source: &str, statement: &Statement) -> String {
+    let mut output = String::new();
+    format_statement_into(&mut output, source, statement, 0);
+    output.truncate(output.len().saturating_sub(1));
+    output
+}
+
+fn format_statement_into(output: &mut String, source: &str, statement: &Statement, depth: usize) {
+    let span = statement.span;
+
+    match &statement.kind {
+        StatementKind::Binding {
+            mutability,
+            name,
+            type_annotation,
+            initializer,
+        } => {
+            line(
+                output,
+                depth,
+                format_args!(
+                    "Binding {mutability:?} {:?} {}",
+                    text(source, *name),
+                    location(span)
+                ),
+            );
+            if let Some(type_annotation) = type_annotation {
+                child_type(output, source, "type", type_annotation, depth);
+            }
+            child_expression(output, source, "initializer", initializer, depth);
+        }
+        StatementKind::Expression(expression) => {
+            line(
+                output,
+                depth,
+                format_args!("ExpressionStatement {}", location(span)),
+            );
+            child_expression(output, source, "expression", expression, depth);
+        }
+    }
 }
 
 fn format_expression_into(
@@ -241,7 +285,7 @@ fn location(span: Span) -> String {
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
-    use crate::parser::{parse_expression, parse_type};
+    use crate::parser::{parse_expression, parse_statement, parse_type};
 
     #[test]
     fn formats_expression_structure_and_source_text() {
@@ -264,5 +308,27 @@ mod tests {
         assert!(output.contains("Intersection @ 0..15"));
         assert!(output.contains("Named \"Reader\" @ 0..6"));
         assert!(output.contains("Primitive None @ 18..22"));
+    }
+
+    #[test]
+    fn formats_binding_statements() {
+        let source = "mut total: int = first + second;";
+        let statement = parse_statement(Lexer::new(source)).expect("statement should parse");
+
+        assert_eq!(
+            format_statement(source, &statement),
+            "Binding Mut \"total\" @ 0..32\n  type:\n    Primitive Int @ 11..14\n  initializer:\n    Binary Add @ 17..31\n      left:\n        Identifier \"first\" @ 17..22\n      right:\n        Identifier \"second\" @ 25..31"
+        );
+    }
+
+    #[test]
+    fn formats_expression_statements() {
+        let source = "run();";
+        let statement = parse_statement(Lexer::new(source)).expect("statement should parse");
+
+        assert_eq!(
+            format_statement(source, &statement),
+            "ExpressionStatement @ 0..6\n  expression:\n    Call @ 0..5\n      callee:\n        Identifier \"run\" @ 0..3\n      arguments:\n        (empty)"
+        );
     }
 }
