@@ -1,13 +1,17 @@
 use std::iter::Peekable;
 
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, Expression, ExpressionKind, LiteralKind, UnaryOperator,
+    AssignmentOperator, BinaryOperator, Expression, ExpressionKind, LiteralKind, PrimitiveType,
+    TypeKind, TypeSyntax, UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParseErrorKind {
     ExpectedExpression {
+        found: TokenKind,
+    },
+    ExpectedType {
         found: TokenKind,
     },
     ExpectedToken {
@@ -68,11 +72,37 @@ where
     Ok(expression)
 }
 
+/// Parses one complete type-expression token stream.
+///
+/// The iterator may be the lexer itself and is expected to yield its explicit
+/// [`TokenKind::Eof`] token.
+pub fn parse_type<I>(tokens: I) -> ParseResult<TypeSyntax>
+where
+    I: Iterator<Item = Result<Token, LexError>>,
+{
+    let mut parser = Parser::new(tokens);
+    let type_syntax = parser.type_expression()?;
+    let token = parser.current()?;
+
+    if token.kind != TokenKind::Eof {
+        return Err(ParseError {
+            kind: ParseErrorKind::UnexpectedToken { found: token.kind },
+            span: token.span,
+        }
+        .into());
+    }
+
+    Ok(type_syntax)
+}
+
 struct Parser<I>
 where
     I: Iterator<Item = Result<Token, LexError>>,
 {
     tokens: Peekable<I>,
+    /// Holds the second `>` when type parsing splits a `>>` token that closes
+    /// two nested parameterized types.
+    pending: Option<Token>,
     last_end: usize,
 }
 
@@ -83,7 +113,212 @@ where
     fn new(tokens: I) -> Self {
         Self {
             tokens: tokens.peekable(),
+            pending: None,
             last_end: 0,
+        }
+    }
+
+    fn type_expression(&mut self) -> ParseResult<TypeSyntax> {
+        let first = self.intersection_type()?;
+
+        if self.current()?.kind != TokenKind::Pipe {
+            return Ok(first);
+        }
+
+        let start = first.span.start;
+        let mut members = vec![first];
+
+        while self.current()?.kind == TokenKind::Pipe {
+            self.advance()?;
+            members.push(self.intersection_type()?);
+        }
+
+        let end = members.last().expect("a union has members").span.end;
+        Ok(TypeSyntax::new(
+            TypeKind::Union { members },
+            Span::new(start, end),
+        ))
+    }
+
+    fn intersection_type(&mut self) -> ParseResult<TypeSyntax> {
+        let first = self.prefix_type()?;
+
+        if self.current()?.kind != TokenKind::Ampersand {
+            return Ok(first);
+        }
+
+        let start = first.span.start;
+        let mut members = vec![first];
+
+        while self.current()?.kind == TokenKind::Ampersand {
+            self.advance()?;
+            members.push(self.prefix_type()?);
+        }
+
+        let end = members
+            .last()
+            .expect("an intersection has members")
+            .span
+            .end;
+        Ok(TypeSyntax::new(
+            TypeKind::Intersection { members },
+            Span::new(start, end),
+        ))
+    }
+
+    fn prefix_type(&mut self) -> ParseResult<TypeSyntax> {
+        let token = self.current()?;
+
+        if token.kind != TokenKind::Mut {
+            return self.primary_type();
+        }
+
+        self.advance()?;
+        let inner = self.prefix_type()?;
+        let span = Span::new(token.span.start, inner.span.end);
+        Ok(TypeSyntax::new(TypeKind::Mutable(Box::new(inner)), span))
+    }
+
+    fn primary_type(&mut self) -> ParseResult<TypeSyntax> {
+        let token = self.current()?;
+
+        match token.kind {
+            TokenKind::Int => self.primitive_type(PrimitiveType::Int),
+            TokenKind::Float => self.primitive_type(PrimitiveType::Float),
+            TokenKind::Bool => self.primitive_type(PrimitiveType::Bool),
+            TokenKind::Char => self.primitive_type(PrimitiveType::Char),
+            TokenKind::String => self.primitive_type(PrimitiveType::String),
+            TokenKind::Bytes => self.primitive_type(PrimitiveType::Bytes),
+            TokenKind::None => self.primitive_type(PrimitiveType::None),
+            TokenKind::Identifier => self.named_type(),
+            TokenKind::Fn => self.callable_type(),
+            TokenKind::LeftParen => self.parenthesized_type(),
+            _ => Err(ParseError {
+                kind: ParseErrorKind::ExpectedType { found: token.kind },
+                span: token.span,
+            }
+            .into()),
+        }
+    }
+
+    fn primitive_type(&mut self, primitive: PrimitiveType) -> ParseResult<TypeSyntax> {
+        let token = self.advance()?;
+        Ok(TypeSyntax::new(TypeKind::Primitive(primitive), token.span))
+    }
+
+    fn named_type(&mut self) -> ParseResult<TypeSyntax> {
+        let name = self.expect(TokenKind::Identifier)?;
+        let mut arguments = Vec::new();
+        let mut end = name.span.end;
+
+        if self.current()?.kind == TokenKind::Less {
+            self.advance()?;
+            arguments.push(self.type_expression()?);
+
+            while self.current()?.kind == TokenKind::Comma {
+                self.advance()?;
+
+                if matches!(
+                    self.current()?.kind,
+                    TokenKind::Greater | TokenKind::ShiftRight
+                ) {
+                    break;
+                }
+
+                arguments.push(self.type_expression()?);
+            }
+
+            end = self.expect_type_argument_close()?.span.end;
+        }
+
+        Ok(TypeSyntax::new(
+            TypeKind::Named {
+                name: name.span,
+                arguments,
+            },
+            Span::new(name.span.start, end),
+        ))
+    }
+
+    fn callable_type(&mut self) -> ParseResult<TypeSyntax> {
+        let function = self.expect(TokenKind::Fn)?;
+        self.expect(TokenKind::LeftParen)?;
+        let mut parameters = Vec::new();
+
+        if self.current()?.kind != TokenKind::RightParen {
+            loop {
+                parameters.push(self.type_expression()?);
+
+                if self.current()?.kind != TokenKind::Comma {
+                    break;
+                }
+
+                self.advance()?;
+
+                if self.current()?.kind == TokenKind::RightParen {
+                    break;
+                }
+            }
+        }
+
+        self.expect(TokenKind::RightParen)?;
+        self.expect(TokenKind::Arrow)?;
+        let return_type = self.type_expression()?;
+        let span = Span::new(function.span.start, return_type.span.end);
+
+        Ok(TypeSyntax::new(
+            TypeKind::Callable {
+                parameters,
+                return_type: Box::new(return_type),
+            },
+            span,
+        ))
+    }
+
+    fn parenthesized_type(&mut self) -> ParseResult<TypeSyntax> {
+        let left_parenthesis = self.expect(TokenKind::LeftParen)?;
+
+        if self.current()?.kind == TokenKind::RightParen {
+            let right_parenthesis = self.advance()?;
+            return Ok(TypeSyntax::new(
+                TypeKind::Primitive(PrimitiveType::Unit),
+                Span::new(left_parenthesis.span.start, right_parenthesis.span.end),
+            ));
+        }
+
+        let inner = self.type_expression()?;
+        let right_parenthesis = self.expect(TokenKind::RightParen)?;
+        Ok(TypeSyntax::new(
+            TypeKind::Group(Box::new(inner)),
+            Span::new(left_parenthesis.span.start, right_parenthesis.span.end),
+        ))
+    }
+
+    fn expect_type_argument_close(&mut self) -> ParseResult<Token> {
+        let token = self.current()?;
+
+        match token.kind {
+            TokenKind::Greater => self.advance(),
+            TokenKind::ShiftRight => {
+                self.advance()?;
+                let first = Token::new(
+                    TokenKind::Greater,
+                    Span::new(token.span.start, token.span.start + 1),
+                );
+                self.pending = Some(Token::new(
+                    TokenKind::Greater,
+                    Span::new(token.span.start + 1, token.span.end),
+                ));
+                Ok(first)
+            }
+            _ => Err(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Greater,
+                    found: token.kind,
+                },
+                span: token.span,
+            }
+            .into()),
         }
     }
 
@@ -301,6 +536,10 @@ where
     }
 
     fn current(&mut self) -> ParseResult<Token> {
+        if let Some(token) = self.pending {
+            return Ok(token);
+        }
+
         match self.tokens.peek().copied() {
             Some(result) => result.map_err(FrontendError::Lexical),
             None => Ok(self.synthetic_eof()),
@@ -308,6 +547,11 @@ where
     }
 
     fn advance(&mut self) -> ParseResult<Token> {
+        if let Some(token) = self.pending.take() {
+            self.last_end = token.span.end;
+            return Ok(token);
+        }
+
         match self.tokens.next() {
             Some(Ok(token)) => {
                 self.last_end = token.span.end;
@@ -513,6 +757,10 @@ mod tests {
 
     fn parse(source: &str) -> ParseResult {
         parse_expression(Lexer::new(source))
+    }
+
+    fn parse_type_source(source: &str) -> ParseResult<TypeSyntax> {
+        parse_type(Lexer::new(source))
     }
 
     fn integer(span: Span) -> Expression {
@@ -881,6 +1129,154 @@ mod tests {
             Err(FrontendError::Lexical(LexError {
                 kind: LexErrorKind::InvalidEscape,
                 span: Span::new(4, 6),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_primitive_and_named_types() {
+        for source in ["int", "float", "bool", "char", "string", "bytes", "none"] {
+            assert!(
+                parse_type_source(source).is_ok(),
+                "failed to parse {source}"
+            );
+        }
+
+        assert_eq!(
+            parse_type_source("User"),
+            Ok(TypeSyntax::new(
+                TypeKind::Named {
+                    name: Span::new(0, 4),
+                    arguments: Vec::new(),
+                },
+                Span::new(0, 4),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_unit_and_grouped_types() {
+        assert_eq!(
+            parse_type_source("()"),
+            Ok(TypeSyntax::new(
+                TypeKind::Primitive(PrimitiveType::Unit),
+                Span::new(0, 2),
+            ))
+        );
+
+        let type_syntax = parse_type_source("(int | none)").expect("grouped type should parse");
+        let TypeKind::Group(inner) = type_syntax.kind else {
+            panic!("expected a grouped type");
+        };
+        assert!(matches!(inner.kind, TypeKind::Union { .. }));
+        assert_eq!(type_syntax.span, Span::new(0, 12));
+    }
+
+    #[test]
+    fn parses_parameterized_and_nested_parameterized_types() {
+        let type_syntax =
+            parse_type_source("Map<string, Error<int | none>>").expect("named type should parse");
+        let TypeKind::Named { arguments, .. } = type_syntax.kind else {
+            panic!("expected a named type");
+        };
+
+        assert_eq!(arguments.len(), 2);
+        let TypeKind::Named {
+            arguments: error_arguments,
+            ..
+        } = &arguments[1].kind
+        else {
+            panic!("expected a nested named type");
+        };
+        assert_eq!(error_arguments.len(), 1);
+        assert!(matches!(&error_arguments[0].kind, TypeKind::Union { .. }));
+    }
+
+    #[test]
+    fn mutable_qualifier_applies_to_the_following_union_member() {
+        let type_syntax =
+            parse_type_source("mut User | none").expect("mutable union type should parse");
+        let TypeKind::Union { members } = type_syntax.kind else {
+            panic!("expected a union type");
+        };
+
+        assert_eq!(members.len(), 2);
+        assert!(matches!(&members[0].kind, TypeKind::Mutable(_)));
+        assert!(matches!(
+            &members[1].kind,
+            TypeKind::Primitive(PrimitiveType::None)
+        ));
+    }
+
+    #[test]
+    fn parses_callable_types() {
+        let type_syntax = parse_type_source("fn(int, mut User,) -> string | none")
+            .expect("callable type should parse");
+        let TypeKind::Callable {
+            parameters,
+            return_type,
+        } = type_syntax.kind
+        else {
+            panic!("expected a callable type");
+        };
+
+        assert_eq!(parameters.len(), 2);
+        assert!(matches!(&parameters[1].kind, TypeKind::Mutable(_)));
+        assert!(matches!(return_type.kind, TypeKind::Union { .. }));
+    }
+
+    #[test]
+    fn intersections_bind_more_tightly_than_unions() {
+        let type_syntax = parse_type_source("A | B & C | D").expect("combined type should parse");
+        let TypeKind::Union { members } = type_syntax.kind else {
+            panic!("expected a union type");
+        };
+
+        assert_eq!(members.len(), 3);
+        let TypeKind::Intersection {
+            members: intersection_members,
+        } = &members[1].kind
+        else {
+            panic!("expected an intersection in the union");
+        };
+        assert_eq!(intersection_members.len(), 2);
+    }
+
+    #[test]
+    fn direct_union_and_intersection_chains_use_member_lists() {
+        let union = parse_type_source("A | B | C").expect("union should parse");
+        let TypeKind::Union { members } = union.kind else {
+            panic!("expected a union type");
+        };
+        assert_eq!(members.len(), 3);
+
+        let intersection = parse_type_source("A & B & C").expect("intersection should parse");
+        let TypeKind::Intersection { members } = intersection.kind else {
+            panic!("expected an intersection type");
+        };
+        assert_eq!(members.len(), 3);
+    }
+
+    #[test]
+    fn reports_incomplete_types() {
+        assert_eq!(
+            parse_type_source("int |"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedType {
+                    found: TokenKind::Eof,
+                },
+                span: Span::new(5, 5),
+            }))
+        );
+
+        assert_eq!(
+            parse_type_source("Error<int"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Greater,
+                    found: TokenKind::Eof,
+                },
+                span: Span::new(9, 9),
             }))
         );
     }

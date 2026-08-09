@@ -237,11 +237,11 @@ define_token_kinds! {
     #[token("==")] Equal,
     // Compares two values for inequality.
     #[token("!=")] NotEqual,
-    // Compares whether the left value is less than the right value.
+    // Compares values or opens a parameterized type's argument list.
     #[token("<")] Less,
     // Compares whether the left value is less than or equal to the right value.
     #[token("<=")] LessEqual,
-    // Compares whether the left value is greater than the right value.
+    // Compares values or closes a parameterized type's argument list.
     #[token(">")] Greater,
     // Compares whether the left value is greater than or equal to the right value.
     #[token(">=")] GreaterEqual,

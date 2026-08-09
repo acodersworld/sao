@@ -14,6 +14,57 @@ impl Expression {
     }
 }
 
+/// A type expression in the source-level syntax tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeSyntax {
+    pub kind: TypeKind,
+    pub span: Span,
+}
+
+impl TypeSyntax {
+    #[must_use]
+    pub const fn new(kind: TypeKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+/// The syntax represented by a [`TypeSyntax`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeKind {
+    Primitive(PrimitiveType),
+    Named {
+        name: Span,
+        arguments: Vec<TypeSyntax>,
+    },
+    Mutable(Box<TypeSyntax>),
+    Group(Box<TypeSyntax>),
+    Callable {
+        parameters: Vec<TypeSyntax>,
+        return_type: Box<TypeSyntax>,
+    },
+    /// An unparenthesized `&` chain in source order, with at least two members.
+    Intersection {
+        members: Vec<TypeSyntax>,
+    },
+    /// An unparenthesized `|` chain in source order, with at least two members.
+    Union {
+        members: Vec<TypeSyntax>,
+    },
+}
+
+/// A built-in type with a reserved source spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrimitiveType {
+    Unit,
+    None,
+    Int,
+    Float,
+    Bool,
+    Char,
+    String,
+    Bytes,
+}
+
 /// The syntax represented by an [`Expression`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpressionKind {
