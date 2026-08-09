@@ -93,7 +93,7 @@ fn create_user(name: string) -> mut User {
 A function declared to return a const reference may return either const or mut
 access, reducing mut to const when necessary. A function declared `-> mut T`
 must return mut access. The qualifier is part of function and method signatures,
-including anonymous-function types and interface requirements. A return
+including callable types and interface requirements. A return
 capability qualifier is unnecessary for copied value types such as `int`.
 Within a union, `mut` qualifies the immediately following reference member, so
 `-> mut User | none` returns either mutable access to a `User` or `none`.
@@ -323,8 +323,8 @@ Current inference boundary:
 - Named function parameter types are explicit.
 - Every named function has an explicit return type.
 - Function return types are never inferred.
-- Anonymous function parameter and return types are explicit in the function
-  expression; contextual lambda signature inference is deferred.
+- Lambda parameter and return types are explicit in the lambda expression;
+  contextual lambda signature inference is deferred.
 - User-defined generic declarations and general-purpose generic inference are
   not part of the initial language. Built-in parameterized types such as
   `Error<T>` have their own limited inference rules.

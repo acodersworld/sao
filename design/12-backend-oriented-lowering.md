@@ -37,7 +37,7 @@ Every function uses a uniform resumable calling protocol, including functions
 that never yield. A function that directly executes `yield()`, or that can call
 another function which may yield, is lowered as a state machine with resume
 states around its suspension-capable operations. This transitive rule applies to
-ordinary calls, recursion, anonymous-function calls, and interface dispatch. The
+ordinary calls, recursion, lambda calls, and interface dispatch. The
 uniform protocol avoids exposing a coroutine effect in source function types and
 allows a single callable value or interface requirement to refer to both
 yielding and non-yielding implementations.

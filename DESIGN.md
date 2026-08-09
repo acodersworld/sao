@@ -16,7 +16,7 @@ provisional syntax and ideas intentionally deferred until later.
 4. [4. Expression-oriented blocks](design/04-expression-oriented-blocks.md)
 5. [5. Nominal structs](design/05-nominal-structs.md)
 6. [6. Go-like structural interfaces](design/06-go-like-structural-interfaces.md)
-7. [7. Anonymous structs, functions, and interface objects](design/07-anonymous-structs-functions-and-interface-objects.md)
+7. [7. Anonymous structs, lambdas, and interface objects](design/07-anonymous-structs-functions-and-interface-objects.md)
 8. [8. Union and intersection types](design/08-union-and-intersection-types.md)
 9. [9. Loop expressions](design/09-loop-expressions.md)
 10. [10. Cooperative coroutines and queues](design/10-cooperative-coroutines-and-queues.md)

@@ -1,4 +1,4 @@
-# 7. Anonymous structs, functions, and interface objects
+# 7. Anonymous structs, lambdas, and interface objects
 
 ## 7.1 Interface-constrained anonymous structs
 
@@ -40,7 +40,7 @@ Anonymous interface object rules:
 
 ## 7.2 Capture semantics
 
-Anonymous structs and anonymous functions automatically capture referenced
+Anonymous structs and lambdas automatically capture referenced
 bindings from their surrounding lexical scope. Captures do not need to be
 redeclared as fields:
 
@@ -75,8 +75,9 @@ Capture rules:
   it, even after its original lexical scope has returned.
 - Captures are hidden storage and do not become fields accessible through an
   interface.
-- Named structs and named functions do not capture lexical state.
-- Parameters and locals inside a method or anonymous function shadow captures
+- Named structs and named functions, including nested functions, do not capture
+  lexical state.
+- Parameters and locals inside a method or lambda shadow captures
   with the same name.
 
 Explicit fields and captures are distinct. A field initializer at
@@ -99,15 +100,39 @@ Mutable captured bindings are always represented by shared garbage-collected
 heap cells. The original scope and every capturing anonymous value access the
 same cell.
 
-## 7.3 Anonymous functions
+## 7.3 Nested functions
 
-Anonymous functions are expressions written with `fn` and an explicit
-signature:
+Named functions may be declared inside executable blocks:
+
+```text
+fn calculate(value: int) -> int {
+    fn double(input: int) -> int {
+        input * 2
+    }
+
+    double(value)
+}
+```
+
+A nested function is lexically scoped but does not capture bindings from its
+enclosing function. It may reference top-level declarations, its own parameters
+and locals, and its own name for recursion. Referencing an enclosing local is a
+compile-time error; a lambda must be used when capture is required.
+
+A nested function's name may be used as a first-class function value. Named
+functions and lambdas share the same callable `fn(...) -> ...` types. A nested
+function has no capture environment and is lowered like any other named
+function.
+
+## 7.4 Lambdas
+
+Lambdas are anonymous function expressions written with `lambda` and an
+explicit signature:
 
 ```text
 const factor = 1.5;
 
-const scale = fn(value: float) -> float {
+const scale = lambda(value: float) -> float {
     value * factor
 };
 ```
@@ -121,7 +146,7 @@ Mutable captures are shared:
 ```text
 mut count = 0;
 
-const next = fn() -> int {
+const next = lambda() -> int {
     count += 1;
     count
 };
@@ -131,16 +156,16 @@ next(); // 2
 // count is now 2
 ```
 
-If several anonymous functions capture the same mutable binding, they observe
+If several lambdas capture the same mutable binding, they observe
 the same storage. SAO has no ownership-transfer or `move` capture modifier.
 
-A `const` binding containing an anonymous function does not make that function
-pure. Calling it may still mutate a `mut` binding captured by the function.
+A `const` binding containing a lambda does not make that function pure. Calling
+it may still mutate a `mut` binding captured by the lambda.
 
-## 7.4 Closure and environment representation
+## 7.5 Closure and environment representation
 
-Every anonymous-function expression has a compiler-generated environment type.
-An anonymous function value has a uniform two-word representation:
+Every lambda expression has a compiler-generated environment type. A lambda
+value has a uniform two-word representation:
 
 ```text
 +--------------+---------------------+
@@ -165,9 +190,10 @@ a non-moving garbage-collected object specialized for that expression:
 The environment stores `const` captures directly and stores a pointer to the
 shared cell for each `mut` capture. Compiler-generated tracing metadata records
 which slots contain references. Environment field order, padding, and byte
-offsets are backend-private details. A non-capturing anonymous function retains
-the same two-word callable representation, uses a null environment pointer, and
-requires no environment allocation.
+offsets are backend-private details. A non-capturing lambda retains the same
+two-word callable representation, uses a null environment pointer, and requires
+no environment allocation. Named function values use the same representation
+with a null environment pointer.
 
 Anonymous structs do not need a separate environment allocation. Their
 compiler-generated garbage-collected object contains declared fields and hidden

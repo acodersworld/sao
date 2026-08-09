@@ -120,8 +120,10 @@ macro_rules! define_token_kinds {
 }
 
 define_token_kinds! {
-    // Begins a named or anonymous function declaration.
+    // Begins a named function declaration or a callable type.
     #[token("fn")] Fn,
+    // Begins an anonymous function expression that may capture lexical bindings.
+    #[token("lambda")] Lambda,
     // Begins a named or anonymous structure declaration.
     #[token("struct")] Struct,
     // Begins an interface declaration or interface-object expression.
@@ -637,7 +639,7 @@ mod tests {
     #[test]
     fn lexes_keywords_and_identifiers() {
         let source = concat!(
-            "fn struct interface const mut self if else loop while for in break continue ",
+            "fn lambda struct interface const mut self if else loop while for in break continue ",
             "return is co defer true false none int float bool char string bytes ",
             "name _private fnord",
         );
@@ -646,6 +648,7 @@ mod tests {
             kinds(source),
             vec![
                 TokenKind::Fn,
+                TokenKind::Lambda,
                 TokenKind::Struct,
                 TokenKind::Interface,
                 TokenKind::Const,

@@ -9,7 +9,7 @@ Identifiers match `[A-Za-z_][A-Za-z0-9_]*` and are case-sensitive. The reserved
 words are:
 
 ```text
-fn struct interface const mut self if else loop while for in break continue
+fn lambda struct interface const mut self if else loop while for in break continue
 return is co defer true false none int float bool char string bytes
 ```
 

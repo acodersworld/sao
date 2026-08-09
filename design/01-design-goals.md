@@ -7,7 +7,8 @@ SAO should be:
 - Expression-oriented, especially around blocks and control flow.
 - Flexible enough to express union and intersection types.
 - Nominal for data definitions and structural for behavioural interfaces.
-- Equipped with first-class anonymous functions and capturing anonymous structs.
+- Equipped with first-class lambdas, nested functions, and capturing anonymous
+  structs.
 - Equipped with explicitly scheduled cooperative coroutines and typed queues.
 - Pleasant for small programs and experimentation.
 - Implementable through a backend-neutral IR.

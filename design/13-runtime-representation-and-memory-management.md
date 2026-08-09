@@ -17,7 +17,7 @@ Initial collector rules:
   collector does not conservatively scan the native C stack.
 - Collection occurs only at well-defined safe points, initially allocation
   points.
-- Anonymous-function environments, anonymous-struct environments, and shared
+- Lambda environments, anonymous-struct environments, and shared
   cells created for mutable captures are ordinary traced heap objects. Coroutine
   objects, activation frames, queues, and queued values are traced as well.
 - Reference cycles are collected naturally.
@@ -114,11 +114,11 @@ padding. Anonymous structs place hidden captures after their declared fields.
 Every instance points to its concrete type's shared vtable; no method table is
 stored directly in an instance.
 
-An anonymous-function value is two words: a signature-specific code pointer and
-an environment pointer. Capturing functions point to a garbage-collected
-environment object. Non-capturing functions use a null environment pointer and
-allocate no environment. The compiler traces only the environment word; code
-pointers are not GC references.
+A callable function value is two words: a signature-specific code pointer and
+an environment pointer. Capturing lambdas point to a garbage-collected
+environment object. Named functions and non-capturing lambdas use a null
+environment pointer and allocate no environment. The compiler traces only the
+environment word; code pointers are not GC references.
 
 An interface or intersection value is exactly the same one-word object pointer
 as its underlying struct reference. Dispatch follows the object header's vtable

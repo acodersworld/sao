@@ -49,7 +49,7 @@ fn prefixed_writer(prefix: bytes, mut destination: Writer) -> mut Writer {
 }
 
 fn make_prefixer(prefix: bytes) -> fn(bytes) -> bytes {
-    fn(data: bytes) -> bytes {
+    lambda(data: bytes) -> bytes {
         bytes.concat(prefix, data)
     }
 }
@@ -62,7 +62,7 @@ fn write_file(path: string, data: bytes) -> int {
 }
 ```
 
-The anonymous writer and function examples use automatic lexical capture. Their
-environments use the specialized garbage-collected layouts described above. The
-file example shows the intended lexical cleanup behaviour without allowing a
-resource to escape its scope.
+The anonymous writer and lambda examples use automatic lexical capture. Their
+environments use the specialized garbage-collected layouts described above.
+The file example shows the intended lexical cleanup behaviour without allowing
+a resource to escape its scope.
