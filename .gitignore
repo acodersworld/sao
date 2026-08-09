@@ -1,0 +1,7 @@
+/build/
+/runtime/build/
+/target/
+*.exe
+*.nativecodeanalysis.xml
+*.obj
+
