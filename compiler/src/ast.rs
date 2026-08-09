@@ -30,6 +30,11 @@ pub enum ExpressionKind {
         operator: BinaryOperator,
         right: Box<Expression>,
     },
+    Assignment {
+        target: Box<Expression>,
+        operator: AssignmentOperator,
+        value: Box<Expression>,
+    },
 }
 
 /// A literal's source-level category. Its original spelling is retained by the
@@ -48,6 +53,8 @@ pub enum LiteralKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOperator {
     Negate,
+    LogicalNot,
+    BitwiseNot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,4 +63,33 @@ pub enum BinaryOperator {
     Subtract,
     Multiply,
     Divide,
+    Remainder,
+    ShiftLeft,
+    ShiftRight,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Equal,
+    NotEqual,
+    BitwiseAnd,
+    BitwiseXor,
+    BitwiseOr,
+    LogicalAnd,
+    LogicalOr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssignmentOperator {
+    Assign,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    BitwiseAnd,
+    BitwiseXor,
+    BitwiseOr,
+    ShiftLeft,
+    ShiftRight,
 }

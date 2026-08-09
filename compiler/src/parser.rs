@@ -1,6 +1,8 @@
 use std::iter::Peekable;
 
-use crate::ast::{BinaryOperator, Expression, ExpressionKind, LiteralKind, UnaryOperator};
+use crate::ast::{
+    AssignmentOperator, BinaryOperator, Expression, ExpressionKind, LiteralKind, UnaryOperator,
+};
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,7 +54,7 @@ where
     I: Iterator<Item = Result<Token, LexError>>,
 {
     let mut parser = Parser::new(tokens);
-    let expression = parser.expression(0)?;
+    let expression = parser.expression(LOWEST_BINDING_POWER)?;
     let token = parser.current()?;
 
     if token.kind != TokenKind::Eof {
@@ -88,11 +90,7 @@ where
     fn expression(&mut self, minimum_binding_power: u8) -> ParseResult {
         let mut left = self.prefix()?;
 
-        loop {
-            let Some(binding_power) = infix_binding_power(self.current()?.kind) else {
-                break;
-            };
-
+        while let Some(binding_power) = infix_binding_power(self.current()?.kind) {
             if binding_power.left_binding_power < minimum_binding_power {
                 break;
             }
@@ -101,14 +99,20 @@ where
             let right = self.expression(binding_power.right_binding_power)?;
             let span = Span::new(left.span.start, right.span.end);
 
-            left = Expression::new(
-                ExpressionKind::Binary {
+            let kind = match binding_power.operator {
+                InfixOperator::Binary(operator) => ExpressionKind::Binary {
                     left: Box::new(left),
-                    operator: binding_power.operator,
+                    operator,
                     right: Box::new(right),
                 },
-                span,
-            );
+                InfixOperator::Assignment(operator) => ExpressionKind::Assignment {
+                    target: Box::new(left),
+                    operator,
+                    value: Box::new(right),
+                },
+            };
+
+            left = Expression::new(kind, span);
         }
 
         Ok(left)
@@ -126,6 +130,24 @@ where
                 Ok(Expression::new(
                     ExpressionKind::Unary {
                         operator: UnaryOperator::Negate,
+                        operand: Box::new(operand),
+                    },
+                    span,
+                ))
+            }
+            TokenKind::Bang | TokenKind::Tilde => {
+                self.advance()?;
+                let operand = self.expression(prefix_binding_power(token.kind))?;
+                let span = Span::new(token.span.start, operand.span.end);
+                let operator = match token.kind {
+                    TokenKind::Bang => UnaryOperator::LogicalNot,
+                    TokenKind::Tilde => UnaryOperator::BitwiseNot,
+                    _ => unreachable!(),
+                };
+
+                Ok(Expression::new(
+                    ExpressionKind::Unary {
+                        operator,
                         operand: Box::new(operand),
                     },
                     span,
@@ -160,7 +182,7 @@ where
             ));
         }
 
-        let expression = self.expression(0)?;
+        let expression = self.expression(LOWEST_BINDING_POWER)?;
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
 
         Ok(Expression::new(
@@ -218,11 +240,31 @@ where
     }
 }
 
+const LOWEST_BINDING_POWER: u8 = 0;
+const ASSIGNMENT_BINDING_POWER: u8 = 1;
+const LOGICAL_OR_BINDING_POWER: u8 = 3;
+const LOGICAL_AND_BINDING_POWER: u8 = 5;
+const BITWISE_OR_BINDING_POWER: u8 = 7;
+const BITWISE_XOR_BINDING_POWER: u8 = 9;
+const BITWISE_AND_BINDING_POWER: u8 = 11;
+const EQUALITY_BINDING_POWER: u8 = 13;
+const RELATIONAL_BINDING_POWER: u8 = 15;
+const SHIFT_BINDING_POWER: u8 = 17;
+const ADDITIVE_BINDING_POWER: u8 = 19;
+const MULTIPLICATIVE_BINDING_POWER: u8 = 21;
+const PREFIX_BINDING_POWER: u8 = 23;
+
 const fn prefix_binding_power(kind: TokenKind) -> u8 {
     match kind {
-        TokenKind::Minus => 5,
-        _ => 0,
+        TokenKind::Minus | TokenKind::Bang | TokenKind::Tilde => PREFIX_BINDING_POWER,
+        _ => LOWEST_BINDING_POWER,
     }
+}
+
+#[derive(Clone, Copy)]
+enum InfixOperator {
+    Binary(BinaryOperator),
+    Assignment(AssignmentOperator),
 }
 
 struct InfixBindingPower {
@@ -230,29 +272,153 @@ struct InfixBindingPower {
     left_binding_power: u8,
     /// Sets the minimum binding power while parsing the operator's right operand.
     right_binding_power: u8,
-    operator: BinaryOperator,
+    operator: InfixOperator,
 }
 
 impl InfixBindingPower {
-    const fn new(
-        left_binding_power: u8,
-        right_binding_power: u8,
-        operator: BinaryOperator,
-    ) -> Self {
+    const fn left_associative(left_binding_power: u8, operator: InfixOperator) -> Self {
         Self {
             left_binding_power,
-            right_binding_power,
+            right_binding_power: left_binding_power + 1,
             operator,
         }
+    }
+
+    const fn right_associative(binding_power: u8, operator: InfixOperator) -> Self {
+        Self {
+            left_binding_power: binding_power,
+            right_binding_power: binding_power,
+            operator,
+        }
+    }
+
+    const fn binary(binding_power: u8, operator: BinaryOperator) -> Self {
+        Self::left_associative(binding_power, InfixOperator::Binary(operator))
+    }
+
+    const fn assignment(binding_power: u8, operator: AssignmentOperator) -> Self {
+        Self::right_associative(binding_power, InfixOperator::Assignment(operator))
     }
 }
 
 const fn infix_binding_power(kind: TokenKind) -> Option<InfixBindingPower> {
     match kind {
-        TokenKind::Plus => Some(InfixBindingPower::new(1, 2, BinaryOperator::Add)),
-        TokenKind::Minus => Some(InfixBindingPower::new(1, 2, BinaryOperator::Subtract)),
-        TokenKind::Star => Some(InfixBindingPower::new(3, 4, BinaryOperator::Multiply)),
-        TokenKind::Slash => Some(InfixBindingPower::new(3, 4, BinaryOperator::Divide)),
+        TokenKind::Assign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::Assign,
+        )),
+        TokenKind::PlusAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::Add,
+        )),
+        TokenKind::MinusAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::Subtract,
+        )),
+        TokenKind::StarAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::Multiply,
+        )),
+        TokenKind::SlashAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::Divide,
+        )),
+        TokenKind::PercentAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::Remainder,
+        )),
+        TokenKind::AmpersandAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::BitwiseAnd,
+        )),
+        TokenKind::CaretAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::BitwiseXor,
+        )),
+        TokenKind::PipeAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::BitwiseOr,
+        )),
+        TokenKind::ShiftLeftAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::ShiftLeft,
+        )),
+        TokenKind::ShiftRightAssign => Some(InfixBindingPower::assignment(
+            ASSIGNMENT_BINDING_POWER,
+            AssignmentOperator::ShiftRight,
+        )),
+        TokenKind::LogicalOr => Some(InfixBindingPower::binary(
+            LOGICAL_OR_BINDING_POWER,
+            BinaryOperator::LogicalOr,
+        )),
+        TokenKind::LogicalAnd => Some(InfixBindingPower::binary(
+            LOGICAL_AND_BINDING_POWER,
+            BinaryOperator::LogicalAnd,
+        )),
+        TokenKind::Pipe => Some(InfixBindingPower::binary(
+            BITWISE_OR_BINDING_POWER,
+            BinaryOperator::BitwiseOr,
+        )),
+        TokenKind::Caret => Some(InfixBindingPower::binary(
+            BITWISE_XOR_BINDING_POWER,
+            BinaryOperator::BitwiseXor,
+        )),
+        TokenKind::Ampersand => Some(InfixBindingPower::binary(
+            BITWISE_AND_BINDING_POWER,
+            BinaryOperator::BitwiseAnd,
+        )),
+        TokenKind::Equal => Some(InfixBindingPower::binary(
+            EQUALITY_BINDING_POWER,
+            BinaryOperator::Equal,
+        )),
+        TokenKind::NotEqual => Some(InfixBindingPower::binary(
+            EQUALITY_BINDING_POWER,
+            BinaryOperator::NotEqual,
+        )),
+        TokenKind::Less => Some(InfixBindingPower::binary(
+            RELATIONAL_BINDING_POWER,
+            BinaryOperator::Less,
+        )),
+        TokenKind::LessEqual => Some(InfixBindingPower::binary(
+            RELATIONAL_BINDING_POWER,
+            BinaryOperator::LessEqual,
+        )),
+        TokenKind::Greater => Some(InfixBindingPower::binary(
+            RELATIONAL_BINDING_POWER,
+            BinaryOperator::Greater,
+        )),
+        TokenKind::GreaterEqual => Some(InfixBindingPower::binary(
+            RELATIONAL_BINDING_POWER,
+            BinaryOperator::GreaterEqual,
+        )),
+        TokenKind::ShiftLeft => Some(InfixBindingPower::binary(
+            SHIFT_BINDING_POWER,
+            BinaryOperator::ShiftLeft,
+        )),
+        TokenKind::ShiftRight => Some(InfixBindingPower::binary(
+            SHIFT_BINDING_POWER,
+            BinaryOperator::ShiftRight,
+        )),
+        TokenKind::Plus => Some(InfixBindingPower::binary(
+            ADDITIVE_BINDING_POWER,
+            BinaryOperator::Add,
+        )),
+        TokenKind::Minus => Some(InfixBindingPower::binary(
+            ADDITIVE_BINDING_POWER,
+            BinaryOperator::Subtract,
+        )),
+        TokenKind::Star => Some(InfixBindingPower::binary(
+            MULTIPLICATIVE_BINDING_POWER,
+            BinaryOperator::Multiply,
+        )),
+        TokenKind::Slash => Some(InfixBindingPower::binary(
+            MULTIPLICATIVE_BINDING_POWER,
+            BinaryOperator::Divide,
+        )),
+        TokenKind::Percent => Some(InfixBindingPower::binary(
+            MULTIPLICATIVE_BINDING_POWER,
+            BinaryOperator::Remainder,
+        )),
         _ => None,
     }
 }
@@ -356,6 +522,133 @@ mod tests {
             left.kind,
             ExpressionKind::Unary {
                 operator: UnaryOperator::Negate,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_all_prefix_operators() {
+        for (source, expected) in [
+            ("-value", UnaryOperator::Negate),
+            ("!value", UnaryOperator::LogicalNot),
+            ("~value", UnaryOperator::BitwiseNot),
+        ] {
+            let expression = parse(source).expect("prefix expression should parse");
+            let ExpressionKind::Unary { operator, .. } = expression.kind else {
+                panic!("expected a unary expression for {source}");
+            };
+
+            assert_eq!(operator, expected, "incorrect operator for {source}");
+        }
+    }
+
+    #[test]
+    fn parses_all_binary_operators() {
+        for (source, expected) in [
+            ("a + b", BinaryOperator::Add),
+            ("a - b", BinaryOperator::Subtract),
+            ("a * b", BinaryOperator::Multiply),
+            ("a / b", BinaryOperator::Divide),
+            ("a % b", BinaryOperator::Remainder),
+            ("a << b", BinaryOperator::ShiftLeft),
+            ("a >> b", BinaryOperator::ShiftRight),
+            ("a < b", BinaryOperator::Less),
+            ("a <= b", BinaryOperator::LessEqual),
+            ("a > b", BinaryOperator::Greater),
+            ("a >= b", BinaryOperator::GreaterEqual),
+            ("a == b", BinaryOperator::Equal),
+            ("a != b", BinaryOperator::NotEqual),
+            ("a & b", BinaryOperator::BitwiseAnd),
+            ("a ^ b", BinaryOperator::BitwiseXor),
+            ("a | b", BinaryOperator::BitwiseOr),
+            ("a && b", BinaryOperator::LogicalAnd),
+            ("a || b", BinaryOperator::LogicalOr),
+        ] {
+            let expression = parse(source).expect("binary expression should parse");
+            let ExpressionKind::Binary { operator, .. } = expression.kind else {
+                panic!("expected a binary expression for {source}");
+            };
+
+            assert_eq!(operator, expected, "incorrect operator for {source}");
+        }
+    }
+
+    #[test]
+    fn parses_all_assignment_operators() {
+        for (source, expected) in [
+            ("a = b", AssignmentOperator::Assign),
+            ("a += b", AssignmentOperator::Add),
+            ("a -= b", AssignmentOperator::Subtract),
+            ("a *= b", AssignmentOperator::Multiply),
+            ("a /= b", AssignmentOperator::Divide),
+            ("a %= b", AssignmentOperator::Remainder),
+            ("a &= b", AssignmentOperator::BitwiseAnd),
+            ("a ^= b", AssignmentOperator::BitwiseXor),
+            ("a |= b", AssignmentOperator::BitwiseOr),
+            ("a <<= b", AssignmentOperator::ShiftLeft),
+            ("a >>= b", AssignmentOperator::ShiftRight),
+        ] {
+            let expression = parse(source).expect("assignment expression should parse");
+            let ExpressionKind::Assignment { operator, .. } = expression.kind else {
+                panic!("expected an assignment expression for {source}");
+            };
+
+            assert_eq!(operator, expected, "incorrect operator for {source}");
+        }
+    }
+
+    #[test]
+    fn observes_precedence_across_operator_groups() {
+        let expression = parse("a || b && c").expect("logical expression should parse");
+        let ExpressionKind::Binary {
+            operator: BinaryOperator::LogicalOr,
+            right,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected logical OR at the root");
+        };
+        assert!(matches!(
+            right.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::LogicalAnd,
+                ..
+            }
+        ));
+
+        let expression = parse("a < b + c").expect("relational expression should parse");
+        let ExpressionKind::Binary {
+            operator: BinaryOperator::Less,
+            right,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected comparison at the root");
+        };
+        assert!(matches!(
+            right.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn assignments_are_right_associative_and_bind_loosely() {
+        let expression = parse("a = b = c || d").expect("assignment expression should parse");
+        let ExpressionKind::Assignment { value, .. } = expression.kind else {
+            panic!("expected an assignment at the root");
+        };
+        let ExpressionKind::Assignment { value, .. } = value.kind else {
+            panic!("expected a nested assignment on the right");
+        };
+
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::LogicalOr,
                 ..
             }
         ));

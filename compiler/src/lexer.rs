@@ -317,7 +317,6 @@ pub struct Lexer<'source> {
 }
 
 impl<'source> Lexer<'source> {
-    #[must_use]
     pub fn new(source: &'source str) -> Self {
         Self {
             inner: RawTokenKind::lexer(source).spanned(),
@@ -371,7 +370,6 @@ impl FusedIterator for Lexer<'_> {}
 /// Returns the complete token stream when the source is lexically valid. If
 /// any malformed regions are found, returns every lexical error instead. Use
 /// [`Lexer`] directly to handle tokens and errors incrementally.
-#[must_use]
 pub fn lex(source: &str) -> LexResult {
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
