@@ -1,6 +1,7 @@
 use std::fmt;
+use std::iter::FusedIterator;
 
-use logos::{Lexer, Logos};
+use logos::{Lexer as LogosLexer, Logos, SpannedIter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
@@ -105,7 +106,6 @@ macro_rules! define_token_kinds {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum TokenKind {
             $($variant,)+
-            Error,
             Eof,
         }
 
@@ -302,55 +302,95 @@ pub struct LexError {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexResult {
-    pub tokens: Vec<Token>,
-    pub errors: Vec<LexError>,
+pub type LexResult = Result<Vec<Token>, Vec<LexError>>;
+
+/// A lazy token iterator over one SAO source string.
+///
+/// The iterator always yields one explicit `Eof` token before it is exhausted.
+/// Malformed source produces an error item, after which iteration continues at
+/// the next token boundary.
+#[must_use = "a lexer does nothing unless it is iterated"]
+pub struct Lexer<'source> {
+    inner: SpannedIter<'source, RawTokenKind>,
+    source_len: usize,
+    emitted_eof: bool,
 }
 
-impl LexResult {
+impl<'source> Lexer<'source> {
     #[must_use]
-    pub fn is_success(&self) -> bool {
-        self.errors.is_empty()
+    pub fn new(source: &'source str) -> Self {
+        Self {
+            inner: RawTokenKind::lexer(source).spanned(),
+            source_len: source.len(),
+            emitted_eof: false,
+        }
     }
 }
 
+impl Iterator for Lexer<'_> {
+    type Item = Result<Token, LexError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some((result, logos_span)) = self.inner.next() {
+            let token_span = Span::from(logos_span);
+
+            return Some(match result {
+                Ok(kind) => Ok(Token::new(kind.into(), token_span)),
+                Err(error) => {
+                    let error_span = error.relative_span.map_or(token_span, |relative| {
+                        Span::new(
+                            token_span.start + relative.start,
+                            token_span.start + relative.end,
+                        )
+                    });
+
+                    Err(LexError {
+                        kind: error.kind,
+                        span: error_span,
+                    })
+                }
+            });
+        }
+
+        if self.emitted_eof {
+            return None;
+        }
+
+        self.emitted_eof = true;
+        Some(Ok(Token::new(
+            TokenKind::Eof,
+            Span::new(self.source_len, self.source_len),
+        )))
+    }
+}
+
+impl FusedIterator for Lexer<'_> {}
+
+/// Lexes an entire source string.
+///
+/// Returns the complete token stream when the source is lexically valid. If
+/// any malformed regions are found, returns every lexical error instead. Use
+/// [`Lexer`] directly to handle tokens and errors incrementally.
 #[must_use]
 pub fn lex(source: &str) -> LexResult {
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
 
-    for (result, logos_span) in RawTokenKind::lexer(source).spanned() {
-        let token_span = Span::from(logos_span);
-
+    for result in Lexer::new(source) {
         match result {
-            Ok(kind) => tokens.push(Token::new(kind.into(), token_span)),
-            Err(error) => {
-                let error_span = error.relative_span.map_or(token_span, |relative| {
-                    Span::new(
-                        token_span.start + relative.start,
-                        token_span.start + relative.end,
-                    )
-                });
-
-                errors.push(LexError {
-                    kind: error.kind,
-                    span: error_span,
-                });
-                tokens.push(Token::new(TokenKind::Error, token_span));
-            }
+            Ok(token) => tokens.push(token),
+            Err(error) => errors.push(error),
         }
     }
 
-    tokens.push(Token::new(
-        TokenKind::Eof,
-        Span::new(source.len(), source.len()),
-    ));
-
-    LexResult { tokens, errors }
+    if errors.is_empty() {
+        Ok(tokens)
+    } else {
+        Err(errors)
+    }
 }
 
-fn lex_block_comment(lexer: &mut Lexer<'_, RawTokenKind>) -> Result<(), RawLexError> {
+fn lex_block_comment(lexer: &mut LogosLexer<'_, RawTokenKind>) -> Result<(), RawLexError> {
     let remainder = lexer.remainder().as_bytes();
     let mut depth = 1_usize;
     let mut offset = 0_usize;
@@ -380,11 +420,11 @@ fn lex_block_comment(lexer: &mut Lexer<'_, RawTokenKind>) -> Result<(), RawLexEr
     ))
 }
 
-fn lex_string_literal(lexer: &mut Lexer<'_, RawTokenKind>) -> Result<(), RawLexError> {
+fn lex_string_literal(lexer: &mut LogosLexer<'_, RawTokenKind>) -> Result<(), RawLexError> {
     lex_quoted_literal(lexer, b'"', QuotedLiteralKind::String)
 }
 
-fn lex_character_literal(lexer: &mut Lexer<'_, RawTokenKind>) -> Result<(), RawLexError> {
+fn lex_character_literal(lexer: &mut LogosLexer<'_, RawTokenKind>) -> Result<(), RawLexError> {
     lex_quoted_literal(lexer, b'\'', QuotedLiteralKind::Character)
 }
 
@@ -404,7 +444,7 @@ impl QuotedLiteralKind {
 }
 
 fn lex_quoted_literal(
-    lexer: &mut Lexer<'_, RawTokenKind>,
+    lexer: &mut LogosLexer<'_, RawTokenKind>,
     quote: u8,
     literal_kind: QuotedLiteralKind,
 ) -> Result<(), RawLexError> {
@@ -541,10 +581,59 @@ mod tests {
 
     fn kinds(source: &str) -> Vec<TokenKind> {
         lex(source)
-            .tokens
+            .expect("source should lex successfully")
             .into_iter()
             .map(|token| token.kind)
             .collect()
+    }
+
+    fn streamed(source: &str) -> (Vec<Token>, Vec<LexError>) {
+        let mut tokens = Vec::new();
+        let mut errors = Vec::new();
+
+        for result in Lexer::new(source) {
+            match result {
+                Ok(token) => tokens.push(token),
+                Err(error) => errors.push(error),
+            }
+        }
+
+        (tokens, errors)
+    }
+
+    #[test]
+    fn streams_tokens_lazily_and_emits_eof_once() {
+        let source = "const value";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token::new(TokenKind::Const, Span::new(0, 5))))
+        );
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token::new(TokenKind::Identifier, Span::new(6, 11))))
+        );
+        assert_eq!(
+            lexer.next(),
+            Some(Ok(Token::new(TokenKind::Eof, Span::new(11, 11))))
+        );
+        assert_eq!(lexer.next(), None);
+        assert_eq!(lexer.next(), None);
+    }
+
+    #[test]
+    fn streaming_error_is_returned_as_err() {
+        let source = "\"bad\\q\"";
+        let mut lexer = Lexer::new(source);
+
+        assert_eq!(
+            lexer.next(),
+            Some(Err(LexError {
+                kind: LexErrorKind::InvalidEscape,
+                span: Span::new(4, 6),
+            }))
+        );
     }
 
     #[test]
@@ -677,15 +766,10 @@ mod tests {
     #[test]
     fn preserves_literal_text_and_accepts_ascii_escapes() {
         let source = "\"hello\\n\\x00\" '\\x7f' '\\''";
-        let result = lex(source);
+        let tokens = lex(source).expect("valid literals should lex successfully");
 
-        assert!(result.is_success());
         assert_eq!(
-            result
-                .tokens
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
             vec![
                 TokenKind::StringLiteral,
                 TokenKind::CharacterLiteral,
@@ -693,9 +777,9 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
-        assert_eq!(result.tokens[0].text(source), "\"hello\\n\\x00\"");
-        assert_eq!(result.tokens[1].text(source), "'\\x7f'");
-        assert_eq!(result.tokens[2].text(source), "'\\''");
+        assert_eq!(tokens[0].text(source), "\"hello\\n\\x00\"");
+        assert_eq!(tokens[1].text(source), "'\\x7f'");
+        assert_eq!(tokens[2].text(source), "'\\''");
     }
 
     #[test]
@@ -705,15 +789,10 @@ mod tests {
             "// Unicode is permitted in comments: \u{03c0}\r\n",
             "= 1;",
         );
-        let result = lex(source);
+        let tokens = lex(source).expect("comments should be skipped successfully");
 
-        assert!(result.is_success());
         assert_eq!(
-            result
-                .tokens
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
             vec![
                 TokenKind::Const,
                 TokenKind::Identifier,
@@ -726,151 +805,108 @@ mod tests {
     }
 
     #[test]
-    fn reports_unterminated_nested_block_comment_as_one_error_token() {
+    fn reports_unterminated_nested_block_comment_as_one_error() {
         let source = "const /* outer /* nested */";
-        let result = lex(source);
+        let (tokens, errors) = streamed(source);
 
         assert_eq!(
-            result
-                .tokens
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
-            vec![TokenKind::Const, TokenKind::Error, TokenKind::Eof]
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Const, TokenKind::Eof]
         );
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(
-            result.errors[0].kind,
-            LexErrorKind::UnterminatedBlockComment
-        );
-        assert_eq!(result.tokens[1].text(source), "/* outer /* nested */");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, LexErrorKind::UnterminatedBlockComment);
+        assert_eq!(lex(source), Err(errors));
     }
 
     #[test]
     fn reports_invalid_escape_and_resumes_after_literal() {
         let source = "\"bad\\q\" + 1";
-        let result = lex(source);
+        let (tokens, errors) = streamed(source);
 
         assert_eq!(
-            result
-                .tokens
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                TokenKind::Error,
-                TokenKind::Plus,
-                TokenKind::IntegerLiteral,
-                TokenKind::Eof,
-            ]
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Plus, TokenKind::IntegerLiteral, TokenKind::Eof,]
         );
         assert_eq!(
-            result.errors,
+            errors,
             vec![LexError {
                 kind: LexErrorKind::InvalidEscape,
                 span: Span::new(4, 6),
             }]
         );
-        assert_eq!(result.tokens[0].text(source), "\"bad\\q\"");
+        assert_eq!(lex(source), Err(errors));
     }
 
     #[test]
     fn rejects_non_ascii_string_and_character_contents() {
         let source = "\"\u{00e9}\" '\u{00e9}'";
-        let result = lex(source);
+        let (tokens, errors) = streamed(source);
 
         assert_eq!(
-            result
-                .tokens
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
-            vec![TokenKind::Error, TokenKind::Error, TokenKind::Eof]
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Eof]
         );
-        assert_eq!(result.errors.len(), 2);
-        assert!(result
-            .errors
+        assert_eq!(errors.len(), 2);
+        assert!(errors
             .iter()
             .all(|error| error.kind == LexErrorKind::NonAsciiLiteral));
+        assert_eq!(lex(source), Err(errors));
     }
 
     #[test]
     fn validates_character_literal_length() {
         let source = "'' 'ab' 'a'";
-        let result = lex(source);
+        let (tokens, errors) = streamed(source);
 
         assert_eq!(
-            result
-                .tokens
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                TokenKind::Error,
-                TokenKind::Error,
-                TokenKind::CharacterLiteral,
-                TokenKind::Eof,
-            ]
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![TokenKind::CharacterLiteral, TokenKind::Eof]
         );
-        assert_eq!(result.errors[0].kind, LexErrorKind::EmptyCharacterLiteral);
-        assert_eq!(
-            result.errors[1].kind,
-            LexErrorKind::MultipleCharacterLiteral
-        );
+        assert_eq!(errors[0].kind, LexErrorKind::EmptyCharacterLiteral);
+        assert_eq!(errors[1].kind, LexErrorKind::MultipleCharacterLiteral);
+        assert_eq!(lex(source), Err(errors));
     }
 
     #[test]
     fn unterminated_literal_stops_before_newline_and_lexing_continues() {
         let source = "\"abc\nconst";
-        let result = lex(source);
+        let (tokens, errors) = streamed(source);
 
         assert_eq!(
-            result
-                .tokens
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
-            vec![TokenKind::Error, TokenKind::Const, TokenKind::Eof]
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Const, TokenKind::Eof]
         );
-        assert_eq!(
-            result.errors[0].kind,
-            LexErrorKind::UnterminatedStringLiteral
-        );
-        assert_eq!(result.tokens[0].span, Span::new(0, 4));
+        assert_eq!(errors[0].kind, LexErrorKind::UnterminatedStringLiteral);
+        assert_eq!(lex(source), Err(errors));
     }
 
     #[test]
     fn reports_each_unrecognized_source_character_and_continues() {
         let source = "@ $";
-        let result = lex(source);
+        let (tokens, errors) = streamed(source);
 
         assert_eq!(
-            result
-                .tokens
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
-            vec![TokenKind::Error, TokenKind::Error, TokenKind::Eof]
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Eof]
         );
-        assert_eq!(result.errors.len(), 2);
-        assert!(result
-            .errors
+        assert_eq!(errors.len(), 2);
+        assert!(errors
             .iter()
             .all(|error| error.kind == LexErrorKind::UnexpectedCharacter));
+        assert_eq!(lex(source), Err(errors));
     }
 
     #[test]
     fn returns_byte_spans_and_an_explicit_eof_token() {
         let source = "const value = 10;";
-        let result = lex(source);
+        let tokens = lex(source).expect("valid source should lex successfully");
 
-        assert!(result.is_success());
-        assert_eq!(result.tokens[0].span, Span::new(0, 5));
-        assert_eq!(result.tokens[1].span, Span::new(6, 11));
-        assert_eq!(result.tokens[2].span, Span::new(12, 13));
-        assert_eq!(result.tokens[3].span, Span::new(14, 16));
-        assert_eq!(result.tokens[4].span, Span::new(16, 17));
-        assert_eq!(result.tokens[5].span, Span::new(17, 17));
-        assert!(result.tokens[5].span.is_empty());
+        assert_eq!(tokens[0].span, Span::new(0, 5));
+        assert_eq!(tokens[1].span, Span::new(6, 11));
+        assert_eq!(tokens[2].span, Span::new(12, 13));
+        assert_eq!(tokens[3].span, Span::new(14, 16));
+        assert_eq!(tokens[4].span, Span::new(16, 17));
+        assert_eq!(tokens[5].span, Span::new(17, 17));
+        assert!(tokens[5].span.is_empty());
     }
 }

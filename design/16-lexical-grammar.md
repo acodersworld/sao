@@ -57,9 +57,9 @@ their runtime value occurs in a later compiler phase.
 
 ## 16.5 Errors and recovery
 
-The lexer reports all errors it encounters and emits an `Error` token for each
-malformed source region. A malformed quoted literal and an unclosed block
-comment are each consumed as one error token so the parser can resume at a
-meaningful boundary. Every token carries a half-open byte span, and a final
+The lazy lexer yields `Result<Token, LexError>` items and continues after an
+error. A malformed quoted literal and an unclosed block comment are each
+consumed as one error item so the next iteration resumes at a meaningful
+boundary. The eager `lex` helper returns all tokens on success or all lexical
+errors on failure. Every token carries a half-open byte span, and a final
 zero-length `Eof` token is always emitted.
-
