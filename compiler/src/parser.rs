@@ -90,6 +90,16 @@ where
     fn expression(&mut self, minimum_binding_power: u8) -> ParseResult {
         let mut left = self.prefix()?;
 
+        loop {
+            left = match self.current()?.kind {
+                TokenKind::LeftParen => self.call(left)?,
+                TokenKind::Dot => self.member_access(left)?,
+                TokenKind::LeftBracket => self.index(left)?,
+                TokenKind::Question => self.try_expression(left)?,
+                _ => break,
+            };
+        }
+
         while let Some(binding_power) = infix_binding_power(self.current()?.kind) {
             if binding_power.left_binding_power < minimum_binding_power {
                 break;
@@ -116,6 +126,79 @@ where
         }
 
         Ok(left)
+    }
+
+    fn call(&mut self, callee: Expression) -> ParseResult {
+        self.expect(TokenKind::LeftParen)?;
+        let mut arguments = Vec::new();
+
+        if self.current()?.kind != TokenKind::RightParen {
+            loop {
+                arguments.push(self.expression(LOWEST_BINDING_POWER)?);
+
+                if self.current()?.kind != TokenKind::Comma {
+                    break;
+                }
+
+                self.advance()?;
+
+                if self.current()?.kind == TokenKind::RightParen {
+                    break;
+                }
+            }
+        }
+
+        let right_parenthesis = self.expect(TokenKind::RightParen)?;
+        let span = Span::new(callee.span.start, right_parenthesis.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::Call {
+                callee: Box::new(callee),
+                arguments,
+            },
+            span,
+        ))
+    }
+
+    fn member_access(&mut self, object: Expression) -> ParseResult {
+        self.expect(TokenKind::Dot)?;
+        let member = self.expect(TokenKind::Identifier)?;
+        let span = Span::new(object.span.start, member.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::MemberAccess {
+                object: Box::new(object),
+                member: member.span,
+            },
+            span,
+        ))
+    }
+
+    fn index(&mut self, object: Expression) -> ParseResult {
+        self.expect(TokenKind::LeftBracket)?;
+        let index = self.expression(LOWEST_BINDING_POWER)?;
+        let right_bracket = self.expect(TokenKind::RightBracket)?;
+        let span = Span::new(object.span.start, right_bracket.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::Index {
+                object: Box::new(object),
+                index: Box::new(index),
+            },
+            span,
+        ))
+    }
+
+    fn try_expression(&mut self, expression: Expression) -> ParseResult {
+        let question = self.expect(TokenKind::Question)?;
+        let span = Span::new(expression.span.start, question.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::Try {
+                expression: Box::new(expression),
+            },
+            span,
+        ))
     }
 
     fn prefix(&mut self) -> ParseResult {
@@ -525,6 +608,106 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_calls_with_empty_and_multiple_argument_lists() {
+        let expression = parse("run()").expect("empty call should parse");
+        let ExpressionKind::Call { arguments, .. } = expression.kind else {
+            panic!("expected a call expression");
+        };
+        assert!(arguments.is_empty());
+        assert_eq!(expression.span, Span::new(0, 5));
+
+        let expression =
+            parse("run(first, second + third,)").expect("call with a trailing comma should parse");
+        let ExpressionKind::Call { arguments, .. } = expression.kind else {
+            panic!("expected a call expression");
+        };
+        assert_eq!(arguments.len(), 2);
+        assert!(matches!(
+            arguments[1].kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_member_access_and_indexing() {
+        let expression = parse("items[1 + 2].length").expect("postfix expression should parse");
+        let ExpressionKind::MemberAccess { object, member } = expression.kind else {
+            panic!("expected member access at the root");
+        };
+        assert_eq!(member, Span::new(13, 19));
+
+        let ExpressionKind::Index { index, .. } = object.kind else {
+            panic!("expected indexing before member access");
+        };
+        assert!(matches!(
+            index.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn postfix_expressions_chain_from_left_to_right() {
+        let expression = parse("service.worker(1)[0]?").expect("postfix chain should parse");
+        let ExpressionKind::Try { expression } = expression.kind else {
+            panic!("expected Try at the root");
+        };
+        let ExpressionKind::Index { object, .. } = expression.kind else {
+            panic!("expected indexing before Try");
+        };
+        let ExpressionKind::Call { callee, .. } = object.kind else {
+            panic!("expected a call before indexing");
+        };
+        assert!(matches!(callee.kind, ExpressionKind::MemberAccess { .. }));
+    }
+
+    #[test]
+    fn postfix_expressions_bind_more_tightly_than_prefix_and_infix_operators() {
+        let expression = parse("-value.member + other").expect("expression should parse");
+        let ExpressionKind::Binary {
+            left,
+            operator: BinaryOperator::Add,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected addition at the root");
+        };
+        let ExpressionKind::Unary { operand, .. } = left.kind else {
+            panic!("expected unary negation on the left");
+        };
+        assert!(matches!(operand.kind, ExpressionKind::MemberAccess { .. }));
+    }
+
+    #[test]
+    fn reports_incomplete_postfix_expressions() {
+        assert_eq!(
+            parse("value."),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Eof,
+                },
+                span: Span::new(6, 6),
+            }))
+        );
+
+        assert_eq!(
+            parse("items[]"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::RightBracket,
+                },
+                span: Span::new(6, 7),
+            }))
+        );
     }
 
     #[test]

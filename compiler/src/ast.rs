@@ -21,6 +21,21 @@ pub enum ExpressionKind {
     SelfValue,
     Literal(LiteralKind),
     Group(Box<Expression>),
+    Call {
+        callee: Box<Expression>,
+        arguments: Vec<Expression>,
+    },
+    MemberAccess {
+        object: Box<Expression>,
+        member: Span,
+    },
+    Index {
+        object: Box<Expression>,
+        index: Box<Expression>,
+    },
+    Try {
+        expression: Box<Expression>,
+    },
     Unary {
         operator: UnaryOperator,
         operand: Box<Expression>,
