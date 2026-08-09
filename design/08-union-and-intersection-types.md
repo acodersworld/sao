@@ -167,7 +167,7 @@ if result is Error<string> {
 }
 ```
 
-The postfix `?` operator propagates an error without exceptions:
+The postfix Try operator, written `?`, propagates an error without exceptions:
 
 ```text
 fn caller() -> int | Error<string> {
@@ -176,12 +176,12 @@ fn caller() -> int | Error<string> {
 }
 ```
 
-For an operand of type `S | Error<E>`, `?` evaluates the operand once. If it is
-an `S`, the expression produces that value with type `S`. If it is an
-`Error<E>`, the current function returns that error immediately. The enclosing
-function's declared return type must accept the propagated `Error<E>`, including
-through the built-in payload-widening conversion. `S` may itself be a union of
-several non-error types.
+For an operand of type `S | Error<E>`, the Try operator evaluates the operand
+once. If it is an `S`, the expression produces that value with type `S`. If it
+is an `Error<E>`, the current function returns that error immediately. The
+enclosing function's declared return type must accept the propagated `Error<E>`,
+including through the built-in payload-widening conversion. `S` may itself be a
+union of several non-error types.
 
 Error payloads can use ordinary SAO types and unions:
 

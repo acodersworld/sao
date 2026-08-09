@@ -200,7 +200,7 @@ define_token_kinds! {
     #[token(".")] Dot,
     // Introduces a function's return type.
     #[token("->")] Arrow,
-    // Propagates an Error value from the current function.
+    // Spells the postfix Try operator that propagates an Error value.
     #[token("?")] Question,
 
     // Assigns a value to a mutable destination.

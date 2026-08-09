@@ -17,7 +17,7 @@ Deferred actions execute:
 - When their lexical block completes normally.
 - Before a `return` exits their scope.
 - Before `break` or `continue` exits their scope.
-- Before `?` propagation exits their scope.
+- Before the Try operator (`?`) exits their scope through error propagation.
 
 `defer` is permitted in the statement list of every executable lexical block.
 It belongs to the innermost block containing the statement and is registered
@@ -40,7 +40,7 @@ value = "second";
 Before an early transfer, any associated value expression is evaluated first,
 then the deferred actions for each exited scope run from innermost to outermost,
 and then the transfer occurs. This applies to `return expression`,
-`break expression`, and error propagation with `?`.
+`break expression`, and error propagation by the Try operator (`?`).
 
 Error propagation is an ordinary early return and performs lexical cleanup.
 Panics terminate without unwinding, so deferred actions do not run after a
