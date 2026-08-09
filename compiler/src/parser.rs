@@ -1,8 +1,8 @@
 use std::iter::Peekable;
 
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, BindingMutability, Expression, ExpressionKind, LiteralKind,
-    PrimitiveType, Statement, StatementKind, TypeKind, TypeSyntax, UnaryOperator,
+    AssignmentOperator, BinaryOperator, BindingMutability, Block, Expression, ExpressionKind,
+    LiteralKind, PrimitiveType, Statement, StatementKind, TypeKind, TypeSyntax, UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -535,6 +535,7 @@ where
                 ))
             }
             TokenKind::LeftParen => self.group(),
+            TokenKind::LeftBrace => self.block(),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
             TokenKind::IntegerLiteral => self.literal(LiteralKind::Integer),
@@ -569,6 +570,61 @@ where
         Ok(Expression::new(
             ExpressionKind::Group(Box::new(expression)),
             Span::new(left_parenthesis.span.start, right_parenthesis.span.end),
+        ))
+    }
+
+    fn block(&mut self) -> ParseResult {
+        let left_brace = self.expect(TokenKind::LeftBrace)?;
+        let mut statements = Vec::new();
+        let mut value = None;
+
+        let right_brace = loop {
+            let token = self.current()?;
+
+            match token.kind {
+                TokenKind::RightBrace => break self.advance()?,
+                TokenKind::Eof => break self.expect(TokenKind::RightBrace)?,
+                TokenKind::Const => {
+                    statements.push(self.binding_statement(BindingMutability::Const)?);
+                }
+                TokenKind::Mut => {
+                    statements.push(self.binding_statement(BindingMutability::Mut)?);
+                }
+                _ => {
+                    let expression = self.expression(LOWEST_BINDING_POWER)?;
+                    let following = self.current()?;
+
+                    match following.kind {
+                        TokenKind::Semicolon => {
+                            let semicolon = self.advance()?;
+                            let span = Span::new(expression.span.start, semicolon.span.end);
+                            statements
+                                .push(Statement::new(StatementKind::Expression(expression), span));
+                        }
+                        TokenKind::RightBrace => {
+                            value = Some(Box::new(expression));
+                            break self.advance()?;
+                        }
+                        TokenKind::Eof => break self.expect(TokenKind::RightBrace)?,
+                        _ => {
+                            return Err(ParseError {
+                                kind: ParseErrorKind::ExpectedToken {
+                                    expected: TokenKind::Semicolon,
+                                    found: following.kind,
+                                },
+                                span: following.span,
+                            }
+                            .into());
+                        }
+                    }
+                }
+            }
+        };
+
+        let span = Span::new(left_brace.span.start, right_brace.span.end);
+        Ok(Expression::new(
+            ExpressionKind::Block(Block::new(statements, value, span)),
+            span,
         ))
     }
 
@@ -1010,6 +1066,200 @@ mod tests {
                     found: TokenKind::Identifier,
                 },
                 span: Span::new(7, 13),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_empty_and_value_producing_blocks() {
+        let empty_span = Span::new(0, 2);
+        assert_eq!(
+            parse("{}"),
+            Ok(Expression::new(
+                ExpressionKind::Block(Block::new(Vec::new(), None, empty_span)),
+                empty_span,
+            ))
+        );
+
+        let value_span = Span::new(0, 6);
+        assert_eq!(
+            parse("{ 42 }"),
+            Ok(Expression::new(
+                ExpressionKind::Block(Block::new(
+                    Vec::new(),
+                    Some(Box::new(integer(Span::new(2, 4)))),
+                    value_span,
+                )),
+                value_span,
+            ))
+        );
+    }
+
+    #[test]
+    fn a_semicolon_discards_a_blocks_last_expression() {
+        let expression = parse("{ 42; }").expect("statement-ended block should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected a block expression");
+        };
+
+        assert_eq!(block.statements.len(), 1);
+        assert_eq!(
+            block.statements[0],
+            Statement::new(
+                StatementKind::Expression(integer(Span::new(2, 4))),
+                Span::new(2, 5),
+            )
+        );
+        assert_eq!(block.value, None);
+        assert_eq!(block.span, Span::new(0, 7));
+        assert_eq!(expression.span, block.span);
+    }
+
+    #[test]
+    fn parses_statements_followed_by_a_block_value() {
+        let source = "{ const x = 1; x += 2; x * 3 }";
+        let expression = parse(source).expect("mixed block should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected a block expression");
+        };
+
+        assert_eq!(block.statements.len(), 2);
+        assert_eq!(block.statements[0].span, Span::new(2, 14));
+        assert_eq!(block.statements[1].span, Span::new(15, 22));
+        assert!(matches!(
+            &block.statements[0].kind,
+            StatementKind::Binding {
+                mutability: BindingMutability::Const,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &block.statements[1].kind,
+            StatementKind::Expression(Expression {
+                kind: ExpressionKind::Assignment {
+                    operator: AssignmentOperator::Add,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            block.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::Binary {
+                    operator: BinaryOperator::Multiply,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(
+            block
+                .value
+                .as_ref()
+                .expect("block should have a value")
+                .span,
+            Span::new(23, 28),
+        );
+        assert_eq!(block.span, Span::new(0, source.len()));
+        assert_eq!(expression.span, block.span);
+    }
+
+    #[test]
+    fn blocks_nest_and_compose_with_postfix_and_infix_expressions() {
+        let expression = parse("{{ 1 }}").expect("nested block should parse");
+        let ExpressionKind::Block(outer) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert!(matches!(
+            outer.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::Block(_),
+                ..
+            })
+        ));
+
+        let expression = parse("{ service }().member").expect("postfix block should parse");
+        let ExpressionKind::MemberAccess { object, .. } = expression.kind else {
+            panic!("expected member access");
+        };
+        let ExpressionKind::Call { callee, .. } = object.kind else {
+            panic!("expected a call before member access");
+        };
+        assert!(matches!(callee.kind, ExpressionKind::Block(_)));
+
+        let expression = parse("1 + { 2 }").expect("infix block should parse");
+        let ExpressionKind::Binary { right, .. } = expression.kind else {
+            panic!("expected a binary expression");
+        };
+        assert!(matches!(right.kind, ExpressionKind::Block(_)));
+    }
+
+    #[test]
+    fn blocks_parse_as_binding_initializers() {
+        let statement = parse_statement_source("const result = { const value = 1; value };")
+            .expect("block initializer should parse");
+        let StatementKind::Binding { initializer, .. } = statement.kind else {
+            panic!("expected a binding statement");
+        };
+        let ExpressionKind::Block(block) = initializer.kind else {
+            panic!("expected a block initializer");
+        };
+
+        assert_eq!(block.statements.len(), 1);
+        assert!(block.value.is_some());
+    }
+
+    #[test]
+    fn reports_missing_block_separators_and_stray_semicolons() {
+        assert_eq!(
+            parse("{ first second }"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::Identifier,
+                },
+                span: Span::new(8, 14),
+            }))
+        );
+
+        assert_eq!(
+            parse("{ ; }"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Semicolon,
+                },
+                span: Span::new(2, 3),
+            }))
+        );
+    }
+
+    #[test]
+    fn reports_unclosed_blocks() {
+        for source in ["{", "{ 42", "{ 42;"] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::ExpectedToken {
+                        expected: TokenKind::RightBrace,
+                        found: TokenKind::Eof,
+                    },
+                    span: Span::new(source.len(), source.len()),
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn complete_expression_entry_point_rejects_input_after_a_block() {
+        assert_eq!(
+            parse("{} value"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::UnexpectedToken {
+                    found: TokenKind::Identifier,
+                },
+                span: Span::new(3, 8),
             }))
         );
     }

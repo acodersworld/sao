@@ -93,6 +93,16 @@ fn format_expression_into(
             line(output, depth, format_args!("Group {}", location(span)));
             child_expression(output, source, "expression", inner, depth);
         }
+        ExpressionKind::Block(block) => {
+            line(output, depth, format_args!("Block {}", location(span)));
+            statement_list(output, source, "statements", &block.statements, depth);
+            line(output, depth + 1, format_args!("value:"));
+            if let Some(value) = &block.value {
+                format_expression_into(output, source, value, depth + 2);
+            } else {
+                line(output, depth + 2, format_args!("(none)"));
+            }
+        }
         ExpressionKind::Call { callee, arguments } => {
             line(output, depth, format_args!("Call {}", location(span)));
             child_expression(output, source, "callee", callee, depth);
@@ -184,6 +194,26 @@ fn expression_list(
     for (index, expression) in expressions.iter().enumerate() {
         line(output, depth + 2, format_args!("[{index}]:"));
         format_expression_into(output, source, expression, depth + 3);
+    }
+}
+
+fn statement_list(
+    output: &mut String,
+    source: &str,
+    label: &str,
+    statements: &[Statement],
+    depth: usize,
+) {
+    line(output, depth + 1, format_args!("{label}:"));
+
+    if statements.is_empty() {
+        line(output, depth + 2, format_args!("(empty)"));
+        return;
+    }
+
+    for (index, statement) in statements.iter().enumerate() {
+        line(output, depth + 2, format_args!("[{index}]:"));
+        format_statement_into(output, source, statement, depth + 3);
     }
 }
 
@@ -329,6 +359,28 @@ mod tests {
         assert_eq!(
             format_statement(source, &statement),
             "ExpressionStatement @ 0..6\n  expression:\n    Call @ 0..5\n      callee:\n        Identifier \"run\" @ 0..3\n      arguments:\n        (empty)"
+        );
+    }
+
+    #[test]
+    fn formats_empty_blocks() {
+        let source = "{}";
+        let expression = parse_expression(Lexer::new(source)).expect("block should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "Block @ 0..2\n  statements:\n    (empty)\n  value:\n    (none)"
+        );
+    }
+
+    #[test]
+    fn formats_blocks_with_statements_and_a_value() {
+        let source = "{ const x = 1; x + 2 }";
+        let expression = parse_expression(Lexer::new(source)).expect("block should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "Block @ 0..22\n  statements:\n    [0]:\n      Binding Const \"x\" @ 2..14\n        initializer:\n          Literal Integer \"1\" @ 12..13\n  value:\n    Binary Add @ 15..20\n      left:\n        Identifier \"x\" @ 15..16\n      right:\n        Literal Integer \"2\" @ 19..20"
         );
     }
 }

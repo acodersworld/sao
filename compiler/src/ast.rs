@@ -42,6 +42,29 @@ impl Statement {
     }
 }
 
+/// A braced executable block containing statements and an optional final value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block {
+    pub statements: Vec<Statement>,
+    pub value: Option<Box<Expression>>,
+    pub span: Span,
+}
+
+impl Block {
+    #[must_use]
+    pub const fn new(
+        statements: Vec<Statement>,
+        value: Option<Box<Expression>>,
+        span: Span,
+    ) -> Self {
+        Self {
+            statements,
+            value,
+            span,
+        }
+    }
+}
+
 /// The syntax represented by a [`Statement`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementKind {
@@ -105,6 +128,7 @@ pub enum ExpressionKind {
     SelfValue,
     Literal(LiteralKind),
     Group(Box<Expression>),
+    Block(Block),
     Call {
         callee: Box<Expression>,
         arguments: Vec<Expression>,
