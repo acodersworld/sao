@@ -1,10 +1,19 @@
 use std::fmt::{Arguments, Write};
 
 use crate::ast::{
-    Block, ConditionalElse, Expression, ExpressionKind, Function, FunctionParameter,
-    FunctionParameterKind, Statement, StatementKind, TypeKind, TypeSyntax,
+    Block, ConditionalElse, Declaration, Expression, ExpressionKind, Function, FunctionParameter,
+    FunctionParameterKind, Program, Statement, StatementKind, TypeKind, TypeSyntax,
 };
 use crate::lexer::Span;
+
+/// Formats one complete program as an indented syntax tree.
+#[must_use]
+pub fn format_program(source: &str, program: &Program) -> String {
+    let mut output = String::new();
+    format_program_into(&mut output, source, program, 0);
+    output.truncate(output.len().saturating_sub(1));
+    output
+}
 
 /// Formats an expression as an indented syntax tree.
 #[must_use]
@@ -31,6 +40,36 @@ pub fn format_statement(source: &str, statement: &Statement) -> String {
     format_statement_into(&mut output, source, statement, 0);
     output.truncate(output.len().saturating_sub(1));
     output
+}
+
+fn format_program_into(output: &mut String, source: &str, program: &Program, depth: usize) {
+    line(
+        output,
+        depth,
+        format_args!("Program {}", location(program.span)),
+    );
+    line(output, depth + 1, format_args!("declarations:"));
+
+    if program.declarations.is_empty() {
+        line(output, depth + 2, format_args!("(empty)"));
+        return;
+    }
+
+    for (index, declaration) in program.declarations.iter().enumerate() {
+        line(output, depth + 2, format_args!("[{index}]:"));
+        format_declaration_into(output, source, declaration, depth + 3);
+    }
+}
+
+fn format_declaration_into(
+    output: &mut String,
+    source: &str,
+    declaration: &Declaration,
+    depth: usize,
+) {
+    match declaration {
+        Declaration::Function(function) => format_function_into(output, source, function, depth),
+    }
 }
 
 fn format_statement_into(output: &mut String, source: &str, statement: &Statement, depth: usize) {
@@ -531,7 +570,29 @@ fn location(span: Span) -> String {
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
-    use crate::parser::{parse_expression, parse_statement, parse_type};
+    use crate::parser::{parse_expression, parse_program, parse_statement, parse_type};
+
+    #[test]
+    fn formats_programs() {
+        let source = "fn first() {}\nfn second() {}";
+        let program = parse_program(Lexer::new(source)).expect("program should parse");
+        let output = format_program(source, &program);
+
+        assert!(output.starts_with("Program @ 0..28\n  declarations:"));
+        assert!(output.contains("[0]:\n      Function \"first\" @ 0..13"));
+        assert!(output.contains("[1]:\n      Function \"second\" @ 14..28"));
+    }
+
+    #[test]
+    fn formats_empty_programs() {
+        let source = "// no declarations";
+        let program = parse_program(Lexer::new(source)).expect("empty program should parse");
+
+        assert_eq!(
+            format_program(source, &program),
+            "Program @ 0..18\n  declarations:\n    (empty)"
+        );
+    }
 
     #[test]
     fn formats_expression_structure_and_source_text() {

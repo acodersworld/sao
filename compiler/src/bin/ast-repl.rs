@@ -141,6 +141,9 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedRangeOperator { found } => {
             format!("expected .. or ..= in for range, found {found:?}")
         }
+        ParseErrorKind::ExpectedTopLevelDeclaration { found } => {
+            format!("expected a top-level declaration, found {found:?}")
+        }
         ParseErrorKind::RangeBoundRequiresGrouping => {
             "complex range bounds must be parenthesized".to_owned()
         }
@@ -197,6 +200,19 @@ mod tests {
                 span: Span::new(0, 1),
             }),
             "expected .. or ..= in for range, found LeftBrace"
+        );
+    }
+
+    #[test]
+    fn describes_invalid_top_level_syntax() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedTopLevelDeclaration {
+                    found: sao_compiler::lexer::TokenKind::Const,
+                },
+                span: Span::new(0, 5),
+            }),
+            "expected a top-level declaration, found Const"
         );
     }
 

@@ -1,9 +1,10 @@
 use std::iter::Peekable;
 
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, BindingMutability, Block, ConditionalElse, Expression,
-    ExpressionKind, Function, FunctionParameter, FunctionParameterKind, LiteralKind, PrimitiveType,
-    RangeInclusivity, Statement, StatementKind, TypeKind, TypeSyntax, UnaryOperator,
+    AssignmentOperator, BinaryOperator, BindingMutability, Block, ConditionalElse, Declaration,
+    Expression, ExpressionKind, Function, FunctionParameter, FunctionParameterKind, LiteralKind,
+    PrimitiveType, Program, RangeInclusivity, Statement, StatementKind, TypeKind, TypeSyntax,
+    UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -19,6 +20,9 @@ pub enum ParseErrorKind {
         found: TokenKind,
     },
     ExpectedRangeOperator {
+        found: TokenKind,
+    },
+    ExpectedTopLevelDeclaration {
         found: TokenKind,
     },
     RangeBoundRequiresGrouping,
@@ -56,6 +60,17 @@ impl From<ParseError> for FrontendError {
 }
 
 pub type ParseResult<T = Expression> = Result<T, FrontendError>;
+
+/// Parses one complete source program.
+///
+/// The iterator may be the lexer itself and is expected to yield its explicit
+/// [`TokenKind::Eof`] token.
+pub fn parse_program<I>(tokens: I) -> ParseResult<Program>
+where
+    I: Iterator<Item = Result<Token, LexError>>,
+{
+    Parser::new(tokens).program()
+}
 
 /// Parses one complete expression token stream.
 ///
@@ -149,6 +164,31 @@ where
         }
     }
 
+    fn program(&mut self) -> ParseResult<Program> {
+        let mut declarations = Vec::new();
+
+        loop {
+            let token = self.current()?;
+            if token.kind == TokenKind::Eof {
+                return Ok(Program::new(declarations, Span::new(0, token.span.end)));
+            }
+
+            declarations.push(self.declaration()?);
+        }
+    }
+
+    fn declaration(&mut self) -> ParseResult<Declaration> {
+        let token = self.current()?;
+        match token.kind {
+            TokenKind::Fn => Ok(Declaration::Function(self.function()?)),
+            _ => Err(ParseError {
+                kind: ParseErrorKind::ExpectedTopLevelDeclaration { found: token.kind },
+                span: token.span,
+            }
+            .into()),
+        }
+    }
+
     fn statement(&mut self) -> ParseResult<Statement> {
         match self.current()?.kind {
             TokenKind::Fn => self.function_statement(),
@@ -162,15 +202,26 @@ where
     }
 
     fn function_statement(&mut self) -> ParseResult<Statement> {
+        let function = self.function()?;
+        let span = function.span;
+        Ok(Statement::new(StatementKind::Function(function), span))
+    }
+
+    fn function(&mut self) -> ParseResult<Function> {
         let keyword = self.expect(TokenKind::Fn)?;
         let name = self.expect(TokenKind::Identifier)?;
         let parameters = self.function_parameters(true)?;
         let return_type = self.optional_return_type()?;
         let body = self.block()?;
         let span = Span::new(keyword.span.start, body.span.end);
-        let function = Function::new(name.span, parameters, return_type, body, span);
 
-        Ok(Statement::new(StatementKind::Function(function), span))
+        Ok(Function::new(
+            name.span,
+            parameters,
+            return_type,
+            body,
+            span,
+        ))
     }
 
     fn function_parameters(&mut self, allow_receiver: bool) -> ParseResult<Vec<FunctionParameter>> {
@@ -1304,6 +1355,10 @@ mod tests {
     use super::*;
     use crate::lexer::{LexErrorKind, Lexer};
 
+    fn parse_program_source(source: &str) -> ParseResult<Program> {
+        parse_program(Lexer::new(source))
+    }
+
     fn parse(source: &str) -> ParseResult {
         parse_expression(Lexer::new(source))
     }
@@ -1318,6 +1373,67 @@ mod tests {
 
     fn integer(span: Span) -> Expression {
         Expression::new(ExpressionKind::Literal(LiteralKind::Integer), span)
+    }
+
+    #[test]
+    fn parses_empty_programs() {
+        let source = " \n// no declarations\n";
+        assert_eq!(
+            parse_program_source(source),
+            Ok(Program::new(Vec::new(), Span::new(0, source.len())))
+        );
+    }
+
+    #[test]
+    fn parses_multiple_top_level_function_declarations() {
+        let source = concat!(
+            "fn helper(value: int) -> int { value }\n",
+            "fn main() { helper(1); }",
+        );
+        let program = parse_program_source(source).expect("program should parse");
+
+        assert_eq!(program.span, Span::new(0, source.len()));
+        assert_eq!(program.declarations.len(), 2);
+        let Declaration::Function(helper) = &program.declarations[0];
+        let Declaration::Function(main) = &program.declarations[1];
+        assert_eq!(helper.name, Span::new(3, 9));
+        assert_eq!(main.name, Span::new(42, 46));
+        assert_eq!(helper.parameters.len(), 1);
+        assert_eq!(main.body.statements.len(), 1);
+    }
+
+    #[test]
+    fn rejects_non_declarations_at_top_level() {
+        for (source, found, span) in [
+            ("const value = 1;", TokenKind::Const, Span::new(0, 5)),
+            ("run();", TokenKind::Identifier, Span::new(0, 3)),
+            ("return;", TokenKind::Return, Span::new(0, 6)),
+            (
+                "fn first() {} 42",
+                TokenKind::IntegerLiteral,
+                Span::new(14, 16),
+            ),
+        ] {
+            assert_eq!(
+                parse_program_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::ExpectedTopLevelDeclaration { found },
+                    span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn whole_program_parser_propagates_lexical_errors() {
+        assert_eq!(
+            parse_program_source("fn main() {} @"),
+            Err(FrontendError::Lexical(LexError {
+                kind: LexErrorKind::UnexpectedCharacter,
+                span: Span::new(13, 14),
+            }))
+        );
     }
 
     #[test]

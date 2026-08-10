@@ -13,7 +13,9 @@ Last reviewed: 2026-08-10
 
 The parser currently supports:
 
-- Single-expression, single-type, and single-statement entry points.
+- Single-expression, single-type, single-statement, and whole-program entry
+  points.
+- File-level programs containing ordered top-level function declarations.
 - Primitive, named, parameterized, mutable, grouped, callable, union, and
   intersection type syntax.
 - Literals, identifiers, `self`, grouping, and expression-oriented blocks.
@@ -40,40 +42,35 @@ for index in (start + offset)..(if ready { limit } else { fallback }) {}
 
 Recommended implementation order:
 
-1. Whole-program parsing
-   - Add a `Program` or source-file AST node.
-   - Add an entry point that accepts multiple top-level declarations instead of
-     requiring EOF after one statement.
-
-2. Struct declarations and construction
+1. Struct declarations and construction
    - Parse named struct declarations, fields, and methods.
    - Parse named construction such as `Position { x: 1.0, y: 2.0 }`.
    - Parse unconstrained anonymous `struct { ... }` expressions.
 
-3. Interface declarations and anonymous implementations
+2. Interface declarations and anonymous implementations
    - Parse semicolon-terminated interface method requirements.
    - Parse interface-constrained anonymous objects such as `Writer { ... }`.
    - Define how brace-based construction is disambiguated in `if`, `while`, and
      `for` heads.
 
-4. `defer` statements
+3. `defer` statements
    - Add the AST and parser representation.
    - Enforce the call-only syntax `defer function_call();`.
 
-5. `co` coroutine calls
+4. `co` coroutine calls
    - Add the AST and parser representation.
    - Restrict the operand to a function or method call.
 
-6. Parameterized built-in construction
+5. Parameterized built-in construction
    - Support expression syntax such as `Queue<int>()` while retaining existing
      parameterized type parsing.
 
-7. Slicing syntax
+6. Slicing syntax
    - First settle the source syntax in the design documents.
    - The lexer and parser currently reserve `..` and `..=` for range `for`
      headers, although byte slicing semantics are mentioned in the design.
 
-8. Program-level syntax recovery
+7. Program-level syntax recovery
    - After whole-program parsing exists, synchronize after malformed declarations
      so one parse can report multiple useful syntax errors.
 
@@ -83,6 +80,7 @@ The following require semantic analysis or later compiler phases rather than
 additional parsing:
 
 - Name and scope resolution.
+- Entry-point validation, including the required unique `main` signature.
 - Type checking and inference.
 - Primitive conversion validation, including defining the accepted inputs and
   result of `bool(value)`.

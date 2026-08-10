@@ -1,5 +1,25 @@
 use crate::lexer::Span;
 
+/// One complete source program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Program {
+    pub declarations: Vec<Declaration>,
+    pub span: Span,
+}
+
+impl Program {
+    #[must_use]
+    pub const fn new(declarations: Vec<Declaration>, span: Span) -> Self {
+        Self { declarations, span }
+    }
+}
+
+/// A declaration in a program's file-level namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declaration {
+    Function(Function),
+}
+
 /// An expression in the source-level syntax tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expression {
