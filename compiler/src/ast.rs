@@ -241,6 +241,10 @@ pub enum ExpressionKind {
         return_type: Option<TypeSyntax>,
         body: Block,
     },
+    PrimitiveConversion {
+        target: PrimitiveType,
+        value: Box<Expression>,
+    },
     Call {
         callee: Box<Expression>,
         arguments: Vec<Expression>,

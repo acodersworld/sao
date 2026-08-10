@@ -724,6 +724,11 @@ where
             TokenKind::While => self.while_expression(),
             TokenKind::For => self.range_for_expression(),
             TokenKind::Lambda => self.lambda_expression(),
+            TokenKind::Int => self.primitive_conversion(PrimitiveType::Int),
+            TokenKind::Float => self.primitive_conversion(PrimitiveType::Float),
+            TokenKind::Bool => self.primitive_conversion(PrimitiveType::Bool),
+            TokenKind::Char => self.primitive_conversion(PrimitiveType::Char),
+            TokenKind::String => self.primitive_conversion(PrimitiveType::String),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
             TokenKind::IntegerLiteral => self.literal(LiteralKind::Integer),
@@ -755,6 +760,21 @@ where
                 body,
             },
             span,
+        ))
+    }
+
+    fn primitive_conversion(&mut self, target: PrimitiveType) -> ParseResult {
+        let keyword = self.advance()?;
+        self.expect(TokenKind::LeftParen)?;
+        let value = self.expression(LOWEST_BINDING_POWER)?;
+        let right_parenthesis = self.expect(TokenKind::RightParen)?;
+
+        Ok(Expression::new(
+            ExpressionKind::PrimitiveConversion {
+                target,
+                value: Box::new(value),
+            },
+            Span::new(keyword.span.start, right_parenthesis.span.end),
         ))
     }
 
@@ -1082,6 +1102,7 @@ fn range_bound_is_simple(expression: &Expression) -> bool {
             range_bound_is_simple(object)
         }
         ExpressionKind::Try { expression } => range_bound_is_simple(expression),
+        ExpressionKind::PrimitiveConversion { .. } => true,
         ExpressionKind::Unary {
             operator: UnaryOperator::Negate,
             operand,
@@ -3156,6 +3177,163 @@ mod tests {
         ] {
             assert!(parse(source).is_ok(), "failed to parse {source}");
         }
+    }
+
+    #[test]
+    fn parses_primitive_conversions() {
+        for (source, expected_target) in [
+            ("int(value)", PrimitiveType::Int),
+            ("float(value)", PrimitiveType::Float),
+            ("bool(value)", PrimitiveType::Bool),
+            ("char(value)", PrimitiveType::Char),
+            ("string(value)", PrimitiveType::String),
+        ] {
+            let expression = parse(source).expect("primitive conversion should parse");
+            let ExpressionKind::PrimitiveConversion { target, value } = expression.kind else {
+                panic!("expected a primitive conversion for {source}");
+            };
+            let value_start = source.find("value").expect("source contains value");
+
+            assert_eq!(target, expected_target);
+            assert_eq!(expression.span, Span::new(0, source.len()));
+            assert_eq!(value.span, Span::new(value_start, value_start + 5));
+            assert!(matches!(value.kind, ExpressionKind::Identifier));
+        }
+    }
+
+    #[test]
+    fn primitive_conversions_accept_full_and_nested_expressions() {
+        let expression = parse("int(value + 1)").expect("full conversion argument should parse");
+        let ExpressionKind::PrimitiveConversion {
+            target: PrimitiveType::Int,
+            value,
+        } = expression.kind
+        else {
+            panic!("expected an int conversion");
+        };
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+
+        let expression = parse("string(int(value))").expect("nested conversion should parse");
+        let ExpressionKind::PrimitiveConversion {
+            target: PrimitiveType::String,
+            value,
+        } = expression.kind
+        else {
+            panic!("expected a string conversion");
+        };
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::PrimitiveConversion {
+                target: PrimitiveType::Int,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn primitive_conversions_compose_with_other_expressions() {
+        let expression = parse("float(count).member + ratio").expect("conversion should compose");
+        let ExpressionKind::Binary {
+            operator: BinaryOperator::Add,
+            left,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected addition at the root");
+        };
+        let ExpressionKind::MemberAccess { object, .. } = left.kind else {
+            panic!("expected member access on the conversion");
+        };
+        assert!(matches!(
+            object.kind,
+            ExpressionKind::PrimitiveConversion {
+                target: PrimitiveType::Float,
+                ..
+            }
+        ));
+
+        let expression =
+            parse("for i in 0..int(limit) {}").expect("conversion should be a simple range bound");
+        let ExpressionKind::RangeFor { end, .. } = expression.kind else {
+            panic!("expected a range loop");
+        };
+        assert!(matches!(
+            end.kind,
+            ExpressionKind::PrimitiveConversion {
+                target: PrimitiveType::Int,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reports_malformed_primitive_conversions() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "int",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftParen,
+                    found: TokenKind::Eof,
+                },
+                Span::new(3, 3),
+            ),
+            (
+                "float()",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::RightParen,
+                },
+                Span::new(6, 7),
+            ),
+            (
+                "bool(first, second)",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightParen,
+                    found: TokenKind::Comma,
+                },
+                Span::new(10, 11),
+            ),
+            (
+                "char(value,)",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightParen,
+                    found: TokenKind::Comma,
+                },
+                Span::new(10, 11),
+            ),
+            (
+                "string(value",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightParen,
+                    found: TokenKind::Eof,
+                },
+                Span::new(12, 12),
+            ),
+            (
+                "bytes(value)",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Bytes,
+                },
+                Span::new(0, 5),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+
+        let expression = parse("none(value)").expect("none call remains ordinary call syntax");
+        assert!(matches!(expression.kind, ExpressionKind::Call { .. }));
     }
 
     #[test]

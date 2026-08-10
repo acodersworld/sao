@@ -19,6 +19,8 @@ The parser currently supports:
 - Literals, identifiers, `self`, grouping, and expression-oriented blocks.
 - Prefix, binary, assignment, type-test, and postfix operators.
 - Calls, member access, indexing, and postfix error propagation with `?`.
+- Dedicated `int`, `float`, `bool`, `char`, and `string` conversion expressions
+  with exactly one argument.
 - Immutable and mutable bindings.
 - Named and nested functions, method receivers, returns, and lambdas.
 - `if`/`else if`/`else`, `loop`, `while`, and integer range `for` expressions.
@@ -38,44 +40,40 @@ for index in (start + offset)..(if ready { limit } else { fallback }) {}
 
 Recommended implementation order:
 
-1. Primitive conversion calls
-   - Accept reserved primitive names as conversion callees, including
-     `int(value)`, `float(value)`, `char(value)`, and `string(value)`.
-
-2. Whole-program parsing
+1. Whole-program parsing
    - Add a `Program` or source-file AST node.
    - Add an entry point that accepts multiple top-level declarations instead of
      requiring EOF after one statement.
 
-3. Struct declarations and construction
+2. Struct declarations and construction
    - Parse named struct declarations, fields, and methods.
    - Parse named construction such as `Position { x: 1.0, y: 2.0 }`.
    - Parse unconstrained anonymous `struct { ... }` expressions.
 
-4. Interface declarations and anonymous implementations
+3. Interface declarations and anonymous implementations
    - Parse semicolon-terminated interface method requirements.
    - Parse interface-constrained anonymous objects such as `Writer { ... }`.
    - Define how brace-based construction is disambiguated in `if`, `while`, and
      `for` heads.
 
-5. `defer` statements
+4. `defer` statements
    - Add the AST and parser representation.
    - Enforce the call-only syntax `defer function_call();`.
 
-6. `co` coroutine calls
+5. `co` coroutine calls
    - Add the AST and parser representation.
    - Restrict the operand to a function or method call.
 
-7. Parameterized built-in construction
+6. Parameterized built-in construction
    - Support expression syntax such as `Queue<int>()` while retaining existing
      parameterized type parsing.
 
-8. Slicing syntax
+7. Slicing syntax
    - First settle the source syntax in the design documents.
    - The lexer and parser currently reserve `..` and `..=` for range `for`
      headers, although byte slicing semantics are mentioned in the design.
 
-9. Program-level syntax recovery
+8. Program-level syntax recovery
    - After whole-program parsing exists, synchronize after malformed declarations
      so one parse can report multiple useful syntax errors.
 
@@ -86,7 +84,8 @@ additional parsing:
 
 - Name and scope resolution.
 - Type checking and inference.
-- Primitive conversion validation.
+- Primitive conversion validation, including defining the accepted inputs and
+  result of `bool(value)`.
 - Assignment-target and mutability validation.
 - Validating `self`, `return`, `break`, and `continue` placement.
 - Range-bound types and immutable induction bindings.

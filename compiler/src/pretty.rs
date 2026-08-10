@@ -271,6 +271,14 @@ fn format_expression_into(
             optional_return_type(output, source, return_type.as_ref(), depth);
             child_block(output, source, "body", body, depth);
         }
+        ExpressionKind::PrimitiveConversion { target, value } => {
+            line(
+                output,
+                depth,
+                format_args!("PrimitiveConversion {target:?} {}", location(span)),
+            );
+            child_expression(output, source, "value", value, depth);
+        }
         ExpressionKind::Call { callee, arguments } => {
             line(output, depth, format_args!("Call {}", location(span)));
             child_expression(output, source, "callee", callee, depth);
@@ -533,6 +541,17 @@ mod tests {
         assert_eq!(
             format_expression(source, &expression),
             "Binary Add @ 0..9\n  left:\n    Literal Integer \"1\" @ 0..1\n  right:\n    Identifier \"value\" @ 4..9"
+        );
+    }
+
+    #[test]
+    fn formats_primitive_conversions() {
+        let source = "string(value + 1)";
+        let expression = parse_expression(Lexer::new(source)).expect("conversion should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "PrimitiveConversion String @ 0..17\n  value:\n    Binary Add @ 7..16\n      left:\n        Identifier \"value\" @ 7..12\n      right:\n        Literal Integer \"1\" @ 15..16"
         );
     }
 
