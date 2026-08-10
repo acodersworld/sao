@@ -48,11 +48,12 @@ Every runnable program declares exactly one top-level entry function with this
 signature:
 
 ```text
-fn main() -> () {
+fn main() {
     // Program body.
 }
 ```
 
-`main` takes no arguments and must return `()`. Normal completion returns process
-status zero; a panic returns a nonzero status. A missing entry function or a
-different `main` signature is a compile-time error.
+`main` takes no arguments and must return `()`. The omitted return annotation
+defaults to `()`; spelling it explicitly as `fn main() -> ()` is equivalent.
+Normal completion returns process status zero; a panic returns a nonzero status.
+A missing entry function or a different `main` signature is a compile-time error.

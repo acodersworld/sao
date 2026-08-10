@@ -65,6 +65,70 @@ impl Block {
     }
 }
 
+/// A named function declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Function {
+    pub name: Span,
+    pub parameters: Vec<FunctionParameter>,
+    /// An explicit return annotation. Its absence defaults to unit.
+    pub return_type: Option<TypeSyntax>,
+    pub body: Block,
+    pub span: Span,
+}
+
+impl Function {
+    #[must_use]
+    pub const fn new(
+        name: Span,
+        parameters: Vec<FunctionParameter>,
+        return_type: Option<TypeSyntax>,
+        body: Block,
+        span: Span,
+    ) -> Self {
+        Self {
+            name,
+            parameters,
+            return_type,
+            body,
+            span,
+        }
+    }
+}
+
+/// A parameter in a named function declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionParameter {
+    pub mutability: BindingMutability,
+    pub kind: FunctionParameterKind,
+    pub span: Span,
+}
+
+impl FunctionParameter {
+    #[must_use]
+    pub const fn new(
+        mutability: BindingMutability,
+        kind: FunctionParameterKind,
+        span: Span,
+    ) -> Self {
+        Self {
+            mutability,
+            kind,
+            span,
+        }
+    }
+}
+
+/// The syntactic form of a named-function parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionParameterKind {
+    Named {
+        name: Span,
+        type_annotation: TypeSyntax,
+    },
+    /// A method receiver written as `self` or `mut self`.
+    Receiver { name: Span },
+}
+
 /// The syntax accepted after an `else` keyword.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConditionalElse {
@@ -84,11 +148,13 @@ pub enum StatementKind {
         initializer: Expression,
     },
     Expression(Expression),
+    Function(Function),
     Break(Option<Expression>),
     Continue,
+    Return(Option<Expression>),
 }
 
-/// Whether a local binding was introduced with `const` or `mut`.
+/// Whether a binding or parameter has const/default or mutable access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingMutability {
     Const,

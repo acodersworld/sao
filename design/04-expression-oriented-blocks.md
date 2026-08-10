@@ -20,7 +20,7 @@ A semicolon discards the expression's value:
 ```
 
 Function bodies use the same rule. The final expression must be compatible with
-the explicitly declared return type:
+the explicitly declared return type, or with `()` when the annotation is omitted:
 
 ```text
 fn absolute(value: int) -> int {

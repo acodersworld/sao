@@ -33,7 +33,8 @@ Anonymous interface object rules:
   inferred unambiguously.
 - Hidden field types may be inferred or explicitly annotated.
 - All required interface methods must be present.
-- Method return types remain explicit.
+- Non-unit method return types remain explicit; an omitted annotation defaults
+  to `()`.
 - Hidden fields are not accessible through the interface value.
 - Extra implementation methods are not visible through the interface value.
 - The source program cannot name the compiler-generated backing type.

@@ -321,8 +321,9 @@ Current inference boundary:
 - Inference never synthesizes a union merely because different paths produce
   different types.
 - Named function parameter types are explicit.
-- Every named function has an explicit return type.
-- Function return types are never inferred.
+- A named function may omit its return annotation, which defaults to `()`.
+- A named function returning any other type must annotate it explicitly;
+  return types are never inferred from the body.
 - Lambda parameter and return types are explicit in the lambda expression;
   contextual lambda signature inference is deferred.
 - User-defined generic declarations and general-purpose generic inference are

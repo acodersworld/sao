@@ -2,8 +2,8 @@ use std::iter::Peekable;
 
 use crate::ast::{
     AssignmentOperator, BinaryOperator, BindingMutability, Block, ConditionalElse, Expression,
-    ExpressionKind, LiteralKind, PrimitiveType, Statement, StatementKind, TypeKind, TypeSyntax,
-    UnaryOperator,
+    ExpressionKind, Function, FunctionParameter, FunctionParameterKind, LiteralKind, PrimitiveType,
+    Statement, StatementKind, TypeKind, TypeSyntax, UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -147,12 +147,86 @@ where
 
     fn statement(&mut self) -> ParseResult<Statement> {
         match self.current()?.kind {
+            TokenKind::Fn => self.function_statement(),
             TokenKind::Const => self.binding_statement(BindingMutability::Const),
             TokenKind::Mut => self.binding_statement(BindingMutability::Mut),
             TokenKind::Break => self.break_statement(),
             TokenKind::Continue => self.continue_statement(),
+            TokenKind::Return => self.return_statement(),
             _ => self.expression_statement(),
         }
+    }
+
+    fn function_statement(&mut self) -> ParseResult<Statement> {
+        let keyword = self.expect(TokenKind::Fn)?;
+        let name = self.expect(TokenKind::Identifier)?;
+        self.expect(TokenKind::LeftParen)?;
+        let mut parameters = Vec::new();
+
+        if self.current()?.kind != TokenKind::RightParen {
+            loop {
+                parameters.push(self.function_parameter()?);
+
+                if self.current()?.kind != TokenKind::Comma {
+                    break;
+                }
+
+                self.advance()?;
+
+                if self.current()?.kind == TokenKind::RightParen {
+                    break;
+                }
+            }
+        }
+
+        self.expect(TokenKind::RightParen)?;
+        let return_type = if self.current()?.kind == TokenKind::Arrow {
+            self.advance()?;
+            Some(self.type_expression()?)
+        } else {
+            None
+        };
+        let body = self.block()?;
+        let span = Span::new(keyword.span.start, body.span.end);
+        let function = Function::new(name.span, parameters, return_type, body, span);
+
+        Ok(Statement::new(StatementKind::Function(function), span))
+    }
+
+    fn function_parameter(&mut self) -> ParseResult<FunctionParameter> {
+        let first = self.current()?;
+        let (mutability, start) = if first.kind == TokenKind::Mut {
+            self.advance()?;
+            (BindingMutability::Mut, first.span.start)
+        } else {
+            (BindingMutability::Const, first.span.start)
+        };
+        let parameter = self.current()?;
+
+        if parameter.kind == TokenKind::SelfValue {
+            let receiver = self.advance()?;
+            return Ok(FunctionParameter::new(
+                mutability,
+                FunctionParameterKind::Receiver {
+                    name: receiver.span,
+                },
+                Span::new(start, receiver.span.end),
+            ));
+        }
+
+        let name = self.expect(TokenKind::Identifier)?;
+        self.expect(TokenKind::Colon)?;
+        let type_annotation = self.type_expression()?;
+        let span = Span::new(start, type_annotation.span.end);
+
+        Ok(FunctionParameter::new(
+            mutability,
+            FunctionParameterKind::Named {
+                name: name.span,
+                type_annotation,
+            },
+            span,
+        ))
     }
 
     fn binding_statement(&mut self, mutability: BindingMutability) -> ParseResult<Statement> {
@@ -226,6 +300,31 @@ where
         let semicolon = self.expect(TokenKind::Semicolon)?;
         Ok(Statement::new(
             StatementKind::Continue,
+            Span::new(keyword.span.start, semicolon.span.end),
+        ))
+    }
+
+    fn return_statement(&mut self) -> ParseResult<Statement> {
+        let keyword = self.expect(TokenKind::Return)?;
+        let token = self.current()?;
+        let value = match token.kind {
+            TokenKind::Semicolon => None,
+            TokenKind::Eof | TokenKind::RightBrace => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::ExpectedToken {
+                        expected: TokenKind::Semicolon,
+                        found: token.kind,
+                    },
+                    span: token.span,
+                }
+                .into());
+            }
+            _ => Some(self.expression(LOWEST_BINDING_POWER)?),
+        };
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+
+        Ok(Statement::new(
+            StatementKind::Return(value),
             Span::new(keyword.span.start, semicolon.span.end),
         ))
     }
@@ -642,6 +741,9 @@ where
             match token.kind {
                 TokenKind::RightBrace => break self.advance()?,
                 TokenKind::Eof => break self.expect(TokenKind::RightBrace)?,
+                TokenKind::Fn => {
+                    statements.push(self.function_statement()?);
+                }
                 TokenKind::Const => {
                     statements.push(self.binding_statement(BindingMutability::Const)?);
                 }
@@ -653,6 +755,9 @@ where
                 }
                 TokenKind::Continue => {
                     statements.push(self.continue_statement()?);
+                }
+                TokenKind::Return => {
+                    statements.push(self.return_statement()?);
                 }
                 _ => {
                     let expression = self.expression(LOWEST_BINDING_POWER)?;
@@ -1035,6 +1140,253 @@ mod tests {
 
     fn integer(span: Span) -> Expression {
         Expression::new(ExpressionKind::Literal(LiteralKind::Integer), span)
+    }
+
+    #[test]
+    fn parses_empty_main_function_declarations() {
+        let statement = parse_statement_source("fn main() {}").expect("main function should parse");
+        let StatementKind::Function(function) = statement.kind else {
+            panic!("expected a function declaration");
+        };
+
+        assert_eq!(statement.span, Span::new(0, 12));
+        assert_eq!(function.name, Span::new(3, 7));
+        assert!(function.parameters.is_empty());
+        assert_eq!(function.return_type, None);
+        assert_eq!(
+            function.body,
+            Block::new(Vec::new(), None, Span::new(10, 12))
+        );
+    }
+
+    #[test]
+    fn parses_named_functions_with_typed_parameters() {
+        let source = "fn add(left: int, mut right: int,) -> int { left + right }";
+        let statement = parse_statement_source(source).expect("function should parse");
+        let StatementKind::Function(function) = statement.kind else {
+            panic!("expected a function declaration");
+        };
+
+        assert_eq!(statement.span, Span::new(0, 58));
+        assert_eq!(function.span, statement.span);
+        assert_eq!(function.name, Span::new(3, 6));
+        assert_eq!(function.parameters.len(), 2);
+        assert_eq!(function.parameters[0].span, Span::new(7, 16));
+        assert_eq!(function.parameters[0].mutability, BindingMutability::Const);
+        assert!(matches!(
+            &function.parameters[0].kind,
+            FunctionParameterKind::Named {
+                name: Span { start: 7, end: 11 },
+                type_annotation: TypeSyntax {
+                    kind: TypeKind::Primitive(PrimitiveType::Int),
+                    span: Span { start: 13, end: 16 },
+                },
+            }
+        ));
+        assert_eq!(function.parameters[1].span, Span::new(18, 32));
+        assert_eq!(function.parameters[1].mutability, BindingMutability::Mut);
+        assert!(matches!(
+            &function.return_type,
+            Some(TypeSyntax {
+                kind: TypeKind::Primitive(PrimitiveType::Int),
+                span: Span { start: 38, end: 41 },
+            })
+        ));
+        assert_eq!(function.body.span, Span::new(42, 58));
+        assert!(function.body.statements.is_empty());
+        assert!(matches!(
+            function.body.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::Binary {
+                    operator: BinaryOperator::Add,
+                    ..
+                },
+                span: Span { start: 44, end: 56 },
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_method_receivers_and_bare_returns() {
+        let source = "fn rename(mut self, name: string) -> () { return; }";
+        let statement =
+            parse_statement_source(source).expect("method-shaped function should parse");
+        let StatementKind::Function(function) = statement.kind else {
+            panic!("expected a function declaration");
+        };
+
+        assert_eq!(function.parameters.len(), 2);
+        assert_eq!(function.parameters[0].span, Span::new(10, 18));
+        assert_eq!(function.parameters[0].mutability, BindingMutability::Mut);
+        assert!(matches!(
+            &function.parameters[0].kind,
+            FunctionParameterKind::Receiver {
+                name: Span { start: 14, end: 18 }
+            }
+        ));
+        assert_eq!(
+            function
+                .return_type
+                .as_ref()
+                .expect("return type should be explicit")
+                .span,
+            Span::new(37, 39)
+        );
+        assert_eq!(function.body.statements.len(), 1);
+        assert_eq!(
+            function.body.statements[0],
+            Statement::new(StatementKind::Return(None), Span::new(42, 49))
+        );
+        assert!(function.body.value.is_none());
+    }
+
+    #[test]
+    fn parses_value_bearing_return_statements() {
+        assert_eq!(
+            parse_statement_source("return;"),
+            Ok(Statement::new(StatementKind::Return(None), Span::new(0, 7),))
+        );
+
+        let statement =
+            parse_statement_source("return value + 1;").expect("value return should parse");
+        assert_eq!(statement.span, Span::new(0, 17));
+        let StatementKind::Return(Some(value)) = statement.kind else {
+            panic!("expected a value-bearing return");
+        };
+        assert_eq!(value.span, Span::new(7, 16));
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_nested_function_declarations() {
+        let source = "{ fn double(input: int) -> int { input * 2 } double(value) }";
+        let expression = parse(source).expect("nested function should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected a block expression");
+        };
+
+        assert_eq!(block.statements.len(), 1);
+        assert_eq!(block.statements[0].span, Span::new(2, 44));
+        assert!(matches!(
+            &block.statements[0].kind,
+            StatementKind::Function(Function {
+                name: Span { start: 5, end: 11 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            block.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::Call { .. },
+                span: Span { start: 45, end: 58 },
+            })
+        ));
+    }
+
+    #[test]
+    fn reports_malformed_function_declarations() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "fn",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Eof,
+                },
+                Span::new(2, 2),
+            ),
+            (
+                "fn name",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftParen,
+                    found: TokenKind::Eof,
+                },
+                Span::new(7, 7),
+            ),
+            (
+                "fn f(value) -> () {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Colon,
+                    found: TokenKind::RightParen,
+                },
+                Span::new(10, 11),
+            ),
+            (
+                "fn f(value:) -> () {}",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::RightParen,
+                },
+                Span::new(11, 12),
+            ),
+            (
+                "fn f() () {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::LeftParen,
+                },
+                Span::new(7, 8),
+            ),
+            (
+                "fn f() -> {}",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::LeftBrace,
+                },
+                Span::new(10, 11),
+            ),
+            (
+                "fn f() -> ()",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(12, 12),
+            ),
+        ] {
+            assert_eq!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn return_statements_require_semicolons() {
+        for (source, found, span) in [
+            ("return", TokenKind::Eof, Span::new(6, 6)),
+            ("return value", TokenKind::Eof, Span::new(12, 12)),
+        ] {
+            assert_eq!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::ExpectedToken {
+                        expected: TokenKind::Semicolon,
+                        found,
+                    },
+                    span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+
+        assert_eq!(
+            parse("{ return }"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::RightBrace,
+                },
+                span: Span::new(9, 10),
+            }))
+        );
     }
 
     fn binary(

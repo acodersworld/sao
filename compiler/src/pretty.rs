@@ -1,8 +1,8 @@
 use std::fmt::{Arguments, Write};
 
 use crate::ast::{
-    Block, ConditionalElse, Expression, ExpressionKind, Statement, StatementKind, TypeKind,
-    TypeSyntax,
+    Block, ConditionalElse, Expression, ExpressionKind, Function, FunctionParameter,
+    FunctionParameterKind, Statement, StatementKind, TypeKind, TypeSyntax,
 };
 use crate::lexer::Span;
 
@@ -65,12 +65,95 @@ fn format_statement_into(output: &mut String, source: &str, statement: &Statemen
             );
             child_expression(output, source, "expression", expression, depth);
         }
+        StatementKind::Function(function) => {
+            format_function_into(output, source, function, depth);
+        }
         StatementKind::Break(value) => {
             line(output, depth, format_args!("Break {}", location(span)));
             optional_expression(output, source, "value", value.as_ref(), depth);
         }
         StatementKind::Continue => {
             line(output, depth, format_args!("Continue {}", location(span)));
+        }
+        StatementKind::Return(value) => {
+            line(output, depth, format_args!("Return {}", location(span)));
+            optional_expression(output, source, "value", value.as_ref(), depth);
+        }
+    }
+}
+
+fn format_function_into(output: &mut String, source: &str, function: &Function, depth: usize) {
+    line(
+        output,
+        depth,
+        format_args!(
+            "Function {:?} {}",
+            text(source, function.name),
+            location(function.span)
+        ),
+    );
+    function_parameter_list(output, source, &function.parameters, depth);
+    line(output, depth + 1, format_args!("return_type:"));
+    if let Some(return_type) = &function.return_type {
+        format_type_into(output, source, return_type, depth + 2);
+    } else {
+        line(output, depth + 2, format_args!("(default ())"));
+    }
+    child_block(output, source, "body", &function.body, depth);
+}
+
+fn function_parameter_list(
+    output: &mut String,
+    source: &str,
+    parameters: &[FunctionParameter],
+    depth: usize,
+) {
+    line(output, depth + 1, format_args!("parameters:"));
+
+    if parameters.is_empty() {
+        line(output, depth + 2, format_args!("(empty)"));
+        return;
+    }
+
+    for (index, parameter) in parameters.iter().enumerate() {
+        line(output, depth + 2, format_args!("[{index}]:"));
+        format_function_parameter_into(output, source, parameter, depth + 3);
+    }
+}
+
+fn format_function_parameter_into(
+    output: &mut String,
+    source: &str,
+    parameter: &FunctionParameter,
+    depth: usize,
+) {
+    match &parameter.kind {
+        FunctionParameterKind::Named {
+            name,
+            type_annotation,
+        } => {
+            line(
+                output,
+                depth,
+                format_args!(
+                    "Parameter {:?} {:?} {}",
+                    parameter.mutability,
+                    text(source, *name),
+                    location(parameter.span)
+                ),
+            );
+            child_type(output, source, "type", type_annotation, depth);
+        }
+        FunctionParameterKind::Receiver { .. } => {
+            line(
+                output,
+                depth,
+                format_args!(
+                    "Parameter {:?} Self {}",
+                    parameter.mutability,
+                    location(parameter.span)
+                ),
+            );
         }
     }
 }
@@ -525,5 +608,27 @@ mod tests {
             format_expression(source, &expression),
             "While @ 0..25\n  condition:\n    Identifier \"ready\" @ 6..11\n  body:\n    Block @ 12..14\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    Block @ 20..25\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 22..23"
         );
+    }
+
+    #[test]
+    fn formats_named_functions_and_return_statements() {
+        let source = "fn add(left: int, mut right: int) -> int { return left + right; }";
+        let statement = parse_statement(Lexer::new(source)).expect("function should parse");
+
+        assert_eq!(
+            format_statement(source, &statement),
+            "Function \"add\" @ 0..65\n  parameters:\n    [0]:\n      Parameter Const \"left\" @ 7..16\n        type:\n          Primitive Int @ 13..16\n    [1]:\n      Parameter Mut \"right\" @ 18..32\n        type:\n          Primitive Int @ 29..32\n  return_type:\n    Primitive Int @ 37..40\n  body:\n    Block @ 41..65\n      statements:\n        [0]:\n          Return @ 43..63\n            value:\n              Binary Add @ 50..62\n                left:\n                  Identifier \"left\" @ 50..54\n                right:\n                  Identifier \"right\" @ 57..62\n      value:\n        (none)"
+        );
+    }
+
+    #[test]
+    fn formats_receivers_and_bare_returns() {
+        let source = "fn stop(mut self) { return; }";
+        let statement = parse_statement(Lexer::new(source)).expect("function should parse");
+        let output = format_statement(source, &statement);
+
+        assert!(output.contains("Parameter Mut Self @ 8..16"));
+        assert!(output.contains("return_type:\n    (default ())"));
+        assert!(output.contains("Return @ 20..27\n            value:\n              (none)"));
     }
 }
