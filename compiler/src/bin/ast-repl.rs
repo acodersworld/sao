@@ -135,6 +135,9 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedType { found } => {
             format!("expected a type, found {found:?}")
         }
+        ParseErrorKind::ExpectedElseBranch { found } => {
+            format!("expected a block or if after else, found {found:?}")
+        }
         ParseErrorKind::ExpectedToken { expected, found } => {
             format!("expected {expected:?}, found {found:?}")
         }
@@ -163,5 +166,18 @@ mod tests {
             Some("const value = 1;")
         );
         assert_eq!(command_argument(":statement", ":stmt"), None);
+    }
+
+    #[test]
+    fn describes_invalid_else_branches() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedElseBranch {
+                    found: sao_compiler::lexer::TokenKind::Identifier,
+                },
+                span: Span::new(0, 5),
+            }),
+            "expected a block or if after else, found Identifier"
+        );
     }
 }

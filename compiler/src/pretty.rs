@@ -1,6 +1,9 @@
 use std::fmt::{Arguments, Write};
 
-use crate::ast::{Expression, ExpressionKind, Statement, StatementKind, TypeKind, TypeSyntax};
+use crate::ast::{
+    Block, ConditionalElse, Expression, ExpressionKind, Statement, StatementKind, TypeKind,
+    TypeSyntax,
+};
 use crate::lexer::Span;
 
 /// Formats an expression as an indented syntax tree.
@@ -93,14 +96,24 @@ fn format_expression_into(
             line(output, depth, format_args!("Group {}", location(span)));
             child_expression(output, source, "expression", inner, depth);
         }
-        ExpressionKind::Block(block) => {
-            line(output, depth, format_args!("Block {}", location(span)));
-            statement_list(output, source, "statements", &block.statements, depth);
-            line(output, depth + 1, format_args!("value:"));
-            if let Some(value) = &block.value {
-                format_expression_into(output, source, value, depth + 2);
-            } else {
-                line(output, depth + 2, format_args!("(none)"));
+        ExpressionKind::Block(block) => format_block_into(output, source, block, depth),
+        ExpressionKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            line(output, depth, format_args!("If {}", location(span)));
+            child_expression(output, source, "condition", condition, depth);
+            child_block(output, source, "then_branch", then_branch, depth);
+            line(output, depth + 1, format_args!("else_branch:"));
+            match else_branch {
+                Some(ConditionalElse::Block(block)) => {
+                    format_block_into(output, source, block, depth + 2);
+                }
+                Some(ConditionalElse::If(conditional)) => {
+                    format_expression_into(output, source, conditional, depth + 2);
+                }
+                None => line(output, depth + 2, format_args!("(none)")),
             }
         }
         ExpressionKind::Call { callee, arguments } => {
@@ -166,6 +179,21 @@ fn format_expression_into(
     }
 }
 
+fn format_block_into(output: &mut String, source: &str, block: &Block, depth: usize) {
+    line(
+        output,
+        depth,
+        format_args!("Block {}", location(block.span)),
+    );
+    statement_list(output, source, "statements", &block.statements, depth);
+    line(output, depth + 1, format_args!("value:"));
+    if let Some(value) = &block.value {
+        format_expression_into(output, source, value, depth + 2);
+    } else {
+        line(output, depth + 2, format_args!("(none)"));
+    }
+}
+
 fn child_expression(
     output: &mut String,
     source: &str,
@@ -175,6 +203,11 @@ fn child_expression(
 ) {
     line(output, depth + 1, format_args!("{label}:"));
     format_expression_into(output, source, expression, depth + 2);
+}
+
+fn child_block(output: &mut String, source: &str, label: &str, block: &Block, depth: usize) {
+    line(output, depth + 1, format_args!("{label}:"));
+    format_block_into(output, source, block, depth + 2);
 }
 
 fn expression_list(
@@ -381,6 +414,39 @@ mod tests {
         assert_eq!(
             format_expression(source, &expression),
             "Block @ 0..22\n  statements:\n    [0]:\n      Binding Const \"x\" @ 2..14\n        initializer:\n          Literal Integer \"1\" @ 12..13\n  value:\n    Binary Add @ 15..20\n      left:\n        Identifier \"x\" @ 15..16\n      right:\n        Literal Integer \"2\" @ 19..20"
+        );
+    }
+
+    #[test]
+    fn formats_conditionals_without_else_branches() {
+        let source = "if ready { 1 }";
+        let expression = parse_expression(Lexer::new(source)).expect("conditional should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "If @ 0..14\n  condition:\n    Identifier \"ready\" @ 3..8\n  then_branch:\n    Block @ 9..14\n      statements:\n        (empty)\n      value:\n        Literal Integer \"1\" @ 11..12\n  else_branch:\n    (none)"
+        );
+    }
+
+    #[test]
+    fn formats_conditionals_with_braced_else_branches() {
+        let source = "if ready { 1 } else { 2 }";
+        let expression = parse_expression(Lexer::new(source)).expect("conditional should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "If @ 0..25\n  condition:\n    Identifier \"ready\" @ 3..8\n  then_branch:\n    Block @ 9..14\n      statements:\n        (empty)\n      value:\n        Literal Integer \"1\" @ 11..12\n  else_branch:\n    Block @ 20..25\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 22..23"
+        );
+    }
+
+    #[test]
+    fn formats_else_if_branches_as_nested_conditionals() {
+        let source = "if a {} else if b {}";
+        let expression = parse_expression(Lexer::new(source)).expect("else-if should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "If @ 0..20\n  condition:\n    Identifier \"a\" @ 3..4\n  then_branch:\n    Block @ 5..7\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    If @ 13..20\n      condition:\n        Identifier \"b\" @ 16..17\n      then_branch:\n        Block @ 18..20\n          statements:\n            (empty)\n          value:\n            (none)\n      else_branch:\n        (none)"
         );
     }
 }

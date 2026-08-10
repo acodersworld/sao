@@ -65,6 +65,15 @@ impl Block {
     }
 }
 
+/// The syntax accepted after an `else` keyword.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalElse {
+    /// A braced `else` body.
+    Block(Block),
+    /// An `else if` expression. The parser guarantees an [`ExpressionKind::If`].
+    If(Box<Expression>),
+}
+
 /// The syntax represented by a [`Statement`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementKind {
@@ -129,6 +138,11 @@ pub enum ExpressionKind {
     Literal(LiteralKind),
     Group(Box<Expression>),
     Block(Block),
+    If {
+        condition: Box<Expression>,
+        then_branch: Block,
+        else_branch: Option<ConditionalElse>,
+    },
     Call {
         callee: Box<Expression>,
         arguments: Vec<Expression>,

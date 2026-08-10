@@ -1,8 +1,9 @@
 use std::iter::Peekable;
 
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, BindingMutability, Block, Expression, ExpressionKind,
-    LiteralKind, PrimitiveType, Statement, StatementKind, TypeKind, TypeSyntax, UnaryOperator,
+    AssignmentOperator, BinaryOperator, BindingMutability, Block, ConditionalElse, Expression,
+    ExpressionKind, LiteralKind, PrimitiveType, Statement, StatementKind, TypeKind, TypeSyntax,
+    UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -12,6 +13,9 @@ pub enum ParseErrorKind {
         found: TokenKind,
     },
     ExpectedType {
+        found: TokenKind,
+    },
+    ExpectedElseBranch {
         found: TokenKind,
     },
     ExpectedToken {
@@ -176,8 +180,17 @@ where
 
     fn expression_statement(&mut self) -> ParseResult<Statement> {
         let expression = self.expression(LOWEST_BINDING_POWER)?;
-        let semicolon = self.expect(TokenKind::Semicolon)?;
-        let span = Span::new(expression.span.start, semicolon.span.end);
+        let span = if self.current()?.kind == TokenKind::Semicolon {
+            let semicolon = self.advance()?;
+            Span::new(expression.span.start, semicolon.span.end)
+        } else if expression_may_omit_statement_semicolon(&expression)
+            && self.current()?.kind == TokenKind::Eof
+        {
+            expression.span
+        } else {
+            let semicolon = self.expect(TokenKind::Semicolon)?;
+            Span::new(expression.span.start, semicolon.span.end)
+        };
         Ok(Statement::new(StatementKind::Expression(expression), span))
     }
 
@@ -535,7 +548,8 @@ where
                 ))
             }
             TokenKind::LeftParen => self.group(),
-            TokenKind::LeftBrace => self.block(),
+            TokenKind::LeftBrace => self.block_expression(),
+            TokenKind::If => self.conditional(),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
             TokenKind::IntegerLiteral => self.literal(LiteralKind::Integer),
@@ -573,7 +587,13 @@ where
         ))
     }
 
-    fn block(&mut self) -> ParseResult {
+    fn block_expression(&mut self) -> ParseResult {
+        let block = self.block()?;
+        let span = block.span;
+        Ok(Expression::new(ExpressionKind::Block(block), span))
+    }
+
+    fn block(&mut self) -> ParseResult<Block> {
         let left_brace = self.expect(TokenKind::LeftBrace)?;
         let mut statements = Vec::new();
         let mut value = None;
@@ -607,14 +627,22 @@ where
                         }
                         TokenKind::Eof => break self.expect(TokenKind::RightBrace)?,
                         _ => {
-                            return Err(ParseError {
-                                kind: ParseErrorKind::ExpectedToken {
-                                    expected: TokenKind::Semicolon,
-                                    found: following.kind,
-                                },
-                                span: following.span,
+                            if expression_may_omit_statement_semicolon(&expression) {
+                                let span = expression.span;
+                                statements.push(Statement::new(
+                                    StatementKind::Expression(expression),
+                                    span,
+                                ));
+                            } else {
+                                return Err(ParseError {
+                                    kind: ParseErrorKind::ExpectedToken {
+                                        expected: TokenKind::Semicolon,
+                                        found: following.kind,
+                                    },
+                                    span: following.span,
+                                }
+                                .into());
                             }
-                            .into());
                         }
                     }
                 }
@@ -622,9 +650,43 @@ where
         };
 
         let span = Span::new(left_brace.span.start, right_brace.span.end);
+        Ok(Block::new(statements, value, span))
+    }
+
+    fn conditional(&mut self) -> ParseResult {
+        let if_keyword = self.expect(TokenKind::If)?;
+        let condition = self.expression(LOWEST_BINDING_POWER)?;
+        let then_branch = self.block()?;
+        let else_branch = if self.current()?.kind == TokenKind::Else {
+            self.advance()?;
+            let token = self.current()?;
+            Some(match token.kind {
+                TokenKind::LeftBrace => ConditionalElse::Block(self.block()?),
+                TokenKind::If => ConditionalElse::If(Box::new(self.conditional()?)),
+                _ => {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::ExpectedElseBranch { found: token.kind },
+                        span: token.span,
+                    }
+                    .into());
+                }
+            })
+        } else {
+            None
+        };
+        let end = match &else_branch {
+            Some(ConditionalElse::Block(block)) => block.span.end,
+            Some(ConditionalElse::If(conditional)) => conditional.span.end,
+            None => then_branch.span.end,
+        };
+
         Ok(Expression::new(
-            ExpressionKind::Block(Block::new(statements, value, span)),
-            span,
+            ExpressionKind::If {
+                condition: Box::new(condition),
+                then_branch,
+                else_branch,
+            },
+            Span::new(if_keyword.span.start, end),
         ))
     }
 
@@ -684,6 +746,13 @@ where
     fn synthetic_eof(&self) -> Token {
         Token::new(TokenKind::Eof, Span::new(self.last_end, self.last_end))
     }
+}
+
+fn expression_may_omit_statement_semicolon(expression: &Expression) -> bool {
+    matches!(
+        &expression.kind,
+        ExpressionKind::Block(_) | ExpressionKind::If { .. }
+    )
 }
 
 const LOWEST_BINDING_POWER: u8 = 0;
@@ -1068,6 +1137,255 @@ mod tests {
                 span: Span::new(7, 13),
             }))
         );
+    }
+
+    #[test]
+    fn parses_conditionals_without_an_else_branch() {
+        let expression = parse("if ready { 1 }").expect("conditional should parse");
+        let ExpressionKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } = expression.kind
+        else {
+            panic!("expected a conditional expression");
+        };
+
+        assert!(matches!(&condition.kind, ExpressionKind::Identifier));
+        assert_eq!(condition.span, Span::new(3, 8));
+        assert_eq!(then_branch.span, Span::new(9, 14));
+        assert_eq!(
+            then_branch.value.as_deref(),
+            Some(&integer(Span::new(11, 12)))
+        );
+        assert_eq!(else_branch, None);
+        assert_eq!(expression.span, Span::new(0, 14));
+    }
+
+    #[test]
+    fn parses_braced_else_branches() {
+        let expression = parse("if ready { 1 } else { 2 }").expect("conditional should parse");
+        let ExpressionKind::If {
+            then_branch,
+            else_branch: Some(ConditionalElse::Block(else_branch)),
+            ..
+        } = expression.kind
+        else {
+            panic!("expected a conditional with a braced else branch");
+        };
+
+        assert_eq!(then_branch.span, Span::new(9, 14));
+        assert_eq!(else_branch.span, Span::new(20, 25));
+        assert_eq!(expression.span, Span::new(0, 25));
+    }
+
+    #[test]
+    fn parses_else_if_chains_recursively() {
+        let source = "if first { 1 } else if second { 2 } else { 3 }";
+        let expression = parse(source).expect("else-if chain should parse");
+        let ExpressionKind::If {
+            else_branch: Some(ConditionalElse::If(nested)),
+            ..
+        } = expression.kind
+        else {
+            panic!("expected an else-if branch");
+        };
+        let ExpressionKind::If {
+            condition,
+            else_branch: Some(ConditionalElse::Block(final_branch)),
+            ..
+        } = nested.kind
+        else {
+            panic!("expected a nested conditional with a final else block");
+        };
+
+        assert_eq!(expression.span, Span::new(0, source.len()));
+        assert_eq!(nested.span, Span::new(20, source.len()));
+        assert_eq!(condition.span, Span::new(23, 29));
+        assert_eq!(final_branch.span, Span::new(41, 46));
+    }
+
+    #[test]
+    fn conditional_conditions_reuse_expression_precedence() {
+        let expression = parse("if a || b && c { 1 } else { 2 }")
+            .expect("conditional with a complex condition should parse");
+        let ExpressionKind::If { condition, .. } = expression.kind else {
+            panic!("expected a conditional expression");
+        };
+        let ExpressionKind::Binary {
+            operator: BinaryOperator::LogicalOr,
+            right,
+            ..
+        } = condition.kind
+        else {
+            panic!("expected logical OR at the condition root");
+        };
+
+        assert!(matches!(
+            right.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::LogicalAnd,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn conditionals_compose_with_postfix_and_infix_expressions() {
+        let expression = parse("if ready { service } else { fallback }().member")
+            .expect("postfix conditional should parse");
+        let ExpressionKind::MemberAccess { object, .. } = expression.kind else {
+            panic!("expected member access");
+        };
+        let ExpressionKind::Call { callee, .. } = object.kind else {
+            panic!("expected a call before member access");
+        };
+        assert!(matches!(callee.kind, ExpressionKind::If { .. }));
+
+        let expression =
+            parse("1 + if ready { 2 } else { 3 }").expect("infix conditional should parse");
+        let ExpressionKind::Binary { right, .. } = expression.kind else {
+            panic!("expected a binary expression");
+        };
+        assert!(matches!(right.kind, ExpressionKind::If { .. }));
+    }
+
+    #[test]
+    fn block_like_expression_statements_may_omit_semicolons() {
+        for source in ["{}", "if true {}"] {
+            let statement =
+                parse_statement_source(source).expect("block-like statement should parse");
+            let StatementKind::Expression(expression) = statement.kind else {
+                panic!("expected an expression statement");
+            };
+
+            assert!(expression_may_omit_statement_semicolon(&expression));
+            assert_eq!(statement.span, expression.span);
+        }
+
+        let expression = parse("{ {} value }").expect("implicit block statement should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert_eq!(block.statements.len(), 1);
+        assert!(matches!(
+            &block.statements[0].kind,
+            StatementKind::Expression(Expression {
+                kind: ExpressionKind::Block(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            block.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::Identifier,
+                ..
+            })
+        ));
+
+        let expression = parse("{ if true {} value }").expect("implicit if statement should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert_eq!(block.statements.len(), 1);
+        assert!(matches!(
+            &block.statements[0].kind,
+            StatementKind::Expression(Expression {
+                kind: ExpressionKind::If { .. },
+                ..
+            })
+        ));
+        assert!(block.value.is_some());
+    }
+
+    #[test]
+    fn block_like_expressions_before_a_right_brace_remain_values() {
+        let expression =
+            parse("{ if true { 1 } else { 2 } }").expect("conditional value should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+
+        assert!(block.statements.is_empty());
+        assert!(matches!(
+            block.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::If { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn semicolons_explicitly_discard_block_like_expressions() {
+        let source = "{ if true {}; }";
+        let expression = parse(source).expect("discarded conditional should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+
+        assert_eq!(block.statements.len(), 1);
+        assert!(block.value.is_none());
+        assert_eq!(block.statements[0].span, Span::new(2, 13));
+    }
+
+    #[test]
+    fn reports_malformed_conditionals() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "if",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Eof,
+                },
+                Span::new(2, 2),
+            ),
+            (
+                "if true",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(7, 7),
+            ),
+            (
+                "if true value",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Identifier,
+                },
+                Span::new(8, 13),
+            ),
+            (
+                "if true {} else value",
+                ParseErrorKind::ExpectedElseBranch {
+                    found: TokenKind::Identifier,
+                },
+                Span::new(16, 21),
+            ),
+            (
+                "if true {} else",
+                ParseErrorKind::ExpectedElseBranch {
+                    found: TokenKind::Eof,
+                },
+                Span::new(15, 15),
+            ),
+            (
+                "else {}",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Else,
+                },
+                Span::new(0, 4),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
     }
 
     #[test]
