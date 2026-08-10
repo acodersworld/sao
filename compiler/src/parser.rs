@@ -21,6 +21,7 @@ pub enum ParseErrorKind {
     ExpectedRangeOperator {
         found: TokenKind,
     },
+    RangeBoundRequiresGrouping,
     ExpectedToken {
         expected: TokenKind,
         found: TokenKind,
@@ -932,6 +933,15 @@ where
         let inclusivity = match range_operator.kind {
             TokenKind::DotDot => RangeInclusivity::Exclusive,
             TokenKind::DotDotEqual => RangeInclusivity::Inclusive,
+            // A simple start bound stops before an infix operator. Report the
+            // missing grouping instead of treating that operator as a range delimiter.
+            kind if infix_binding_power(kind).is_some() => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::RangeBoundRequiresGrouping,
+                    span: range_operator.span,
+                }
+                .into());
+            }
             _ => {
                 return Err(ParseError {
                     kind: ParseErrorKind::ExpectedRangeOperator {
@@ -944,6 +954,16 @@ where
         };
         self.advance()?;
         let end = self.range_bound_expression()?;
+        let following = self.current()?;
+        // Likewise, an infix operator after a simple end bound means the full
+        // bound needed grouping; it is not merely a missing loop body.
+        if following.kind != TokenKind::LeftBrace && infix_binding_power(following.kind).is_some() {
+            return Err(ParseError {
+                kind: ParseErrorKind::RangeBoundRequiresGrouping,
+                span: following.span,
+            }
+            .into());
+        }
         let body = self.block()?;
         let else_branch = if self.current()?.kind == TokenKind::Else {
             self.advance()?;
@@ -969,17 +989,17 @@ where
     }
 
     fn range_bound_expression(&mut self) -> ParseResult {
-        let token = self.current()?;
+        let expression = self.expression(PREFIX_BINDING_POWER)?;
 
-        if token.kind == TokenKind::LeftBrace {
+        if !range_bound_is_simple(&expression) {
             return Err(ParseError {
-                kind: ParseErrorKind::ExpectedExpression { found: token.kind },
-                span: token.span,
+                kind: ParseErrorKind::RangeBoundRequiresGrouping,
+                span: expression.span,
             }
             .into());
         }
 
-        self.expression(LOWEST_BINDING_POWER)
+        Ok(expression)
     }
 
     fn primary(&mut self, kind: ExpressionKind) -> ParseResult {
@@ -1049,6 +1069,25 @@ fn expression_may_omit_statement_semicolon(expression: &Expression) -> bool {
             | ExpressionKind::While { .. }
             | ExpressionKind::RangeFor { .. }
     )
+}
+
+fn range_bound_is_simple(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::Identifier
+        | ExpressionKind::SelfValue
+        | ExpressionKind::Literal(_)
+        | ExpressionKind::Group(_) => true,
+        ExpressionKind::Call { callee, .. } => range_bound_is_simple(callee),
+        ExpressionKind::MemberAccess { object, .. } | ExpressionKind::Index { object, .. } => {
+            range_bound_is_simple(object)
+        }
+        ExpressionKind::Try { expression } => range_bound_is_simple(expression),
+        ExpressionKind::Unary {
+            operator: UnaryOperator::Negate,
+            operand,
+        } => range_bound_is_simple(operand),
+        _ => false,
+    }
 }
 
 const LOWEST_BINDING_POWER: u8 = 0;
@@ -2380,9 +2419,9 @@ mod tests {
     }
 
     #[test]
-    fn range_bounds_reuse_expression_precedence_and_postfix_parsing() {
-        let expression =
-            parse("for i in -start()..limit.value + 1 {}").expect("computed bounds should parse");
+    fn range_bounds_accept_unary_and_postfix_expressions() {
+        let expression = parse("for i in -start()..limit.value {}")
+            .expect("simple computed bounds should parse");
         let ExpressionKind::RangeFor { start, end, .. } = expression.kind else {
             panic!("expected a range loop");
         };
@@ -2395,15 +2434,90 @@ mod tests {
                 operand,
             } if matches!(operand.kind, ExpressionKind::Call { .. })
         ));
-        assert_eq!(end.span, Span::new(19, 34));
+        assert_eq!(end.span, Span::new(19, 30));
+        assert!(matches!(end.kind, ExpressionKind::MemberAccess { .. }));
+    }
+
+    #[test]
+    fn range_bounds_accept_grouped_full_expressions() {
+        let expression = parse("for i in (start - 1)..(limit + 1) {}")
+            .expect("grouped infix bounds should parse");
+        let ExpressionKind::RangeFor { start, end, .. } = expression.kind else {
+            panic!("expected a range loop");
+        };
+
+        assert!(matches!(
+            start.kind,
+            ExpressionKind::Group(inner)
+                if matches!(
+                    inner.kind,
+                    ExpressionKind::Binary {
+                        operator: BinaryOperator::Subtract,
+                        ..
+                    }
+                )
+        ));
         assert!(matches!(
             end.kind,
-            ExpressionKind::Binary {
-                operator: BinaryOperator::Add,
-                left,
-                ..
-            } if matches!(left.kind, ExpressionKind::MemberAccess { .. })
+            ExpressionKind::Group(inner)
+                if matches!(
+                    inner.kind,
+                    ExpressionKind::Binary {
+                        operator: BinaryOperator::Add,
+                        ..
+                    }
+                )
         ));
+    }
+
+    #[test]
+    fn range_bounds_accept_parenthesized_block_expressions() {
+        let expression = parse("for i in ({ 0 })..({ 10 }) {}")
+            .expect("parenthesized block bounds should parse");
+        let ExpressionKind::RangeFor { start, end, .. } = expression.kind else {
+            panic!("expected a range loop");
+        };
+
+        assert!(matches!(
+            start.kind,
+            ExpressionKind::Group(inner)
+                if matches!(inner.kind, ExpressionKind::Block(_))
+        ));
+        assert!(matches!(
+            end.kind,
+            ExpressionKind::Group(inner)
+                if matches!(inner.kind, ExpressionKind::Block(_))
+        ));
+    }
+
+    #[test]
+    fn range_loop_else_follows_an_else_in_the_end_bound() {
+        let expression = parse("for i in 0..(if ready { 1 } else { 2 }) {} else { 3 }")
+            .expect("conditional end bound and loop else should parse");
+        let ExpressionKind::RangeFor {
+            end,
+            else_branch: Some(loop_else),
+            ..
+        } = expression.kind
+        else {
+            panic!("expected a range loop with an else block");
+        };
+
+        assert!(matches!(
+            end.kind,
+            ExpressionKind::Group(inner)
+                if matches!(
+                    inner.kind,
+                    ExpressionKind::If {
+                        else_branch: Some(ConditionalElse::Block(_)),
+                        ..
+                    }
+                )
+        ));
+        assert_eq!(
+            loop_else.value.as_deref(),
+            Some(&integer(Span::new(50, 51)))
+        );
     }
 
     #[test]
@@ -2556,10 +2670,13 @@ mod tests {
             ),
             (
                 "for i in {}..1 {}",
-                ParseErrorKind::ExpectedExpression {
-                    found: TokenKind::LeftBrace,
-                },
-                Span::new(9, 10),
+                ParseErrorKind::RangeBoundRequiresGrouping,
+                Span::new(9, 11),
+            ),
+            (
+                "for i in start + 1..limit {}",
+                ParseErrorKind::RangeBoundRequiresGrouping,
+                Span::new(15, 16),
             ),
             (
                 "for i in 0 {}",
@@ -2569,11 +2686,33 @@ mod tests {
                 Span::new(11, 12),
             ),
             (
-                "for i in 0.. {}",
-                ParseErrorKind::ExpectedExpression {
-                    found: TokenKind::LeftBrace,
+                "for i in 0",
+                ParseErrorKind::ExpectedRangeOperator {
+                    found: TokenKind::Eof,
                 },
-                Span::new(13, 14),
+                Span::new(10, 10),
+            ),
+            (
+                "for i in 0.. {}",
+                ParseErrorKind::RangeBoundRequiresGrouping,
+                Span::new(13, 15),
+            ),
+            (
+                "for i in 0..limit + 1 {}",
+                ParseErrorKind::RangeBoundRequiresGrouping,
+                Span::new(18, 19),
+            ),
+            (
+                "for i in 0..if ready { 1 } else { 2 } {} else { 3 }",
+                ParseErrorKind::RangeBoundRequiresGrouping,
+                Span::new(12, 37),
+            ),
+            (
+                "for i in 0..",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Eof,
+                },
+                Span::new(12, 12),
             ),
             (
                 "for i in 0..1",

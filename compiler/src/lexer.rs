@@ -142,9 +142,9 @@ define_token_kinds! {
     #[token("loop")] Loop,
     // Begins a condition-controlled loop expression.
     #[token("while")] While,
-    // Begins an iterator or three-clause loop expression.
+    // Begins an ascending integer range loop expression.
     #[token("for")] For,
-    // Separates an iterator binding from its source expression.
+    // Separates a range loop's induction binding from its bounds.
     #[token("in")] In,
     // Exits the innermost loop, optionally carrying a value.
     #[token("break")] Break,

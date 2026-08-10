@@ -57,9 +57,15 @@ inclusive range is empty when its start is greater than its end. An inclusive
 range ending at the maximum `int` value terminates after visiting that value and
 does not overflow while advancing.
 
-A bare block expression cannot begin either bound because the `{` following the
-end bound begins the loop body. Parentheses may be used when a nested block is
-intentionally part of a larger bound expression.
+An unparenthesized bound is limited to a primary expression, its postfix chains,
+or unary negation. Infix, assignment, lambda, and block-like expressions must be
+parenthesized. Grouping makes the boundary between a complex end bound and the
+loop body explicit:
+
+```text
+for index in -start..items.length() {}
+for index in (start + offset)..(if ready { limit } else { fallback }) {}
+```
 
 The induction binding is immutable and controlled by the loop. It is introduced
 without `const`, and neither `const` nor `mut` is accepted after `for`:

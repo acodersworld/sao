@@ -141,6 +141,9 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedRangeOperator { found } => {
             format!("expected .. or ..= in for range, found {found:?}")
         }
+        ParseErrorKind::RangeBoundRequiresGrouping => {
+            "complex range bounds must be parenthesized".to_owned()
+        }
         ParseErrorKind::ExpectedToken { expected, found } => {
             format!("expected {expected:?}, found {found:?}")
         }
@@ -194,6 +197,17 @@ mod tests {
                 span: Span::new(0, 1),
             }),
             "expected .. or ..= in for range, found LeftBrace"
+        );
+    }
+
+    #[test]
+    fn describes_ungrouped_complex_range_bounds() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::RangeBoundRequiresGrouping,
+                span: Span::new(0, 1),
+            }),
+            "complex range bounds must be parenthesized"
         );
     }
 }
