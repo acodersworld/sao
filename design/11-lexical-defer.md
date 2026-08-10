@@ -57,7 +57,8 @@ Lexical scope means a defer inside a loop iteration runs at the end of that
 iteration:
 
 ```text
-for path in paths {
+for index in 0..paths.length() {
+    const path = paths[index];
     mut file = File.open(path);
     defer file.close();
 

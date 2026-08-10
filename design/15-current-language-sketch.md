@@ -26,7 +26,9 @@ struct Buffer {
 }
 
 fn find_nonzero(data: bytes) -> int | none {
-    for value in data {
+    for index in 0..data.length() {
+        const value = data[index];
+
         if value != 0 {
             break value;
         }

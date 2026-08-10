@@ -161,6 +161,13 @@ pub enum BindingMutability {
     Mut,
 }
 
+/// Whether a range loop includes its end bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RangeInclusivity {
+    Exclusive,
+    Inclusive,
+}
+
 /// The syntax represented by a [`TypeSyntax`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
@@ -216,6 +223,14 @@ pub enum ExpressionKind {
     },
     While {
         condition: Box<Expression>,
+        body: Block,
+        else_branch: Option<Block>,
+    },
+    RangeFor {
+        binding: Span,
+        start: Box<Expression>,
+        end: Box<Expression>,
+        inclusivity: RangeInclusivity,
         body: Block,
         else_branch: Option<Block>,
     },

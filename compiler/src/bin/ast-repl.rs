@@ -138,6 +138,9 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedElseBranch { found } => {
             format!("expected a block or if after else, found {found:?}")
         }
+        ParseErrorKind::ExpectedRangeOperator { found } => {
+            format!("expected .. or ..= in for range, found {found:?}")
+        }
         ParseErrorKind::ExpectedToken { expected, found } => {
             format!("expected {expected:?}, found {found:?}")
         }
@@ -178,6 +181,19 @@ mod tests {
                 span: Span::new(0, 5),
             }),
             "expected a block or if after else, found Identifier"
+        );
+    }
+
+    #[test]
+    fn describes_missing_range_operators() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedRangeOperator {
+                    found: sao_compiler::lexer::TokenKind::LeftBrace,
+                },
+                span: Span::new(0, 1),
+            }),
+            "expected .. or ..= in for range, found LeftBrace"
         );
     }
 }

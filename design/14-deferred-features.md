@@ -7,6 +7,8 @@ core:
 - A `satisfies` operator that preserves an anonymous object's exact hidden type.
 - Nominal data-carrying enums.
 - General `match` expressions and exhaustive pattern matching.
+- General iterable types and collection-based `for item in collection` loops;
+  initial `for` loops iterate only over integer ranges written in the header.
 - User-defined generic structs, functions, and interfaces, including generic
   constraints, general-purpose generic inference, and associated types.
 - `errdefer`.

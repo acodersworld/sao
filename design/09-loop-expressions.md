@@ -1,6 +1,7 @@
 # 9. Loop expressions
 
-Value-producing loops are a core feature. SAO supports four loop forms:
+Value-producing loops are a core feature. The initial language supports three
+loop forms:
 
 ```text
 loop {
@@ -11,12 +12,8 @@ while condition {
     // Conditional loop.
 }
 
-for item in items {
-    // Iterator loop.
-}
-
-for mut index = 0; index < 10; index += 1 {
-    // Traditional three-clause loop.
+for index in 0..10 {
+    // Ascending integer range loop.
 }
 ```
 
@@ -39,32 +36,54 @@ const command = loop {
 All reachable `break value` expressions associated with the loop must have
 compatible types.
 
-## 9.2 Naturally terminating loops
+## 9.2 Range loops
 
-`while`, iterator `for`, and three-clause `for` loops can terminate without
-executing `break`. When such a loop is used to produce a non-unit value, it must
-have an `else` block that supplies the natural-completion value:
+Range loops use Rust-style exclusive and inclusive end bounds:
 
 ```text
-const admin: User | none = for user in users {
-    if user.is_admin {
-        break user;
-    }
-} else {
-    none
-};
+for index in 0..10 {
+    // Visits 0 through 9.
+}
+
+for index in 0..=10 {
+    // Visits 0 through 10.
+}
 ```
 
-The `else` block executes only when the loop completes naturally, not after a
-`break`.
+Both bounds are `int` expressions and are evaluated exactly once from left to
+right before iteration begins. Iteration always advances upward by one. An
+exclusive range is empty when its start is greater than or equal to its end; an
+inclusive range is empty when its start is greater than its end. An inclusive
+range ending at the maximum `int` value terminates after visiting that value and
+does not overflow while advancing.
 
-Traditional loops follow the same rule:
+A bare block expression cannot begin either bound because the `{` following the
+end bound begins the loop body. Parentheses may be used when a nested block is
+intentionally part of a larger bound expression.
+
+The induction binding is immutable and controlled by the loop. It is introduced
+without `const`, and neither `const` nor `mut` is accepted after `for`:
 
 ```text
-const divisor = for mut candidate = 2;
-                  candidate < value;
-                  candidate += 1
-{
+for index in start..end {
+    index = 0; // Type error: the induction binding is immutable.
+}
+```
+
+The `..` and `..=` forms initially exist only in `for` headers and do not create
+first-class range values. Descending ranges, configurable steps, open-ended
+ranges, and traditional three-clause loops are unsupported. Collection
+iteration may later reuse `for item in collection` after SAO defines iterable
+types and their iteration protocol.
+
+## 9.3 Naturally terminating loops
+
+`while` and range `for` loops can terminate without executing `break`. When such
+a loop is used to produce a non-unit value, it must have an `else` block that
+supplies the natural-completion value:
+
+```text
+const divisor = for candidate in 2..value {
     if value % candidate == 0 {
         break candidate;
     }
@@ -73,7 +92,10 @@ const divisor = for mut candidate = 2;
 };
 ```
 
-## 9.3 Loop result typing
+The `else` block executes only when the loop completes naturally, not after a
+`break`. This includes natural completion of an empty range.
+
+## 9.4 Loop result typing
 
 - `break expression` contributes the expression's type to the loop result.
 - Bare `break;` contributes `()`.

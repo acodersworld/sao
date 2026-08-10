@@ -3,7 +3,7 @@ use std::iter::Peekable;
 use crate::ast::{
     AssignmentOperator, BinaryOperator, BindingMutability, Block, ConditionalElse, Expression,
     ExpressionKind, Function, FunctionParameter, FunctionParameterKind, LiteralKind, PrimitiveType,
-    Statement, StatementKind, TypeKind, TypeSyntax, UnaryOperator,
+    RangeInclusivity, Statement, StatementKind, TypeKind, TypeSyntax, UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -16,6 +16,9 @@ pub enum ParseErrorKind {
         found: TokenKind,
     },
     ExpectedElseBranch {
+        found: TokenKind,
+    },
+    ExpectedRangeOperator {
         found: TokenKind,
     },
     ExpectedToken {
@@ -718,6 +721,7 @@ where
             TokenKind::If => self.conditional(),
             TokenKind::Loop => self.loop_expression(),
             TokenKind::While => self.while_expression(),
+            TokenKind::For => self.range_for_expression(),
             TokenKind::Lambda => self.lambda_expression(),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
@@ -919,6 +923,65 @@ where
         ))
     }
 
+    fn range_for_expression(&mut self) -> ParseResult {
+        let keyword = self.expect(TokenKind::For)?;
+        let binding = self.expect(TokenKind::Identifier)?;
+        self.expect(TokenKind::In)?;
+        let start = self.range_bound_expression()?;
+        let range_operator = self.current()?;
+        let inclusivity = match range_operator.kind {
+            TokenKind::DotDot => RangeInclusivity::Exclusive,
+            TokenKind::DotDotEqual => RangeInclusivity::Inclusive,
+            _ => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::ExpectedRangeOperator {
+                        found: range_operator.kind,
+                    },
+                    span: range_operator.span,
+                }
+                .into());
+            }
+        };
+        self.advance()?;
+        let end = self.range_bound_expression()?;
+        let body = self.block()?;
+        let else_branch = if self.current()?.kind == TokenKind::Else {
+            self.advance()?;
+            Some(self.block()?)
+        } else {
+            None
+        };
+        let end_span = else_branch
+            .as_ref()
+            .map_or(body.span.end, |branch| branch.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::RangeFor {
+                binding: binding.span,
+                start: Box::new(start),
+                end: Box::new(end),
+                inclusivity,
+                body,
+                else_branch,
+            },
+            Span::new(keyword.span.start, end_span),
+        ))
+    }
+
+    fn range_bound_expression(&mut self) -> ParseResult {
+        let token = self.current()?;
+
+        if token.kind == TokenKind::LeftBrace {
+            return Err(ParseError {
+                kind: ParseErrorKind::ExpectedExpression { found: token.kind },
+                span: token.span,
+            }
+            .into());
+        }
+
+        self.expression(LOWEST_BINDING_POWER)
+    }
+
     fn primary(&mut self, kind: ExpressionKind) -> ParseResult {
         let token = self.advance()?;
         Ok(Expression::new(kind, token.span))
@@ -984,6 +1047,7 @@ fn expression_may_omit_statement_semicolon(expression: &Expression) -> bool {
             | ExpressionKind::If { .. }
             | ExpressionKind::Loop { .. }
             | ExpressionKind::While { .. }
+            | ExpressionKind::RangeFor { .. }
     )
 }
 
@@ -2259,6 +2323,304 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_exclusive_range_for_loops() {
+        let expression = parse("for i in 0..10 {}").expect("range loop should parse");
+        let ExpressionKind::RangeFor {
+            binding,
+            start,
+            end,
+            inclusivity,
+            body,
+            else_branch,
+        } = expression.kind
+        else {
+            panic!("expected a range for loop");
+        };
+
+        assert_eq!(expression.span, Span::new(0, 17));
+        assert_eq!(binding, Span::new(4, 5));
+        assert_eq!(start.as_ref(), &integer(Span::new(9, 10)));
+        assert_eq!(end.as_ref(), &integer(Span::new(12, 14)));
+        assert_eq!(inclusivity, RangeInclusivity::Exclusive);
+        assert_eq!(body, Block::new(Vec::new(), None, Span::new(15, 17)));
+        assert_eq!(else_branch, None);
+    }
+
+    #[test]
+    fn parses_inclusive_range_for_loops_with_else_blocks() {
+        let source = "for index in start..=limit { continue; } else { 42 }";
+        let expression = parse(source).expect("inclusive range loop should parse");
+        let ExpressionKind::RangeFor {
+            binding,
+            start,
+            end,
+            inclusivity,
+            body,
+            else_branch: Some(else_branch),
+        } = expression.kind
+        else {
+            panic!("expected a range loop with an else block");
+        };
+
+        assert_eq!(expression.span, Span::new(0, 52));
+        assert_eq!(binding, Span::new(4, 9));
+        assert_eq!(start.span, Span::new(13, 18));
+        assert_eq!(end.span, Span::new(21, 26));
+        assert_eq!(inclusivity, RangeInclusivity::Inclusive);
+        assert_eq!(body.span, Span::new(27, 40));
+        assert!(matches!(&body.statements[0].kind, StatementKind::Continue));
+        assert_eq!(else_branch.span, Span::new(46, 52));
+        assert_eq!(
+            else_branch.value.as_deref(),
+            Some(&integer(Span::new(48, 50)))
+        );
+    }
+
+    #[test]
+    fn range_bounds_reuse_expression_precedence_and_postfix_parsing() {
+        let expression =
+            parse("for i in -start()..limit.value + 1 {}").expect("computed bounds should parse");
+        let ExpressionKind::RangeFor { start, end, .. } = expression.kind else {
+            panic!("expected a range loop");
+        };
+
+        assert_eq!(start.span, Span::new(9, 17));
+        assert!(matches!(
+            start.kind,
+            ExpressionKind::Unary {
+                operator: UnaryOperator::Negate,
+                operand,
+            } if matches!(operand.kind, ExpressionKind::Call { .. })
+        ));
+        assert_eq!(end.span, Span::new(19, 34));
+        assert!(matches!(
+            end.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                left,
+                ..
+            } if matches!(left.kind, ExpressionKind::MemberAccess { .. })
+        ));
+    }
+
+    #[test]
+    fn range_loops_accept_existing_loop_transfers() {
+        let expression = parse("for i in 0..10 { break i; continue; }")
+            .expect("range loop transfers should parse");
+        let ExpressionKind::RangeFor { body, .. } = expression.kind else {
+            panic!("expected a range loop");
+        };
+
+        assert_eq!(body.statements.len(), 2);
+        assert!(matches!(
+            &body.statements[0].kind,
+            StatementKind::Break(Some(Expression {
+                kind: ExpressionKind::Identifier,
+                ..
+            }))
+        ));
+        assert!(matches!(&body.statements[1].kind, StatementKind::Continue));
+    }
+
+    #[test]
+    fn range_loops_compose_with_postfix_and_infix_expressions() {
+        let expression =
+            parse("for i in 0..1 {}().member").expect("postfix range loop should parse");
+        let ExpressionKind::MemberAccess { object, .. } = expression.kind else {
+            panic!("expected member access");
+        };
+        let ExpressionKind::Call { callee, .. } = object.kind else {
+            panic!("expected a call before member access");
+        };
+        assert!(matches!(callee.kind, ExpressionKind::RangeFor { .. }));
+        assert_eq!(callee.span, Span::new(0, 16));
+
+        let expression =
+            parse("1 + for i in 0..1 { 2 } else { 3 }").expect("infix range loop should parse");
+        let ExpressionKind::Binary {
+            operator: BinaryOperator::Add,
+            right,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected addition at the root");
+        };
+        assert!(matches!(right.kind, ExpressionKind::RangeFor { .. }));
+    }
+
+    #[test]
+    fn range_loops_follow_block_like_statement_rules() {
+        let statement = parse_statement_source("for i in 0..1 {}")
+            .expect("range loop statement should parse without a semicolon");
+        let StatementKind::Expression(expression) = statement.kind else {
+            panic!("expected an expression statement");
+        };
+        assert!(expression_may_omit_statement_semicolon(&expression));
+        assert_eq!(statement.span, expression.span);
+
+        let expression = parse("{ for i in 0..1 {} value }")
+            .expect("implicit range loop statement should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert_eq!(block.statements.len(), 1);
+        assert!(matches!(
+            &block.statements[0].kind,
+            StatementKind::Expression(Expression {
+                kind: ExpressionKind::RangeFor { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            block.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::Identifier,
+                ..
+            })
+        ));
+
+        let expression = parse("{ for i in 0..1 {} }").expect("range loop value should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert!(block.statements.is_empty());
+        assert!(matches!(
+            block.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::RangeFor { .. },
+                ..
+            })
+        ));
+
+        let expression = parse("{ for i in 0..1 {}; }").expect("discarded range loop should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert_eq!(block.statements.len(), 1);
+        assert!(block.value.is_none());
+        assert_eq!(block.statements[0].span, Span::new(2, 19));
+    }
+
+    #[test]
+    fn reports_malformed_range_for_loops() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "for",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Eof,
+                },
+                Span::new(3, 3),
+            ),
+            (
+                "for mut i in 0..1 {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Mut,
+                },
+                Span::new(4, 7),
+            ),
+            (
+                "for const i in 0..1 {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Const,
+                },
+                Span::new(4, 9),
+            ),
+            (
+                "for in 0..1 {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::In,
+                },
+                Span::new(4, 6),
+            ),
+            (
+                "for i 0..1 {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::In,
+                    found: TokenKind::IntegerLiteral,
+                },
+                Span::new(6, 7),
+            ),
+            (
+                "for i in ..1 {}",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::DotDot,
+                },
+                Span::new(9, 11),
+            ),
+            (
+                "for i in {}..1 {}",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::LeftBrace,
+                },
+                Span::new(9, 10),
+            ),
+            (
+                "for i in 0 {}",
+                ParseErrorKind::ExpectedRangeOperator {
+                    found: TokenKind::LeftBrace,
+                },
+                Span::new(11, 12),
+            ),
+            (
+                "for i in 0.. {}",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::LeftBrace,
+                },
+                Span::new(13, 14),
+            ),
+            (
+                "for i in 0..1",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(13, 13),
+            ),
+            (
+                "for i in 0..1 {} else if true {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::If,
+                },
+                Span::new(22, 24),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+
+        assert_eq!(
+            parse("for i in 0..1 {} trailing"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::UnexpectedToken {
+                    found: TokenKind::Identifier,
+                },
+                span: Span::new(17, 25),
+            }))
+        );
+
+        assert_eq!(
+            parse("0..10"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::UnexpectedToken {
+                    found: TokenKind::DotDot,
+                },
+                span: Span::new(1, 3),
+            }))
+        );
     }
 
     #[test]

@@ -60,9 +60,8 @@ mut copy = original; // Allowed: int is copied by value.
 copy += 1;
 ```
 
-Function parameters and implicit bindings such as iterator variables are const
-by default and omit the `const` keyword. A parameter that requires mutable
-access is marked `mut`:
+Function parameters are const by default and omit the `const` keyword. A
+parameter that requires mutable access is marked `mut`:
 
 ```text
 fn display(user: User) -> () {
@@ -76,6 +75,10 @@ fn rename(mut user: User, name: string) -> () {
 
 A `mut` argument may be passed to either parameter form. A `const` argument may
 only be passed to the default const form.
+
+The induction binding of a range `for` loop is always immutable and is controlled
+by the loop. It is written without `const`; `mut` is not permitted for this
+binding.
 
 Reference return types are also const by default. Returning mutable access is
 explicit with `mut`:

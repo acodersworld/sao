@@ -196,6 +196,10 @@ define_token_kinds! {
     #[token(";")] Semicolon,
     // Separates a name from its type or field initializer context.
     #[token(":")] Colon,
+    // Separates the bounds of an exclusive range in a `for` header.
+    #[token("..")] DotDot,
+    // Separates the bounds of an inclusive range in a `for` header.
+    #[token("..=")] DotDotEqual,
     // Selects a member from a value.
     #[token(".")] Dot,
     // Introduces a function's return type.
@@ -686,7 +690,7 @@ mod tests {
     #[test]
     fn lexes_punctuation_and_operators_with_longest_match() {
         let source = concat!(
-            "( ) { } [ ] , ; : . -> ? ",
+            "( ) { } [ ] , ; : . .. ..= -> ? ",
             "= + - * / % ! & | ^ ~ && || << >> == != < <= > >= ",
             "+= -= *= /= %= &= |= ^= <<= >>=",
         );
@@ -704,6 +708,8 @@ mod tests {
                 TokenKind::Semicolon,
                 TokenKind::Colon,
                 TokenKind::Dot,
+                TokenKind::DotDot,
+                TokenKind::DotDotEqual,
                 TokenKind::Arrow,
                 TokenKind::Question,
                 TokenKind::Assign,
@@ -758,6 +764,28 @@ mod tests {
                 TokenKind::Dot,
                 TokenKind::IntegerLiteral,
                 TokenKind::IntegerLiteral,
+                TokenKind::Dot,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn distinguishes_ranges_from_members_and_decimal_numbers() {
+        assert_eq!(
+            kinds("0..10 0..=10 value.member 1.0 ..."),
+            vec![
+                TokenKind::IntegerLiteral,
+                TokenKind::DotDot,
+                TokenKind::IntegerLiteral,
+                TokenKind::IntegerLiteral,
+                TokenKind::DotDotEqual,
+                TokenKind::IntegerLiteral,
+                TokenKind::Identifier,
+                TokenKind::Dot,
+                TokenKind::Identifier,
+                TokenKind::FloatLiteral,
+                TokenKind::DotDot,
                 TokenKind::Dot,
                 TokenKind::Eof,
             ]

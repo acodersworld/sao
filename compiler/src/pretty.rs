@@ -234,6 +234,33 @@ fn format_expression_into(
                 line(output, depth + 2, format_args!("(none)"));
             }
         }
+        ExpressionKind::RangeFor {
+            binding,
+            start,
+            end,
+            inclusivity,
+            body,
+            else_branch,
+        } => {
+            line(
+                output,
+                depth,
+                format_args!(
+                    "RangeFor {inclusivity:?} {:?} {}",
+                    text(source, *binding),
+                    location(span)
+                ),
+            );
+            child_expression(output, source, "start", start, depth);
+            child_expression(output, source, "end", end, depth);
+            child_block(output, source, "body", body, depth);
+            line(output, depth + 1, format_args!("else_branch:"));
+            if let Some(else_branch) = else_branch {
+                format_block_into(output, source, else_branch, depth + 2);
+            } else {
+                line(output, depth + 2, format_args!("(none)"));
+            }
+        }
         ExpressionKind::Lambda {
             parameters,
             return_type,
@@ -642,6 +669,28 @@ mod tests {
         assert_eq!(
             format_expression(source, &expression),
             "While @ 0..25\n  condition:\n    Identifier \"ready\" @ 6..11\n  body:\n    Block @ 12..14\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    Block @ 20..25\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 22..23"
+        );
+    }
+
+    #[test]
+    fn formats_exclusive_range_for_loops() {
+        let source = "for i in 0..10 {}";
+        let expression = parse_expression(Lexer::new(source)).expect("range loop should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "RangeFor Exclusive \"i\" @ 0..17\n  start:\n    Literal Integer \"0\" @ 9..10\n  end:\n    Literal Integer \"10\" @ 12..14\n  body:\n    Block @ 15..17\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    (none)"
+        );
+    }
+
+    #[test]
+    fn formats_inclusive_range_for_loops_with_else_blocks() {
+        let source = "for i in 0..=1 {} else { 2 }";
+        let expression = parse_expression(Lexer::new(source)).expect("range loop should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "RangeFor Inclusive \"i\" @ 0..28\n  start:\n    Literal Integer \"0\" @ 9..10\n  end:\n    Literal Integer \"1\" @ 13..14\n  body:\n    Block @ 15..17\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    Block @ 23..28\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 25..26"
         );
     }
 
