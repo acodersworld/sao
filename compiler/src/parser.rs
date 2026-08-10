@@ -552,20 +552,42 @@ where
             }
 
             self.advance()?;
-            let right = self.expression(binding_power.right_binding_power)?;
-            let span = Span::new(left.span.start, right.span.end);
-
-            let kind = match binding_power.operator {
-                InfixOperator::Binary(operator) => ExpressionKind::Binary {
-                    left: Box::new(left),
-                    operator,
-                    right: Box::new(right),
-                },
-                InfixOperator::Assignment(operator) => ExpressionKind::Assignment {
-                    target: Box::new(left),
-                    operator,
-                    value: Box::new(right),
-                },
+            let (kind, span) = match binding_power.operator {
+                InfixOperator::Binary(operator) => {
+                    let right = self.expression(binding_power.right_binding_power)?;
+                    let span = Span::new(left.span.start, right.span.end);
+                    (
+                        ExpressionKind::Binary {
+                            left: Box::new(left),
+                            operator,
+                            right: Box::new(right),
+                        },
+                        span,
+                    )
+                }
+                InfixOperator::Assignment(operator) => {
+                    let right = self.expression(binding_power.right_binding_power)?;
+                    let span = Span::new(left.span.start, right.span.end);
+                    (
+                        ExpressionKind::Assignment {
+                            target: Box::new(left),
+                            operator,
+                            value: Box::new(right),
+                        },
+                        span,
+                    )
+                }
+                InfixOperator::TypeTest => {
+                    let type_syntax = self.type_expression()?;
+                    let span = Span::new(left.span.start, type_syntax.span.end);
+                    (
+                        ExpressionKind::TypeTest {
+                            value: Box::new(left),
+                            type_syntax,
+                        },
+                        span,
+                    )
+                }
             };
 
             left = Expression::new(kind, span);
@@ -963,6 +985,7 @@ const fn prefix_binding_power(kind: TokenKind) -> u8 {
 enum InfixOperator {
     Binary(BinaryOperator),
     Assignment(AssignmentOperator),
+    TypeTest,
 }
 
 struct InfixBindingPower {
@@ -1088,6 +1111,10 @@ const fn infix_binding_power(kind: TokenKind) -> Option<InfixBindingPower> {
         TokenKind::GreaterEqual => Some(InfixBindingPower::binary(
             RELATIONAL_BINDING_POWER,
             BinaryOperator::GreaterEqual,
+        )),
+        TokenKind::Is => Some(InfixBindingPower::left_associative(
+            RELATIONAL_BINDING_POWER,
+            InfixOperator::TypeTest,
         )),
         TokenKind::ShiftLeft => Some(InfixBindingPower::binary(
             SHIFT_BINDING_POWER,
@@ -2508,6 +2535,119 @@ mod tests {
             };
 
             assert_eq!(operator, expected, "incorrect operator for {source}");
+        }
+    }
+
+    #[test]
+    fn parses_type_test_expressions() {
+        let expression = parse("value is int").expect("type test should parse");
+
+        assert_eq!(expression.span, Span::new(0, 12));
+        let ExpressionKind::TypeTest { value, type_syntax } = expression.kind else {
+            panic!("expected a type test");
+        };
+        assert_eq!(value.span, Span::new(0, 5));
+        assert!(matches!(value.kind, ExpressionKind::Identifier));
+        assert_eq!(
+            type_syntax,
+            TypeSyntax::new(TypeKind::Primitive(PrimitiveType::Int), Span::new(9, 12),)
+        );
+
+        let expression =
+            parse("result is Error<string> | none").expect("union type test should parse");
+        let ExpressionKind::TypeTest { type_syntax, .. } = expression.kind else {
+            panic!("expected a type test");
+        };
+        assert_eq!(type_syntax.span, Span::new(10, 30));
+        assert!(matches!(type_syntax.kind, TypeKind::Union { .. }));
+    }
+
+    #[test]
+    fn type_tests_use_relational_precedence() {
+        let expression =
+            parse("value + 1 is int == true").expect("composed type test should parse");
+        let ExpressionKind::Binary {
+            left,
+            operator: BinaryOperator::Equal,
+            right,
+        } = expression.kind
+        else {
+            panic!("expected equality at the root");
+        };
+        assert!(matches!(
+            right.kind,
+            ExpressionKind::Literal(LiteralKind::Boolean(true))
+        ));
+        let ExpressionKind::TypeTest { value, type_syntax } = left.kind else {
+            panic!("expected a type test before equality");
+        };
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+        assert_eq!(type_syntax.span, Span::new(13, 16));
+
+        let expression = parse("service.read() is bytes").expect("postfix operand should parse");
+        let ExpressionKind::TypeTest { value, .. } = expression.kind else {
+            panic!("expected a type test");
+        };
+        assert!(matches!(value.kind, ExpressionKind::Call { .. }));
+        assert_eq!(value.span, Span::new(0, 14));
+    }
+
+    #[test]
+    fn type_tests_parse_in_conditional_conditions() {
+        let expression = parse("if value is int { value }").expect("conditional should parse");
+        let ExpressionKind::If { condition, .. } = expression.kind else {
+            panic!("expected a conditional");
+        };
+        assert!(matches!(condition.kind, ExpressionKind::TypeTest { .. }));
+        assert_eq!(condition.span, Span::new(3, 15));
+    }
+
+    #[test]
+    fn reports_missing_and_trailing_type_test_syntax() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "value is",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::Eof,
+                },
+                Span::new(8, 8),
+            ),
+            (
+                "value is + 1",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::Plus,
+                },
+                Span::new(9, 10),
+            ),
+            (
+                "value is int |",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::Eof,
+                },
+                Span::new(14, 14),
+            ),
+            (
+                "value is int trailing",
+                ParseErrorKind::UnexpectedToken {
+                    found: TokenKind::Identifier,
+                },
+                Span::new(13, 21),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
         }
     }
 

@@ -251,6 +251,11 @@ fn format_expression_into(
             line(output, depth, format_args!("Try {}", location(span)));
             child_expression(output, source, "expression", inner, depth);
         }
+        ExpressionKind::TypeTest { value, type_syntax } => {
+            line(output, depth, format_args!("TypeTest {}", location(span)));
+            child_expression(output, source, "value", value, depth);
+            child_type(output, source, "type", type_syntax, depth);
+        }
         ExpressionKind::Unary { operator, operand } => {
             line(
                 output,
@@ -482,6 +487,17 @@ mod tests {
         assert_eq!(
             format_expression(source, &expression),
             "Binary Add @ 0..9\n  left:\n    Literal Integer \"1\" @ 0..1\n  right:\n    Identifier \"value\" @ 4..9"
+        );
+    }
+
+    #[test]
+    fn formats_type_test_expressions() {
+        let source = "result is Error<string> | none";
+        let expression = parse_expression(Lexer::new(source)).expect("type test should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "TypeTest @ 0..30\n  value:\n    Identifier \"result\" @ 0..6\n  type:\n    Union @ 10..30\n      members:\n        [0]:\n          Named \"Error\" @ 10..23\n            arguments:\n              [0]:\n                Primitive String @ 16..22\n        [1]:\n          Primitive None @ 26..30"
         );
     }
 

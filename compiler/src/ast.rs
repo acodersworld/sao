@@ -234,6 +234,10 @@ pub enum ExpressionKind {
     Try {
         expression: Box<Expression>,
     },
+    TypeTest {
+        value: Box<Expression>,
+        type_syntax: TypeSyntax,
+    },
     Unary {
         operator: UnaryOperator,
         operand: Box<Expression>,
