@@ -149,6 +149,8 @@ where
         match self.current()?.kind {
             TokenKind::Const => self.binding_statement(BindingMutability::Const),
             TokenKind::Mut => self.binding_statement(BindingMutability::Mut),
+            TokenKind::Break => self.break_statement(),
+            TokenKind::Continue => self.continue_statement(),
             _ => self.expression_statement(),
         }
     }
@@ -192,6 +194,40 @@ where
             Span::new(expression.span.start, semicolon.span.end)
         };
         Ok(Statement::new(StatementKind::Expression(expression), span))
+    }
+
+    fn break_statement(&mut self) -> ParseResult<Statement> {
+        let keyword = self.expect(TokenKind::Break)?;
+        let token = self.current()?;
+        let value = match token.kind {
+            TokenKind::Semicolon => None,
+            TokenKind::Eof | TokenKind::RightBrace => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::ExpectedToken {
+                        expected: TokenKind::Semicolon,
+                        found: token.kind,
+                    },
+                    span: token.span,
+                }
+                .into());
+            }
+            _ => Some(self.expression(LOWEST_BINDING_POWER)?),
+        };
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+
+        Ok(Statement::new(
+            StatementKind::Break(value),
+            Span::new(keyword.span.start, semicolon.span.end),
+        ))
+    }
+
+    fn continue_statement(&mut self) -> ParseResult<Statement> {
+        let keyword = self.expect(TokenKind::Continue)?;
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+        Ok(Statement::new(
+            StatementKind::Continue,
+            Span::new(keyword.span.start, semicolon.span.end),
+        ))
     }
 
     fn type_expression(&mut self) -> ParseResult<TypeSyntax> {
@@ -550,6 +586,8 @@ where
             TokenKind::LeftParen => self.group(),
             TokenKind::LeftBrace => self.block_expression(),
             TokenKind::If => self.conditional(),
+            TokenKind::Loop => self.loop_expression(),
+            TokenKind::While => self.while_expression(),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
             TokenKind::IntegerLiteral => self.literal(LiteralKind::Integer),
@@ -609,6 +647,12 @@ where
                 }
                 TokenKind::Mut => {
                     statements.push(self.binding_statement(BindingMutability::Mut)?);
+                }
+                TokenKind::Break => {
+                    statements.push(self.break_statement()?);
+                }
+                TokenKind::Continue => {
+                    statements.push(self.continue_statement()?);
                 }
                 _ => {
                     let expression = self.expression(LOWEST_BINDING_POWER)?;
@@ -690,6 +734,37 @@ where
         ))
     }
 
+    fn loop_expression(&mut self) -> ParseResult {
+        let keyword = self.expect(TokenKind::Loop)?;
+        let body = self.block()?;
+        let span = Span::new(keyword.span.start, body.span.end);
+        Ok(Expression::new(ExpressionKind::Loop { body }, span))
+    }
+
+    fn while_expression(&mut self) -> ParseResult {
+        let keyword = self.expect(TokenKind::While)?;
+        let condition = self.expression(LOWEST_BINDING_POWER)?;
+        let body = self.block()?;
+        let else_branch = if self.current()?.kind == TokenKind::Else {
+            self.advance()?;
+            Some(self.block()?)
+        } else {
+            None
+        };
+        let end = else_branch
+            .as_ref()
+            .map_or(body.span.end, |branch| branch.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::While {
+                condition: Box::new(condition),
+                body,
+                else_branch,
+            },
+            Span::new(keyword.span.start, end),
+        ))
+    }
+
     fn primary(&mut self, kind: ExpressionKind) -> ParseResult {
         let token = self.advance()?;
         Ok(Expression::new(kind, token.span))
@@ -751,7 +826,10 @@ where
 fn expression_may_omit_statement_semicolon(expression: &Expression) -> bool {
     matches!(
         &expression.kind,
-        ExpressionKind::Block(_) | ExpressionKind::If { .. }
+        ExpressionKind::Block(_)
+            | ExpressionKind::If { .. }
+            | ExpressionKind::Loop { .. }
+            | ExpressionKind::While { .. }
     )
 }
 
@@ -1386,6 +1464,314 @@ mod tests {
                 "incorrect diagnostic for {source}",
             );
         }
+    }
+
+    #[test]
+    fn parses_bare_and_value_bearing_break_statements() {
+        assert_eq!(
+            parse_statement_source("break;"),
+            Ok(Statement::new(StatementKind::Break(None), Span::new(0, 6),))
+        );
+
+        let statement =
+            parse_statement_source("break value + 1;").expect("valued break should parse");
+        let StatementKind::Break(Some(value)) = statement.kind else {
+            panic!("expected a value-bearing break");
+        };
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+        assert_eq!(value.span, Span::new(6, 15));
+        assert_eq!(statement.span, Span::new(0, 16));
+    }
+
+    #[test]
+    fn parses_continue_statements() {
+        assert_eq!(
+            parse_statement_source("continue;"),
+            Ok(Statement::new(StatementKind::Continue, Span::new(0, 9)))
+        );
+    }
+
+    #[test]
+    fn parses_infinite_loops() {
+        let expression = parse("loop {}").expect("infinite loop should parse");
+        let ExpressionKind::Loop { body } = expression.kind else {
+            panic!("expected an infinite loop");
+        };
+
+        assert_eq!(body, Block::new(Vec::new(), None, Span::new(5, 7)));
+        assert_eq!(expression.span, Span::new(0, 7));
+
+        let expression = parse("loop { break 42; }").expect("loop with break should parse");
+        let ExpressionKind::Loop { body } = expression.kind else {
+            panic!("expected an infinite loop");
+        };
+        assert_eq!(body.statements.len(), 1);
+        assert_eq!(body.statements[0].span, Span::new(7, 16));
+        assert!(matches!(
+            &body.statements[0].kind,
+            StatementKind::Break(Some(Expression {
+                kind: ExpressionKind::Literal(LiteralKind::Integer),
+                ..
+            }))
+        ));
+        assert!(body.value.is_none());
+        assert_eq!(expression.span, Span::new(0, 18));
+    }
+
+    #[test]
+    fn parses_while_loops_with_and_without_else_blocks() {
+        let expression = parse("while ready { continue; }").expect("while loop should parse");
+        let ExpressionKind::While {
+            condition,
+            body,
+            else_branch,
+        } = expression.kind
+        else {
+            panic!("expected a while loop");
+        };
+
+        assert!(matches!(&condition.kind, ExpressionKind::Identifier));
+        assert_eq!(condition.span, Span::new(6, 11));
+        assert_eq!(body.span, Span::new(12, 25));
+        assert!(matches!(&body.statements[0].kind, StatementKind::Continue));
+        assert_eq!(else_branch, None);
+        assert_eq!(expression.span, Span::new(0, 25));
+
+        let source = "while ready {} else { 2 }";
+        let expression = parse(source).expect("while-else should parse");
+        let ExpressionKind::While {
+            body,
+            else_branch: Some(else_branch),
+            ..
+        } = expression.kind
+        else {
+            panic!("expected a while loop with an else block");
+        };
+        assert_eq!(body.span, Span::new(12, 14));
+        assert_eq!(else_branch.span, Span::new(20, 25));
+        assert_eq!(expression.span, Span::new(0, source.len()));
+    }
+
+    #[test]
+    fn while_conditions_reuse_expression_precedence() {
+        let expression = parse("while a || b && c {}").expect("while loop should parse");
+        let ExpressionKind::While { condition, .. } = expression.kind else {
+            panic!("expected a while loop");
+        };
+        let ExpressionKind::Binary {
+            operator: BinaryOperator::LogicalOr,
+            right,
+            ..
+        } = condition.kind
+        else {
+            panic!("expected logical OR at the condition root");
+        };
+        assert!(matches!(
+            right.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::LogicalAnd,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn loop_transfers_nest_inside_conditionals() {
+        let expression = parse("loop { if ready { break 1; } continue; }")
+            .expect("loop with nested transfers should parse");
+        let ExpressionKind::Loop { body } = expression.kind else {
+            panic!("expected an infinite loop");
+        };
+
+        assert_eq!(body.statements.len(), 2);
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::If { then_branch, .. },
+            ..
+        }) = &body.statements[0].kind
+        else {
+            panic!("expected an implicit conditional statement");
+        };
+        assert!(matches!(
+            &then_branch.statements[0].kind,
+            StatementKind::Break(Some(_))
+        ));
+        assert!(matches!(&body.statements[1].kind, StatementKind::Continue));
+    }
+
+    #[test]
+    fn loops_compose_with_postfix_and_infix_expressions() {
+        let expression = parse("loop {}().member").expect("postfix loop should parse");
+        let ExpressionKind::MemberAccess { object, .. } = expression.kind else {
+            panic!("expected member access");
+        };
+        let ExpressionKind::Call { callee, .. } = object.kind else {
+            panic!("expected a call before member access");
+        };
+        assert!(matches!(callee.kind, ExpressionKind::Loop { .. }));
+
+        let expression =
+            parse("1 + while ready { 2 } else { 3 }").expect("infix while loop should parse");
+        let ExpressionKind::Binary { right, .. } = expression.kind else {
+            panic!("expected a binary expression");
+        };
+        assert!(matches!(right.kind, ExpressionKind::While { .. }));
+    }
+
+    #[test]
+    fn loops_follow_block_like_statement_rules() {
+        for source in ["loop {}", "while true {}"] {
+            let statement =
+                parse_statement_source(source).expect("block-like statement should parse");
+            let StatementKind::Expression(expression) = statement.kind else {
+                panic!("expected an expression statement");
+            };
+            assert!(expression_may_omit_statement_semicolon(&expression));
+            assert_eq!(statement.span, expression.span);
+        }
+
+        let expression = parse("{ loop {} value }").expect("implicit loop statement should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert_eq!(block.statements.len(), 1);
+        assert!(matches!(
+            &block.statements[0].kind,
+            StatementKind::Expression(Expression {
+                kind: ExpressionKind::Loop { .. },
+                ..
+            })
+        ));
+        assert!(block.value.is_some());
+
+        let expression = parse("{ while true {} }").expect("while value should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert!(block.statements.is_empty());
+        assert!(matches!(
+            block.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::While { .. },
+                ..
+            })
+        ));
+
+        let expression = parse("{ loop {}; }").expect("discarded loop should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected an outer block");
+        };
+        assert_eq!(block.statements.len(), 1);
+        assert!(block.value.is_none());
+        assert_eq!(block.statements[0].span, Span::new(2, 10));
+    }
+
+    #[test]
+    fn reports_malformed_loops_and_transfers() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "loop",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(4, 4),
+            ),
+            (
+                "while",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Eof,
+                },
+                Span::new(5, 5),
+            ),
+            (
+                "while true",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(10, 10),
+            ),
+            (
+                "while true {} else value",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Identifier,
+                },
+                Span::new(19, 24),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+
+        for (source, expected_kind, expected_span) in [
+            (
+                "break",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::Eof,
+                },
+                Span::new(5, 5),
+            ),
+            (
+                "continue",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::Eof,
+                },
+                Span::new(8, 8),
+            ),
+            (
+                "continue value;",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::Identifier,
+                },
+                Span::new(9, 14),
+            ),
+        ] {
+            assert_eq!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+
+        assert_eq!(
+            parse("loop {} else {}"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::UnexpectedToken {
+                    found: TokenKind::Else,
+                },
+                span: Span::new(8, 12),
+            }))
+        );
+
+        assert_eq!(
+            parse("{ break }"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::RightBrace,
+                },
+                span: Span::new(8, 9),
+            }))
+        );
     }
 
     #[test]

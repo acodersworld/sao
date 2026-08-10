@@ -65,6 +65,13 @@ fn format_statement_into(output: &mut String, source: &str, statement: &Statemen
             );
             child_expression(output, source, "expression", expression, depth);
         }
+        StatementKind::Break(value) => {
+            line(output, depth, format_args!("Break {}", location(span)));
+            optional_expression(output, source, "value", value.as_ref(), depth);
+        }
+        StatementKind::Continue => {
+            line(output, depth, format_args!("Continue {}", location(span)));
+        }
     }
 }
 
@@ -114,6 +121,25 @@ fn format_expression_into(
                     format_expression_into(output, source, conditional, depth + 2);
                 }
                 None => line(output, depth + 2, format_args!("(none)")),
+            }
+        }
+        ExpressionKind::Loop { body } => {
+            line(output, depth, format_args!("Loop {}", location(span)));
+            child_block(output, source, "body", body, depth);
+        }
+        ExpressionKind::While {
+            condition,
+            body,
+            else_branch,
+        } => {
+            line(output, depth, format_args!("While {}", location(span)));
+            child_expression(output, source, "condition", condition, depth);
+            child_block(output, source, "body", body, depth);
+            line(output, depth + 1, format_args!("else_branch:"));
+            if let Some(else_branch) = else_branch {
+                format_block_into(output, source, else_branch, depth + 2);
+            } else {
+                line(output, depth + 2, format_args!("(none)"));
             }
         }
         ExpressionKind::Call { callee, arguments } => {
@@ -203,6 +229,21 @@ fn child_expression(
 ) {
     line(output, depth + 1, format_args!("{label}:"));
     format_expression_into(output, source, expression, depth + 2);
+}
+
+fn optional_expression(
+    output: &mut String,
+    source: &str,
+    label: &str,
+    expression: Option<&Expression>,
+    depth: usize,
+) {
+    line(output, depth + 1, format_args!("{label}:"));
+    if let Some(expression) = expression {
+        format_expression_into(output, source, expression, depth + 2);
+    } else {
+        line(output, depth + 2, format_args!("(none)"));
+    }
 }
 
 fn child_block(output: &mut String, source: &str, label: &str, block: &Block, depth: usize) {
@@ -447,6 +488,42 @@ mod tests {
         assert_eq!(
             format_expression(source, &expression),
             "If @ 0..20\n  condition:\n    Identifier \"a\" @ 3..4\n  then_branch:\n    Block @ 5..7\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    If @ 13..20\n      condition:\n        Identifier \"b\" @ 16..17\n      then_branch:\n        Block @ 18..20\n          statements:\n            (empty)\n          value:\n            (none)\n      else_branch:\n        (none)"
+        );
+    }
+
+    #[test]
+    fn formats_break_and_continue_statements() {
+        let source = "break value + 1;";
+        let statement = parse_statement(Lexer::new(source)).expect("break should parse");
+        assert_eq!(
+            format_statement(source, &statement),
+            "Break @ 0..16\n  value:\n    Binary Add @ 6..15\n      left:\n        Identifier \"value\" @ 6..11\n      right:\n        Literal Integer \"1\" @ 14..15"
+        );
+
+        let source = "continue;";
+        let statement = parse_statement(Lexer::new(source)).expect("continue should parse");
+        assert_eq!(format_statement(source, &statement), "Continue @ 0..9");
+    }
+
+    #[test]
+    fn formats_infinite_loops() {
+        let source = "loop { break 42; }";
+        let expression = parse_expression(Lexer::new(source)).expect("loop should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "Loop @ 0..18\n  body:\n    Block @ 5..18\n      statements:\n        [0]:\n          Break @ 7..16\n            value:\n              Literal Integer \"42\" @ 13..15\n      value:\n        (none)"
+        );
+    }
+
+    #[test]
+    fn formats_while_loops_with_else_blocks() {
+        let source = "while ready {} else { 2 }";
+        let expression = parse_expression(Lexer::new(source)).expect("while loop should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "While @ 0..25\n  condition:\n    Identifier \"ready\" @ 6..11\n  body:\n    Block @ 12..14\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    Block @ 20..25\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 22..23"
         );
     }
 }

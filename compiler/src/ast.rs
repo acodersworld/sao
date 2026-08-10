@@ -84,6 +84,8 @@ pub enum StatementKind {
         initializer: Expression,
     },
     Expression(Expression),
+    Break(Option<Expression>),
+    Continue,
 }
 
 /// Whether a local binding was introduced with `const` or `mut`.
@@ -142,6 +144,14 @@ pub enum ExpressionKind {
         condition: Box<Expression>,
         then_branch: Block,
         else_branch: Option<ConditionalElse>,
+    },
+    Loop {
+        body: Block,
+    },
+    While {
+        condition: Box<Expression>,
+        body: Block,
+        else_branch: Option<Block>,
     },
     Call {
         callee: Box<Expression>,
