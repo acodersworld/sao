@@ -95,7 +95,7 @@ impl Function {
     }
 }
 
-/// A parameter in a named function declaration.
+/// A parameter in a named function declaration or lambda expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionParameter {
     pub mutability: BindingMutability,
@@ -118,7 +118,7 @@ impl FunctionParameter {
     }
 }
 
-/// The syntactic form of a named-function parameter.
+/// The syntactic form of a function parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionParameterKind {
     Named {
@@ -218,6 +218,13 @@ pub enum ExpressionKind {
         condition: Box<Expression>,
         body: Block,
         else_branch: Option<Block>,
+    },
+    Lambda {
+        /// Lambda parameters are always [`FunctionParameterKind::Named`].
+        parameters: Vec<FunctionParameter>,
+        /// An explicit return annotation. Its absence defaults to unit.
+        return_type: Option<TypeSyntax>,
+        body: Block,
     },
     Call {
         callee: Box<Expression>,

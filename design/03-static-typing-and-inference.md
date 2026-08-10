@@ -324,8 +324,9 @@ Current inference boundary:
 - A named function may omit its return annotation, which defaults to `()`.
 - A named function returning any other type must annotate it explicitly;
   return types are never inferred from the body.
-- Lambda parameter and return types are explicit in the lambda expression;
-  contextual lambda signature inference is deferred.
+- Lambda parameter types are explicit. A lambda may omit its return annotation,
+  which defaults to `()`; lambda return types are not inferred from the body.
+- Contextual lambda signature inference is deferred.
 - User-defined generic declarations and general-purpose generic inference are
   not part of the initial language. Built-in parameterized types such as
   `Error<T>` have their own limited inference rules.

@@ -92,17 +92,12 @@ fn format_function_into(output: &mut String, source: &str, function: &Function, 
             location(function.span)
         ),
     );
-    function_parameter_list(output, source, &function.parameters, depth);
-    line(output, depth + 1, format_args!("return_type:"));
-    if let Some(return_type) = &function.return_type {
-        format_type_into(output, source, return_type, depth + 2);
-    } else {
-        line(output, depth + 2, format_args!("(default ())"));
-    }
+    parameter_list(output, source, &function.parameters, depth);
+    optional_return_type(output, source, function.return_type.as_ref(), depth);
     child_block(output, source, "body", &function.body, depth);
 }
 
-fn function_parameter_list(
+fn parameter_list(
     output: &mut String,
     source: &str,
     parameters: &[FunctionParameter],
@@ -117,11 +112,11 @@ fn function_parameter_list(
 
     for (index, parameter) in parameters.iter().enumerate() {
         line(output, depth + 2, format_args!("[{index}]:"));
-        format_function_parameter_into(output, source, parameter, depth + 3);
+        format_parameter_into(output, source, parameter, depth + 3);
     }
 }
 
-fn format_function_parameter_into(
+fn format_parameter_into(
     output: &mut String,
     source: &str,
     parameter: &FunctionParameter,
@@ -155,6 +150,20 @@ fn format_function_parameter_into(
                 ),
             );
         }
+    }
+}
+
+fn optional_return_type(
+    output: &mut String,
+    source: &str,
+    return_type: Option<&TypeSyntax>,
+    depth: usize,
+) {
+    line(output, depth + 1, format_args!("return_type:"));
+    if let Some(return_type) = return_type {
+        format_type_into(output, source, return_type, depth + 2);
+    } else {
+        line(output, depth + 2, format_args!("(default ())"));
     }
 }
 
@@ -224,6 +233,16 @@ fn format_expression_into(
             } else {
                 line(output, depth + 2, format_args!("(none)"));
             }
+        }
+        ExpressionKind::Lambda {
+            parameters,
+            return_type,
+            body,
+        } => {
+            line(output, depth, format_args!("Lambda {}", location(span)));
+            parameter_list(output, source, parameters, depth);
+            optional_return_type(output, source, return_type.as_ref(), depth);
+            child_block(output, source, "body", body, depth);
         }
         ExpressionKind::Call { callee, arguments } => {
             line(output, depth, format_args!("Call {}", location(span)));
@@ -623,6 +642,28 @@ mod tests {
         assert_eq!(
             format_expression(source, &expression),
             "While @ 0..25\n  condition:\n    Identifier \"ready\" @ 6..11\n  body:\n    Block @ 12..14\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    Block @ 20..25\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 22..23"
+        );
+    }
+
+    #[test]
+    fn formats_default_unit_lambdas() {
+        let source = "lambda() {}";
+        let expression = parse_expression(Lexer::new(source)).expect("lambda should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "Lambda @ 0..11\n  parameters:\n    (empty)\n  return_type:\n    (default ())\n  body:\n    Block @ 9..11\n      statements:\n        (empty)\n      value:\n        (none)"
+        );
+    }
+
+    #[test]
+    fn formats_value_returning_lambdas() {
+        let source = "lambda(value: int) -> int { value }";
+        let expression = parse_expression(Lexer::new(source)).expect("lambda should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "Lambda @ 0..35\n  parameters:\n    [0]:\n      Parameter Const \"value\" @ 7..17\n        type:\n          Primitive Int @ 14..17\n  return_type:\n    Primitive Int @ 22..25\n  body:\n    Block @ 26..35\n      statements:\n        (empty)\n      value:\n        Identifier \"value\" @ 28..33"
         );
     }
 

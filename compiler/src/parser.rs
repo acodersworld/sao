@@ -160,12 +160,22 @@ where
     fn function_statement(&mut self) -> ParseResult<Statement> {
         let keyword = self.expect(TokenKind::Fn)?;
         let name = self.expect(TokenKind::Identifier)?;
+        let parameters = self.function_parameters(true)?;
+        let return_type = self.optional_return_type()?;
+        let body = self.block()?;
+        let span = Span::new(keyword.span.start, body.span.end);
+        let function = Function::new(name.span, parameters, return_type, body, span);
+
+        Ok(Statement::new(StatementKind::Function(function), span))
+    }
+
+    fn function_parameters(&mut self, allow_receiver: bool) -> ParseResult<Vec<FunctionParameter>> {
         self.expect(TokenKind::LeftParen)?;
         let mut parameters = Vec::new();
 
         if self.current()?.kind != TokenKind::RightParen {
             loop {
-                parameters.push(self.function_parameter()?);
+                parameters.push(self.function_parameter(allow_receiver)?);
 
                 if self.current()?.kind != TokenKind::Comma {
                     break;
@@ -180,20 +190,19 @@ where
         }
 
         self.expect(TokenKind::RightParen)?;
-        let return_type = if self.current()?.kind == TokenKind::Arrow {
-            self.advance()?;
-            Some(self.type_expression()?)
-        } else {
-            None
-        };
-        let body = self.block()?;
-        let span = Span::new(keyword.span.start, body.span.end);
-        let function = Function::new(name.span, parameters, return_type, body, span);
-
-        Ok(Statement::new(StatementKind::Function(function), span))
+        Ok(parameters)
     }
 
-    fn function_parameter(&mut self) -> ParseResult<FunctionParameter> {
+    fn optional_return_type(&mut self) -> ParseResult<Option<TypeSyntax>> {
+        if self.current()?.kind == TokenKind::Arrow {
+            self.advance()?;
+            Ok(Some(self.type_expression()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn function_parameter(&mut self, allow_receiver: bool) -> ParseResult<FunctionParameter> {
         let first = self.current()?;
         let (mutability, start) = if first.kind == TokenKind::Mut {
             self.advance()?;
@@ -203,7 +212,7 @@ where
         };
         let parameter = self.current()?;
 
-        if parameter.kind == TokenKind::SelfValue {
+        if allow_receiver && parameter.kind == TokenKind::SelfValue {
             let receiver = self.advance()?;
             return Ok(FunctionParameter::new(
                 mutability,
@@ -709,6 +718,7 @@ where
             TokenKind::If => self.conditional(),
             TokenKind::Loop => self.loop_expression(),
             TokenKind::While => self.while_expression(),
+            TokenKind::Lambda => self.lambda_expression(),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
             TokenKind::IntegerLiteral => self.literal(LiteralKind::Integer),
@@ -724,6 +734,23 @@ where
             }
             .into()),
         }
+    }
+
+    fn lambda_expression(&mut self) -> ParseResult {
+        let keyword = self.expect(TokenKind::Lambda)?;
+        let parameters = self.function_parameters(false)?;
+        let return_type = self.optional_return_type()?;
+        let body = self.block()?;
+        let span = Span::new(keyword.span.start, body.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::Lambda {
+                parameters,
+                return_type,
+                body,
+            },
+            span,
+        ))
     }
 
     fn group(&mut self) -> ParseResult {
@@ -1314,6 +1341,280 @@ mod tests {
                 span: Span { start: 45, end: 58 },
             })
         ));
+    }
+
+    #[test]
+    fn parses_empty_lambdas_with_default_unit_returns() {
+        let expression = parse("lambda() {}").expect("lambda should parse");
+
+        assert_eq!(expression.span, Span::new(0, 11));
+        let ExpressionKind::Lambda {
+            parameters,
+            return_type,
+            body,
+        } = expression.kind
+        else {
+            panic!("expected a lambda expression");
+        };
+        assert!(parameters.is_empty());
+        assert_eq!(return_type, None);
+        assert_eq!(body, Block::new(Vec::new(), None, Span::new(9, 11)));
+    }
+
+    #[test]
+    fn parses_typed_lambda_parameters_and_explicit_returns() {
+        let source = "lambda(value: int, mut output: Writer,) -> int { return value; }";
+        let expression = parse(source).expect("typed lambda should parse");
+        let ExpressionKind::Lambda {
+            parameters,
+            return_type,
+            body,
+        } = expression.kind
+        else {
+            panic!("expected a lambda expression");
+        };
+
+        assert_eq!(expression.span, Span::new(0, 64));
+        assert_eq!(parameters.len(), 2);
+        assert_eq!(parameters[0].mutability, BindingMutability::Const);
+        assert_eq!(parameters[0].span, Span::new(7, 17));
+        assert!(matches!(
+            &parameters[0].kind,
+            FunctionParameterKind::Named {
+                name: Span { start: 7, end: 12 },
+                type_annotation: TypeSyntax {
+                    kind: TypeKind::Primitive(PrimitiveType::Int),
+                    span: Span { start: 14, end: 17 },
+                },
+            }
+        ));
+        assert_eq!(parameters[1].mutability, BindingMutability::Mut);
+        assert_eq!(parameters[1].span, Span::new(19, 37));
+        assert!(matches!(
+            &parameters[1].kind,
+            FunctionParameterKind::Named {
+                name: Span { start: 23, end: 29 },
+                type_annotation: TypeSyntax {
+                    kind: TypeKind::Named {
+                        name: Span { start: 31, end: 37 },
+                        ..
+                    },
+                    span: Span { start: 31, end: 37 },
+                },
+            }
+        ));
+        assert!(matches!(
+            return_type,
+            Some(TypeSyntax {
+                kind: TypeKind::Primitive(PrimitiveType::Int),
+                span: Span { start: 43, end: 46 },
+            })
+        ));
+        assert_eq!(body.span, Span::new(47, 64));
+        assert_eq!(body.statements.len(), 1);
+        assert_eq!(body.statements[0].span, Span::new(49, 62));
+        assert!(matches!(
+            &body.statements[0].kind,
+            StatementKind::Return(Some(Expression {
+                kind: ExpressionKind::Identifier,
+                span: Span { start: 56, end: 61 },
+            }))
+        ));
+        assert!(body.value.is_none());
+    }
+
+    #[test]
+    fn lambdas_nest_and_parse_as_binding_initializers() {
+        let expression =
+            parse("lambda() -> fn() -> () { lambda() {} }").expect("nested lambda should parse");
+        let ExpressionKind::Lambda { body, .. } = expression.kind else {
+            panic!("expected an outer lambda");
+        };
+        assert!(matches!(
+            body.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::Lambda { .. },
+                ..
+            })
+        ));
+
+        let expression = parse("{ lambda(value: int) -> int { value + 1 } }")
+            .expect("lambda value should parse");
+        let ExpressionKind::Block(block) = expression.kind else {
+            panic!("expected a block expression");
+        };
+        assert!(block.statements.is_empty());
+        assert!(matches!(
+            block.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::Lambda { .. },
+                ..
+            })
+        ));
+
+        let statement =
+            parse_statement_source("const increment = lambda(value: int) -> int { value + 1 };")
+                .expect("lambda initializer should parse");
+        let StatementKind::Binding { initializer, .. } = statement.kind else {
+            panic!("expected a binding statement");
+        };
+        assert!(matches!(initializer.kind, ExpressionKind::Lambda { .. }));
+        assert_eq!(initializer.span, Span::new(18, 57));
+    }
+
+    #[test]
+    fn lambdas_compose_with_postfix_and_infix_expressions() {
+        let expression = parse("lambda(value: int) -> int { value }(1).member")
+            .expect("postfix lambda should parse");
+        let ExpressionKind::MemberAccess { object, .. } = expression.kind else {
+            panic!("expected member access");
+        };
+        let ExpressionKind::Call { callee, .. } = object.kind else {
+            panic!("expected a call before member access");
+        };
+        assert!(matches!(callee.kind, ExpressionKind::Lambda { .. }));
+        assert_eq!(callee.span, Span::new(0, 35));
+
+        let expression = parse("1 + lambda() -> int { 2 }()").expect("infix lambda should parse");
+        let ExpressionKind::Binary {
+            operator: BinaryOperator::Add,
+            right,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected addition at the root");
+        };
+        let ExpressionKind::Call { callee, .. } = right.kind else {
+            panic!("expected an immediately invoked lambda");
+        };
+        assert!(matches!(callee.kind, ExpressionKind::Lambda { .. }));
+    }
+
+    #[test]
+    fn discarded_lambdas_require_semicolons() {
+        let statement = parse_statement_source("lambda() {};")
+            .expect("semicolon-terminated lambda statement should parse");
+        let StatementKind::Expression(expression) = statement.kind else {
+            panic!("expected an expression statement");
+        };
+        assert!(matches!(expression.kind, ExpressionKind::Lambda { .. }));
+        assert_eq!(expression.span, Span::new(0, 11));
+        assert_eq!(statement.span, Span::new(0, 12));
+
+        assert_eq!(
+            parse_statement_source("lambda() {}"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::Eof,
+                },
+                span: Span::new(11, 11),
+            }))
+        );
+
+        assert_eq!(
+            parse("{ lambda() {} value }"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::Identifier,
+                },
+                span: Span::new(14, 19),
+            }))
+        );
+    }
+
+    #[test]
+    fn reports_malformed_lambda_expressions() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "lambda",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftParen,
+                    found: TokenKind::Eof,
+                },
+                Span::new(6, 6),
+            ),
+            (
+                "lambda(value) {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Colon,
+                    found: TokenKind::RightParen,
+                },
+                Span::new(12, 13),
+            ),
+            (
+                "lambda(: int) {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Colon,
+                },
+                Span::new(7, 8),
+            ),
+            (
+                "lambda(value:) {}",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::RightParen,
+                },
+                Span::new(13, 14),
+            ),
+            (
+                "lambda(value: int {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightParen,
+                    found: TokenKind::LeftBrace,
+                },
+                Span::new(18, 19),
+            ),
+            (
+                "lambda() -> {}",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::LeftBrace,
+                },
+                Span::new(12, 13),
+            ),
+            (
+                "lambda() -> int",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(15, 15),
+            ),
+            (
+                "lambda() {",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(10, 10),
+            ),
+            (
+                "lambda(self) {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::SelfValue,
+                },
+                Span::new(7, 11),
+            ),
+            (
+                "lambda(mut self) {}",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::SelfValue,
+                },
+                Span::new(11, 15),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
     }
 
     #[test]

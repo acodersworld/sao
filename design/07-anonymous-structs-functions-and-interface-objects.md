@@ -127,8 +127,9 @@ function.
 
 ## 7.4 Lambdas
 
-Lambdas are anonymous function expressions written with `lambda` and an
-explicit signature:
+Lambdas are anonymous function expressions written with `lambda`. Parameter
+types are explicit, while the return annotation may be omitted when it defaults
+to `()`:
 
 ```text
 const factor = 1.5;
@@ -137,6 +138,9 @@ const scale = lambda(value: float) -> float {
     value * factor
 };
 ```
+
+As with named functions, omitting `-> Type` means `-> ()`; the return type is
+not inferred from the body.
 
 The inferred callable type of `scale` is the single type
 `fn(float) -> float`. A function value contains both callable code and any
