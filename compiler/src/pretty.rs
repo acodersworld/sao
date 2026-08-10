@@ -1,8 +1,10 @@
 use std::fmt::{Arguments, Write};
 
 use crate::ast::{
-    Block, ConditionalElse, Declaration, Expression, ExpressionKind, Function, FunctionParameter,
-    FunctionParameterKind, Program, Statement, StatementKind, TypeKind, TypeSyntax,
+    AnonymousStructField, AnonymousStructMember, Block, ConditionalElse, Declaration, Expression,
+    ExpressionKind, Function, FunctionParameter, FunctionParameterKind, Program, Statement,
+    StatementKind, StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind,
+    TypeSyntax,
 };
 use crate::lexer::Span;
 
@@ -69,7 +71,58 @@ fn format_declaration_into(
 ) {
     match declaration {
         Declaration::Function(function) => format_function_into(output, source, function, depth),
+        Declaration::Struct(structure) => {
+            format_struct_declaration_into(output, source, structure, depth);
+        }
     }
+}
+
+fn format_struct_declaration_into(
+    output: &mut String,
+    source: &str,
+    structure: &StructDeclaration,
+    depth: usize,
+) {
+    line(
+        output,
+        depth,
+        format_args!(
+            "Struct {:?} {}",
+            text(source, structure.name),
+            location(structure.span)
+        ),
+    );
+    line(output, depth + 1, format_args!("members:"));
+
+    if structure.members.is_empty() {
+        line(output, depth + 2, format_args!("(empty)"));
+        return;
+    }
+
+    for (index, member) in structure.members.iter().enumerate() {
+        line(output, depth + 2, format_args!("[{index}]:"));
+        match member {
+            StructMember::Field(field) => {
+                format_struct_field_into(output, source, field, depth + 3);
+            }
+            StructMember::Method(method) => {
+                format_function_into(output, source, method, depth + 3);
+            }
+        }
+    }
+}
+
+fn format_struct_field_into(output: &mut String, source: &str, field: &StructField, depth: usize) {
+    line(
+        output,
+        depth,
+        format_args!(
+            "Field {:?} {}",
+            text(source, field.name),
+            location(field.span)
+        ),
+    );
+    child_type(output, source, "type", &field.type_annotation, depth);
 }
 
 fn format_statement_into(output: &mut String, source: &str, statement: &Statement, depth: usize) {
@@ -318,6 +371,26 @@ fn format_expression_into(
             );
             child_expression(output, source, "value", value, depth);
         }
+        ExpressionKind::StructConstruction { name, fields } => {
+            line(
+                output,
+                depth,
+                format_args!(
+                    "StructConstruction {:?} {}",
+                    text(source, *name),
+                    location(span)
+                ),
+            );
+            struct_initializer_list(output, source, fields, depth);
+        }
+        ExpressionKind::AnonymousStruct { members } => {
+            line(
+                output,
+                depth,
+                format_args!("AnonymousStruct {}", location(span)),
+            );
+            anonymous_struct_member_list(output, source, members, depth);
+        }
         ExpressionKind::Call { callee, arguments } => {
             line(output, depth, format_args!("Call {}", location(span)));
             child_expression(output, source, "callee", callee, depth);
@@ -384,6 +457,79 @@ fn format_expression_into(
             child_expression(output, source, "value", value, depth);
         }
     }
+}
+
+fn struct_initializer_list(
+    output: &mut String,
+    source: &str,
+    fields: &[StructFieldInitializer],
+    depth: usize,
+) {
+    line(output, depth + 1, format_args!("fields:"));
+    if fields.is_empty() {
+        line(output, depth + 2, format_args!("(empty)"));
+        return;
+    }
+
+    for (index, field) in fields.iter().enumerate() {
+        line(output, depth + 2, format_args!("[{index}]:"));
+        line(
+            output,
+            depth + 3,
+            format_args!(
+                "FieldInitializer {:?} {}",
+                text(source, field.name),
+                location(field.span)
+            ),
+        );
+        child_expression(output, source, "value", &field.value, depth + 3);
+    }
+}
+
+fn anonymous_struct_member_list(
+    output: &mut String,
+    source: &str,
+    members: &[AnonymousStructMember],
+    depth: usize,
+) {
+    line(output, depth + 1, format_args!("members:"));
+    if members.is_empty() {
+        line(output, depth + 2, format_args!("(empty)"));
+        return;
+    }
+
+    for (index, member) in members.iter().enumerate() {
+        line(output, depth + 2, format_args!("[{index}]:"));
+        match member {
+            AnonymousStructMember::Field(field) => {
+                format_anonymous_struct_field_into(output, source, field, depth + 3);
+            }
+            AnonymousStructMember::Method(method) => {
+                format_function_into(output, source, method, depth + 3);
+            }
+        }
+    }
+}
+
+fn format_anonymous_struct_field_into(
+    output: &mut String,
+    source: &str,
+    field: &AnonymousStructField,
+    depth: usize,
+) {
+    line(
+        output,
+        depth,
+        format_args!(
+            "Field {:?} {}",
+            text(source, field.name),
+            location(field.span)
+        ),
+    );
+    if let Some(type_annotation) = &field.type_annotation {
+        child_type(output, source, "type", type_annotation, depth);
+    }
+    child_expression(output, source, "initializer", &field.initializer, depth);
 }
 
 fn format_block_into(output: &mut String, source: &str, block: &Block, depth: usize) {
@@ -595,6 +741,19 @@ mod tests {
     }
 
     #[test]
+    fn formats_named_struct_declarations() {
+        let source = "struct Point { x: float, fn get_x(self) -> float { self.x } }";
+        let program = parse_program(Lexer::new(source)).expect("struct should parse");
+        let output = format_program(source, &program);
+
+        assert!(output.contains("Struct \"Point\" @ 0..61"));
+        assert!(output.contains("Field \"x\" @ 15..24"));
+        assert!(output.contains("Primitive Float @ 18..23"));
+        assert!(output.contains("Function \"get_x\" @ 25..59"));
+        assert!(output.contains("Parameter Const Self"));
+    }
+
+    #[test]
     fn formats_expression_structure_and_source_text() {
         let source = "1 + value";
         let expression = parse_expression(Lexer::new(source)).expect("expression should parse");
@@ -614,6 +773,27 @@ mod tests {
             format_expression(source, &expression),
             "PrimitiveConversion String @ 0..17\n  value:\n    Binary Add @ 7..16\n      left:\n        Identifier \"value\" @ 7..12\n      right:\n        Literal Integer \"1\" @ 15..16"
         );
+    }
+
+    #[test]
+    fn formats_named_and_anonymous_struct_expressions() {
+        let source = "Point { x: 1 + 2 }";
+        let expression = parse_expression(Lexer::new(source)).expect("construction should parse");
+        let output = format_expression(source, &expression);
+
+        assert!(output.starts_with("StructConstruction \"Point\" @ 0..18"));
+        assert!(output.contains("FieldInitializer \"x\" @ 8..16"));
+        assert!(output.contains("Binary Add @ 11..16"));
+
+        let source = "struct { value: int = 1; fn get(self) { self.value } }";
+        let expression =
+            parse_expression(Lexer::new(source)).expect("anonymous struct should parse");
+        let output = format_expression(source, &expression);
+
+        assert!(output.starts_with("AnonymousStruct @ 0..54"));
+        assert!(output.contains("Field \"value\" @ 9..24"));
+        assert!(output.contains("Literal Integer \"1\" @ 22..23"));
+        assert!(output.contains("Function \"get\" @ 25..52"));
     }
 
     #[test]

@@ -15,7 +15,8 @@ The parser currently supports:
 
 - Single-expression, single-type, single-statement, and whole-program entry
   points.
-- File-level programs containing ordered top-level function declarations.
+- File-level programs containing ordered top-level function and named struct
+  declarations.
 - Primitive, named, parameterized, mutable, grouped, callable, union, and
   intersection type syntax.
 - Literals, identifiers, `self`, grouping, and expression-oriented blocks.
@@ -23,6 +24,8 @@ The parser currently supports:
 - Calls, member access, indexing, and postfix error propagation with `?`.
 - Dedicated `int`, `float`, `bool`, `char`, and `string` conversion expressions
   with exactly one argument.
+- Named struct construction and unconstrained anonymous `struct { ... }`
+  expressions, including initialized fields and methods.
 - Immutable and mutable bindings.
 - Named and nested functions, method receivers, returns, and lambdas.
 - `if`/`else if`/`else`, `loop`, `while`, and integer range `for` expressions.
@@ -31,46 +34,46 @@ The parser currently supports:
 
 Range bounds use a deliberately restricted grammar. An unparenthesized bound may
 be a primary expression, a postfix chain, or unary negation. Infix, assignment,
-lambda, and block-like bounds must be parenthesized. For example:
+lambda, struct construction, and block-like bounds must be parenthesized. For
+example:
 
 ```text
 for index in -start..items.length() {}
 for index in (start + offset)..(if ready { limit } else { fallback }) {}
 ```
 
+Brace-based struct construction is also disabled directly in `if`, `while`,
+and range `for` heads so the following brace always begins the control-flow
+body. Parentheses re-enable it, as in `if (Position { x: 1.0, y: 2.0 }) {}`.
+
 ## Parser work queue
 
 Recommended implementation order:
 
-1. Struct declarations and construction
-   - Parse named struct declarations, fields, and methods.
-   - Parse named construction such as `Position { x: 1.0, y: 2.0 }`.
-   - Parse unconstrained anonymous `struct { ... }` expressions.
-
-2. Interface declarations and anonymous implementations
+1. Interface declarations and anonymous implementations
    - Parse semicolon-terminated interface method requirements.
    - Parse interface-constrained anonymous objects such as `Writer { ... }`.
-   - Define how brace-based construction is disambiguated in `if`, `while`, and
-     `for` heads.
+   - Reuse the struct-construction disambiguation rule: construction in `if`,
+     `while`, and range `for` heads must be parenthesized.
 
-3. `defer` statements
+2. `defer` statements
    - Add the AST and parser representation.
    - Enforce the call-only syntax `defer function_call();`.
 
-4. `co` coroutine calls
+3. `co` coroutine calls
    - Add the AST and parser representation.
    - Restrict the operand to a function or method call.
 
-5. Parameterized built-in construction
+4. Parameterized built-in construction
    - Support expression syntax such as `Queue<int>()` while retaining existing
      parameterized type parsing.
 
-6. Slicing syntax
+5. Slicing syntax
    - First settle the source syntax in the design documents.
    - The lexer and parser currently reserve `..` and `..=` for range `for`
      headers, although byte slicing semantics are mentioned in the design.
 
-7. Program-level syntax recovery
+6. Program-level syntax recovery
    - After whole-program parsing exists, synchronize after malformed declarations
      so one parse can report multiple useful syntax errors.
 

@@ -1,10 +1,11 @@
 use std::iter::Peekable;
 
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, BindingMutability, Block, ConditionalElse, Declaration,
-    Expression, ExpressionKind, Function, FunctionParameter, FunctionParameterKind, LiteralKind,
-    PrimitiveType, Program, RangeInclusivity, Statement, StatementKind, TypeKind, TypeSyntax,
-    UnaryOperator,
+    AnonymousStructField, AnonymousStructMember, AssignmentOperator, BinaryOperator,
+    BindingMutability, Block, ConditionalElse, Declaration, Expression, ExpressionKind, Function,
+    FunctionParameter, FunctionParameterKind, LiteralKind, PrimitiveType, Program,
+    RangeInclusivity, Statement, StatementKind, StructDeclaration, StructField,
+    StructFieldInitializer, StructMember, TypeKind, TypeSyntax, UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -23,6 +24,12 @@ pub enum ParseErrorKind {
         found: TokenKind,
     },
     ExpectedTopLevelDeclaration {
+        found: TokenKind,
+    },
+    ExpectedStructMember {
+        found: TokenKind,
+    },
+    ExpectedAnonymousStructMember {
         found: TokenKind,
     },
     RangeBoundRequiresGrouping,
@@ -81,7 +88,7 @@ where
     I: Iterator<Item = Result<Token, LexError>>,
 {
     let mut parser = Parser::new(tokens);
-    let expression = parser.expression(LOWEST_BINDING_POWER)?;
+    let expression = parser.expression(LOWEST_BINDING_POWER, true)?;
     let token = parser.current()?;
 
     if token.kind != TokenKind::Eof {
@@ -181,12 +188,52 @@ where
         let token = self.current()?;
         match token.kind {
             TokenKind::Fn => Ok(Declaration::Function(self.function()?)),
+            TokenKind::Struct => Ok(Declaration::Struct(self.struct_declaration()?)),
             _ => Err(ParseError {
                 kind: ParseErrorKind::ExpectedTopLevelDeclaration { found: token.kind },
                 span: token.span,
             }
             .into()),
         }
+    }
+
+    fn struct_declaration(&mut self) -> ParseResult<StructDeclaration> {
+        let keyword = self.expect(TokenKind::Struct)?;
+        let name = self.expect(TokenKind::Identifier)?;
+        self.expect(TokenKind::LeftBrace)?;
+        let mut members = Vec::new();
+
+        let right_brace = loop {
+            let token = self.current()?;
+            match token.kind {
+                TokenKind::RightBrace => break self.advance()?,
+                TokenKind::Eof => break self.expect(TokenKind::RightBrace)?,
+                TokenKind::Fn => members.push(StructMember::Method(self.function()?)),
+                TokenKind::Identifier => members.push(StructMember::Field(self.struct_field()?)),
+                _ => {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::ExpectedStructMember { found: token.kind },
+                        span: token.span,
+                    }
+                    .into());
+                }
+            }
+        };
+
+        Ok(StructDeclaration::new(
+            name.span,
+            members,
+            Span::new(keyword.span.start, right_brace.span.end),
+        ))
+    }
+
+    fn struct_field(&mut self) -> ParseResult<StructField> {
+        let name = self.expect(TokenKind::Identifier)?;
+        self.expect(TokenKind::Colon)?;
+        let type_annotation = self.type_expression()?;
+        let comma = self.expect(TokenKind::Comma)?;
+        let span = Span::new(name.span.start, comma.span.end);
+        Ok(StructField::new(name.span, type_annotation, span))
     }
 
     fn statement(&mut self) -> ParseResult<Statement> {
@@ -304,7 +351,7 @@ where
         };
 
         self.expect(TokenKind::Assign)?;
-        let initializer = self.expression(LOWEST_BINDING_POWER)?;
+        let initializer = self.expression(LOWEST_BINDING_POWER, true)?;
         let semicolon = self.expect(TokenKind::Semicolon)?;
 
         Ok(Statement::new(
@@ -319,7 +366,7 @@ where
     }
 
     fn expression_statement(&mut self) -> ParseResult<Statement> {
-        let expression = self.expression(LOWEST_BINDING_POWER)?;
+        let expression = self.expression(LOWEST_BINDING_POWER, true)?;
         let span = if self.current()?.kind == TokenKind::Semicolon {
             let semicolon = self.advance()?;
             Span::new(expression.span.start, semicolon.span.end)
@@ -349,7 +396,7 @@ where
                 }
                 .into());
             }
-            _ => Some(self.expression(LOWEST_BINDING_POWER)?),
+            _ => Some(self.expression(LOWEST_BINDING_POWER, true)?),
         };
         let semicolon = self.expect(TokenKind::Semicolon)?;
 
@@ -383,7 +430,7 @@ where
                 }
                 .into());
             }
-            _ => Some(self.expression(LOWEST_BINDING_POWER)?),
+            _ => Some(self.expression(LOWEST_BINDING_POWER, true)?),
         };
         let semicolon = self.expect(TokenKind::Semicolon)?;
 
@@ -597,8 +644,12 @@ where
         }
     }
 
-    fn expression(&mut self, minimum_binding_power: u8) -> ParseResult {
-        let mut left = self.prefix()?;
+    fn expression(
+        &mut self,
+        minimum_binding_power: u8,
+        allow_struct_construction: bool,
+    ) -> ParseResult {
+        let mut left = self.prefix(allow_struct_construction)?;
 
         loop {
             left = match self.current()?.kind {
@@ -606,6 +657,15 @@ where
                 TokenKind::Dot => self.member_access(left)?,
                 TokenKind::LeftBracket => self.index(left)?,
                 TokenKind::Question => self.try_expression(left)?,
+                // A construction target is a nominal name, not an arbitrary
+                // expression. Control-flow heads disable this branch so their
+                // following brace remains the body delimiter.
+                TokenKind::LeftBrace
+                    if allow_struct_construction
+                        && matches!(&left.kind, ExpressionKind::Identifier) =>
+                {
+                    self.struct_construction(left)?
+                }
                 _ => break,
             };
         }
@@ -618,7 +678,8 @@ where
             self.advance()?;
             let (kind, span) = match binding_power.operator {
                 InfixOperator::Binary(operator) => {
-                    let right = self.expression(binding_power.right_binding_power)?;
+                    let right = self
+                        .expression(binding_power.right_binding_power, allow_struct_construction)?;
                     let span = Span::new(left.span.start, right.span.end);
                     (
                         ExpressionKind::Binary {
@@ -630,7 +691,8 @@ where
                     )
                 }
                 InfixOperator::Assignment(operator) => {
-                    let right = self.expression(binding_power.right_binding_power)?;
+                    let right = self
+                        .expression(binding_power.right_binding_power, allow_struct_construction)?;
                     let span = Span::new(left.span.start, right.span.end);
                     (
                         ExpressionKind::Assignment {
@@ -666,7 +728,7 @@ where
 
         if self.current()?.kind != TokenKind::RightParen {
             loop {
-                arguments.push(self.expression(LOWEST_BINDING_POWER)?);
+                arguments.push(self.expression(LOWEST_BINDING_POWER, true)?);
 
                 if self.current()?.kind != TokenKind::Comma {
                     break;
@@ -708,7 +770,7 @@ where
 
     fn index(&mut self, object: Expression) -> ParseResult {
         self.expect(TokenKind::LeftBracket)?;
-        let index = self.expression(LOWEST_BINDING_POWER)?;
+        let index = self.expression(LOWEST_BINDING_POWER, true)?;
         let right_bracket = self.expect(TokenKind::RightBracket)?;
         let span = Span::new(object.span.start, right_bracket.span.end);
 
@@ -733,13 +795,14 @@ where
         ))
     }
 
-    fn prefix(&mut self) -> ParseResult {
+    fn prefix(&mut self, allow_struct_construction: bool) -> ParseResult {
         let token = self.current()?;
 
         match token.kind {
             TokenKind::Minus => {
                 self.advance()?;
-                let operand = self.expression(prefix_binding_power(token.kind))?;
+                let operand =
+                    self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
                 let span = Span::new(token.span.start, operand.span.end);
 
                 Ok(Expression::new(
@@ -752,7 +815,8 @@ where
             }
             TokenKind::Bang | TokenKind::Tilde => {
                 self.advance()?;
-                let operand = self.expression(prefix_binding_power(token.kind))?;
+                let operand =
+                    self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
                 let span = Span::new(token.span.start, operand.span.end);
                 let operator = match token.kind {
                     TokenKind::Bang => UnaryOperator::LogicalNot,
@@ -780,6 +844,7 @@ where
             TokenKind::Bool => self.primitive_conversion(PrimitiveType::Bool),
             TokenKind::Char => self.primitive_conversion(PrimitiveType::Char),
             TokenKind::String => self.primitive_conversion(PrimitiveType::String),
+            TokenKind::Struct if allow_struct_construction => self.anonymous_struct_expression(),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
             TokenKind::IntegerLiteral => self.literal(LiteralKind::Integer),
@@ -817,7 +882,7 @@ where
     fn primitive_conversion(&mut self, target: PrimitiveType) -> ParseResult {
         let keyword = self.advance()?;
         self.expect(TokenKind::LeftParen)?;
-        let value = self.expression(LOWEST_BINDING_POWER)?;
+        let value = self.expression(LOWEST_BINDING_POWER, true)?;
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
 
         Ok(Expression::new(
@@ -826,6 +891,91 @@ where
                 value: Box::new(value),
             },
             Span::new(keyword.span.start, right_parenthesis.span.end),
+        ))
+    }
+
+    fn struct_construction(&mut self, name_expression: Expression) -> ParseResult {
+        debug_assert!(matches!(&name_expression.kind, ExpressionKind::Identifier));
+        let name = name_expression.span;
+        self.expect(TokenKind::LeftBrace)?;
+        let mut fields = Vec::new();
+
+        if self.current()?.kind != TokenKind::RightBrace {
+            loop {
+                let field_name = self.expect(TokenKind::Identifier)?;
+                self.expect(TokenKind::Colon)?;
+                let value = self.expression(LOWEST_BINDING_POWER, true)?;
+                let span = Span::new(field_name.span.start, value.span.end);
+                fields.push(StructFieldInitializer::new(field_name.span, value, span));
+
+                if self.current()?.kind != TokenKind::Comma {
+                    break;
+                }
+
+                self.advance()?;
+                if self.current()?.kind == TokenKind::RightBrace {
+                    break;
+                }
+            }
+        }
+
+        let right_brace = self.expect(TokenKind::RightBrace)?;
+        Ok(Expression::new(
+            ExpressionKind::StructConstruction { name, fields },
+            Span::new(name.start, right_brace.span.end),
+        ))
+    }
+
+    fn anonymous_struct_expression(&mut self) -> ParseResult {
+        let keyword = self.expect(TokenKind::Struct)?;
+        self.expect(TokenKind::LeftBrace)?;
+        let mut members = Vec::new();
+
+        let right_brace = loop {
+            let token = self.current()?;
+            match token.kind {
+                TokenKind::RightBrace => break self.advance()?,
+                TokenKind::Eof => break self.expect(TokenKind::RightBrace)?,
+                TokenKind::Fn => {
+                    members.push(AnonymousStructMember::Method(self.function()?));
+                }
+                TokenKind::Identifier => {
+                    members.push(AnonymousStructMember::Field(self.anonymous_struct_field()?));
+                }
+                _ => {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::ExpectedAnonymousStructMember { found: token.kind },
+                        span: token.span,
+                    }
+                    .into());
+                }
+            }
+        };
+
+        Ok(Expression::new(
+            ExpressionKind::AnonymousStruct { members },
+            Span::new(keyword.span.start, right_brace.span.end),
+        ))
+    }
+
+    fn anonymous_struct_field(&mut self) -> ParseResult<AnonymousStructField> {
+        let name = self.expect(TokenKind::Identifier)?;
+        let type_annotation = if self.current()?.kind == TokenKind::Colon {
+            self.advance()?;
+            Some(self.type_expression()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::Assign)?;
+        let initializer = self.expression(LOWEST_BINDING_POWER, true)?;
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+        let span = Span::new(name.span.start, semicolon.span.end);
+
+        Ok(AnonymousStructField::new(
+            name.span,
+            type_annotation,
+            initializer,
+            span,
         ))
     }
 
@@ -840,7 +990,10 @@ where
             ));
         }
 
-        let expression = self.expression(LOWEST_BINDING_POWER)?;
+        // Parentheses provide an unambiguous boundary, so construction syntax
+        // is available even when the surrounding condition or range head
+        // disables it to reserve the following brace for a body.
+        let expression = self.expression(LOWEST_BINDING_POWER, true)?;
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
 
         Ok(Expression::new(
@@ -885,7 +1038,7 @@ where
                     statements.push(self.return_statement()?);
                 }
                 _ => {
-                    let expression = self.expression(LOWEST_BINDING_POWER)?;
+                    let expression = self.expression(LOWEST_BINDING_POWER, true)?;
                     let following = self.current()?;
 
                     match following.kind {
@@ -929,7 +1082,9 @@ where
 
     fn conditional(&mut self) -> ParseResult {
         let if_keyword = self.expect(TokenKind::If)?;
-        let condition = self.expression(LOWEST_BINDING_POWER)?;
+        // An ungrouped `{` starts the `if` body, rather than a named or
+        // anonymous struct expression in the condition.
+        let condition = self.expression(LOWEST_BINDING_POWER, false)?;
         let then_branch = self.block()?;
         let else_branch = if self.current()?.kind == TokenKind::Else {
             self.advance()?;
@@ -973,7 +1128,9 @@ where
 
     fn while_expression(&mut self) -> ParseResult {
         let keyword = self.expect(TokenKind::While)?;
-        let condition = self.expression(LOWEST_BINDING_POWER)?;
+        // Match `if` disambiguation: construction in the condition must be
+        // parenthesized so this brace unambiguously starts the loop body.
+        let condition = self.expression(LOWEST_BINDING_POWER, false)?;
         let body = self.block()?;
         let else_branch = if self.current()?.kind == TokenKind::Else {
             self.advance()?;
@@ -1060,7 +1217,9 @@ where
     }
 
     fn range_bound_expression(&mut self) -> ParseResult {
-        let expression = self.expression(PREFIX_BINDING_POWER)?;
+        // A brace after a range bound belongs to the loop body. Grouping
+        // re-enables struct construction through `group` above.
+        let expression = self.expression(PREFIX_BINDING_POWER, false)?;
 
         if !range_bound_is_simple(&expression) {
             return Err(ParseError {
@@ -1394,12 +1553,151 @@ mod tests {
 
         assert_eq!(program.span, Span::new(0, source.len()));
         assert_eq!(program.declarations.len(), 2);
-        let Declaration::Function(helper) = &program.declarations[0];
-        let Declaration::Function(main) = &program.declarations[1];
+        let Declaration::Function(helper) = &program.declarations[0] else {
+            panic!("expected helper function");
+        };
+        let Declaration::Function(main) = &program.declarations[1] else {
+            panic!("expected main function");
+        };
         assert_eq!(helper.name, Span::new(3, 9));
         assert_eq!(main.name, Span::new(42, 46));
         assert_eq!(helper.parameters.len(), 1);
         assert_eq!(main.body.statements.len(), 1);
+    }
+
+    #[test]
+    fn parses_named_struct_fields_methods_and_declaration_order() {
+        let source = concat!(
+            "struct Node {\n",
+            "    value: int,\n",
+            "    next: Node | none,\n",
+            "    fn value_or(self, fallback: int) -> int { self.value }\n",
+            "}\n",
+            "fn main() {}",
+        );
+        let program = parse_program_source(source).expect("program should parse");
+
+        assert_eq!(program.declarations.len(), 2);
+        let Declaration::Struct(structure) = &program.declarations[0] else {
+            panic!("expected a struct declaration");
+        };
+        let Declaration::Function(main) = &program.declarations[1] else {
+            panic!("expected main function");
+        };
+
+        let struct_end = source.find("\nfn main").expect("main follows struct");
+        assert_eq!(structure.name, Span::new(7, 11));
+        assert_eq!(structure.span, Span::new(0, struct_end));
+        assert_eq!(structure.members.len(), 3);
+        let StructMember::Field(value) = &structure.members[0] else {
+            panic!("expected value field");
+        };
+        let StructMember::Field(next) = &structure.members[1] else {
+            panic!("expected next field");
+        };
+        let StructMember::Method(method) = &structure.members[2] else {
+            panic!("expected method");
+        };
+        assert_eq!(&source[value.name.start..value.name.end], "value");
+        assert!(matches!(
+            &value.type_annotation.kind,
+            TypeKind::Primitive(PrimitiveType::Int)
+        ));
+        assert_eq!(&source[next.name.start..next.name.end], "next");
+        assert!(matches!(&next.type_annotation.kind, TypeKind::Union { .. }));
+        assert_eq!(&source[method.name.start..method.name.end], "value_or");
+        assert!(matches!(
+            method.parameters[0].kind,
+            FunctionParameterKind::Receiver { .. }
+        ));
+        assert_eq!(&source[main.name.start..main.name.end], "main");
+    }
+
+    #[test]
+    fn parses_empty_and_recursive_struct_declarations() {
+        let source = "struct Empty {} struct Node { next: Node | none, }";
+        let program = parse_program_source(source).expect("struct declarations should parse");
+
+        let Declaration::Struct(empty) = &program.declarations[0] else {
+            panic!("expected Empty");
+        };
+        let Declaration::Struct(node) = &program.declarations[1] else {
+            panic!("expected Node");
+        };
+        assert!(empty.members.is_empty());
+        let StructMember::Field(next) = &node.members[0] else {
+            panic!("expected recursive field");
+        };
+        assert!(matches!(&next.type_annotation.kind, TypeKind::Union { .. }));
+    }
+
+    #[test]
+    fn reports_malformed_named_struct_declarations() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "struct",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Eof,
+                },
+                Span::new(6, 6),
+            ),
+            (
+                "struct Thing",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(12, 12),
+            ),
+            (
+                "struct Thing { field int, }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Colon,
+                    found: TokenKind::Int,
+                },
+                Span::new(21, 24),
+            ),
+            (
+                "struct Thing { field: , }",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::Comma,
+                },
+                Span::new(22, 23),
+            ),
+            (
+                "struct Thing { field: int }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Comma,
+                    found: TokenKind::RightBrace,
+                },
+                Span::new(26, 27),
+            ),
+            (
+                "struct Thing { const }",
+                ParseErrorKind::ExpectedStructMember {
+                    found: TokenKind::Const,
+                },
+                Span::new(15, 20),
+            ),
+            (
+                "struct Thing {",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(14, 14),
+            ),
+        ] {
+            assert_eq!(
+                parse_program_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
     }
 
     #[test]
@@ -3292,6 +3590,277 @@ mod tests {
             "name", "self", "()", "42", "1.5", "true", "false", "'a'", "\"text\"", "none",
         ] {
             assert!(parse(source).is_ok(), "failed to parse {source}");
+        }
+    }
+
+    #[test]
+    fn parses_named_struct_construction_with_full_field_expressions() {
+        let source = "Position { y: calculate_y(), x: 1 + 2, }";
+        let expression = parse(source).expect("struct construction should parse");
+        let ExpressionKind::StructConstruction { name, fields } = expression.kind else {
+            panic!("expected named struct construction");
+        };
+
+        assert_eq!(expression.span, Span::new(0, source.len()));
+        assert_eq!(&source[name.start..name.end], "Position");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(&source[fields[0].name.start..fields[0].name.end], "y");
+        assert!(matches!(fields[0].value.kind, ExpressionKind::Call { .. }));
+        assert_eq!(&source[fields[1].name.start..fields[1].name.end], "x");
+        assert!(matches!(
+            fields[1].value.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+        assert_eq!(
+            fields[1].span,
+            Span::new(fields[1].name.start, fields[1].value.span.end)
+        );
+
+        let empty = parse("Marker {}").expect("empty construction should parse");
+        assert!(matches!(
+            empty.kind,
+            ExpressionKind::StructConstruction { fields, .. } if fields.is_empty()
+        ));
+    }
+
+    #[test]
+    fn named_struct_construction_composes_with_postfix_and_infix_expressions() {
+        let expression =
+            parse("Position { x: 1 }.magnitude() + 2").expect("struct construction should compose");
+        let ExpressionKind::Binary {
+            operator: BinaryOperator::Add,
+            left,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected addition");
+        };
+        let ExpressionKind::Call { callee, .. } = left.kind else {
+            panic!("expected method call");
+        };
+        let ExpressionKind::MemberAccess { object, .. } = callee.kind else {
+            panic!("expected member access");
+        };
+        assert!(matches!(
+            object.kind,
+            ExpressionKind::StructConstruction { .. }
+        ));
+    }
+
+    #[test]
+    fn grouped_struct_construction_is_allowed_in_conditions_and_range_bounds() {
+        let expression =
+            parse("if (Position { x: 1 }) {}").expect("grouped condition should parse");
+        let ExpressionKind::If { condition, .. } = expression.kind else {
+            panic!("expected conditional");
+        };
+        assert!(matches!(
+            condition.kind,
+            ExpressionKind::Group(ref inner)
+                if matches!(inner.kind, ExpressionKind::StructConstruction { .. })
+        ));
+
+        let expression = parse("while (struct { value = 1; }) {}")
+            .expect("grouped anonymous struct condition should parse");
+        let ExpressionKind::While { condition, .. } = expression.kind else {
+            panic!("expected while loop");
+        };
+        assert!(matches!(
+            condition.kind,
+            ExpressionKind::Group(ref inner)
+                if matches!(inner.kind, ExpressionKind::AnonymousStruct { .. })
+        ));
+
+        let expression = parse("for i in 0..(Position { x: 1 }) {}")
+            .expect("grouped construction range bound should parse");
+        let ExpressionKind::RangeFor { end, .. } = expression.kind else {
+            panic!("expected range loop");
+        };
+        assert!(matches!(end.kind, ExpressionKind::Group(_)));
+    }
+
+    #[test]
+    fn parses_anonymous_struct_fields_and_methods() {
+        let source = concat!(
+            "struct { ",
+            "x: float = 10.0; ",
+            "label = \"point\"; ",
+            "fn magnitude(self) -> float { self.x }",
+            " }",
+        );
+        let expression = parse(source).expect("anonymous struct should parse");
+        let ExpressionKind::AnonymousStruct { members } = expression.kind else {
+            panic!("expected anonymous struct");
+        };
+
+        assert_eq!(expression.span, Span::new(0, source.len()));
+        assert_eq!(members.len(), 3);
+        let AnonymousStructMember::Field(x) = &members[0] else {
+            panic!("expected x field");
+        };
+        let AnonymousStructMember::Field(label) = &members[1] else {
+            panic!("expected label field");
+        };
+        let AnonymousStructMember::Method(method) = &members[2] else {
+            panic!("expected magnitude method");
+        };
+        assert_eq!(&source[x.name.start..x.name.end], "x");
+        assert!(matches!(
+            &x.type_annotation,
+            Some(TypeSyntax {
+                kind: TypeKind::Primitive(PrimitiveType::Float),
+                ..
+            })
+        ));
+        assert_eq!(&source[label.name.start..label.name.end], "label");
+        assert!(label.type_annotation.is_none());
+        assert_eq!(&source[method.name.start..method.name.end], "magnitude");
+        assert!(matches!(
+            method.parameters[0].kind,
+            FunctionParameterKind::Receiver { .. }
+        ));
+
+        let expression = parse("struct {}.method() + other")
+            .expect("empty anonymous struct should compose with postfix and infix syntax");
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reports_malformed_named_struct_construction() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "Position {",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Eof,
+                },
+                Span::new(10, 10),
+            ),
+            (
+                "Position { x }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Colon,
+                    found: TokenKind::RightBrace,
+                },
+                Span::new(13, 14),
+            ),
+            (
+                "Position { x: }",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::RightBrace,
+                },
+                Span::new(14, 15),
+            ),
+            (
+                "Position { x: 1 y: 2 }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBrace,
+                    found: TokenKind::Identifier,
+                },
+                Span::new(16, 17),
+            ),
+            (
+                "Position { x: 1,",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Eof,
+                },
+                Span::new(16, 16),
+            ),
+            (
+                "Position { x: 1",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(15, 15),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn reports_malformed_anonymous_structs() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "struct {",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(8, 8),
+            ),
+            (
+                "struct { const value = 1; }",
+                ParseErrorKind::ExpectedAnonymousStructMember {
+                    found: TokenKind::Const,
+                },
+                Span::new(9, 14),
+            ),
+            (
+                "struct { value: = 1; }",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::Assign,
+                },
+                Span::new(16, 17),
+            ),
+            (
+                "struct { value: int 1; }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Assign,
+                    found: TokenKind::IntegerLiteral,
+                },
+                Span::new(20, 21),
+            ),
+            (
+                "struct { value = ; }",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Semicolon,
+                },
+                Span::new(17, 18),
+            ),
+            (
+                "struct { value = 1 }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::RightBrace,
+                },
+                Span::new(19, 20),
+            ),
+            (
+                "struct { value = 1;",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(19, 19),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
         }
     }
 

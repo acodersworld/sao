@@ -18,6 +18,100 @@ impl Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Declaration {
     Function(Function),
+    Struct(StructDeclaration),
+}
+
+/// A named nominal struct declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructDeclaration {
+    pub name: Span,
+    pub members: Vec<StructMember>,
+    pub span: Span,
+}
+
+impl StructDeclaration {
+    #[must_use]
+    pub const fn new(name: Span, members: Vec<StructMember>, span: Span) -> Self {
+        Self {
+            name,
+            members,
+            span,
+        }
+    }
+}
+
+/// A field or method declared by a named struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructMember {
+    Field(StructField),
+    Method(Function),
+}
+
+/// A field declared by a named struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructField {
+    pub name: Span,
+    pub type_annotation: TypeSyntax,
+    pub span: Span,
+}
+
+impl StructField {
+    #[must_use]
+    pub const fn new(name: Span, type_annotation: TypeSyntax, span: Span) -> Self {
+        Self {
+            name,
+            type_annotation,
+            span,
+        }
+    }
+}
+
+/// One field initializer in a named struct construction expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructFieldInitializer {
+    pub name: Span,
+    pub value: Expression,
+    pub span: Span,
+}
+
+impl StructFieldInitializer {
+    #[must_use]
+    pub const fn new(name: Span, value: Expression, span: Span) -> Self {
+        Self { name, value, span }
+    }
+}
+
+/// A field or method in an anonymous struct expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnonymousStructMember {
+    Field(AnonymousStructField),
+    Method(Function),
+}
+
+/// An initialized field in an anonymous struct expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnonymousStructField {
+    pub name: Span,
+    pub type_annotation: Option<TypeSyntax>,
+    pub initializer: Expression,
+    pub span: Span,
+}
+
+impl AnonymousStructField {
+    #[must_use]
+    pub const fn new(
+        name: Span,
+        type_annotation: Option<TypeSyntax>,
+        initializer: Expression,
+        span: Span,
+    ) -> Self {
+        Self {
+            name,
+            type_annotation,
+            initializer,
+            span,
+        }
+    }
 }
 
 /// An expression in the source-level syntax tree.
@@ -264,6 +358,13 @@ pub enum ExpressionKind {
     PrimitiveConversion {
         target: PrimitiveType,
         value: Box<Expression>,
+    },
+    StructConstruction {
+        name: Span,
+        fields: Vec<StructFieldInitializer>,
+    },
+    AnonymousStruct {
+        members: Vec<AnonymousStructMember>,
     },
     Call {
         callee: Box<Expression>,

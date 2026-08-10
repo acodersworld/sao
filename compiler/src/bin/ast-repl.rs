@@ -144,6 +144,12 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedTopLevelDeclaration { found } => {
             format!("expected a top-level declaration, found {found:?}")
         }
+        ParseErrorKind::ExpectedStructMember { found } => {
+            format!("expected a struct field or method, found {found:?}")
+        }
+        ParseErrorKind::ExpectedAnonymousStructMember { found } => {
+            format!("expected an anonymous struct field or method, found {found:?}")
+        }
         ParseErrorKind::RangeBoundRequiresGrouping => {
             "complex range bounds must be parenthesized".to_owned()
         }
@@ -213,6 +219,28 @@ mod tests {
                 span: Span::new(0, 5),
             }),
             "expected a top-level declaration, found Const"
+        );
+    }
+
+    #[test]
+    fn describes_invalid_struct_members() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedStructMember {
+                    found: sao_compiler::lexer::TokenKind::Const,
+                },
+                span: Span::new(0, 5),
+            }),
+            "expected a struct field or method, found Const"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedAnonymousStructMember {
+                    found: sao_compiler::lexer::TokenKind::Return,
+                },
+                span: Span::new(0, 6),
+            }),
+            "expected an anonymous struct field or method, found Return"
         );
     }
 
