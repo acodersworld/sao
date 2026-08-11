@@ -74,3 +74,8 @@ consumed as one error item so the next iteration resumes at a meaningful
 boundary. The eager `lex` helper returns all tokens on success or all lexical
 errors on failure. Every token carries a half-open byte span, and a final
 zero-length `Eof` token is always emitted.
+
+Parser entry points intentionally stop at the first lexical or syntax error.
+Whole-program parsing does not currently collect multiple diagnostics or return
+a partial syntax tree; declaration-level and statement-level recovery are
+deferred.

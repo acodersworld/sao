@@ -14,6 +14,10 @@ core:
 - `errdefer`.
 - Vector and Map APIs, mutation rules, and runtime representations beyond their
   reserved type and empty-construction syntax.
+- Multi-error program parsing and partial-AST production. A future
+  declaration-level recovery pass should abandon a malformed braced declaration
+  and synchronize at its matching outer `}`, rather than the next arbitrary
+  brace. Recovery within statement blocks is a separate concern.
 - A Cranelift JIT or native object backend.
 - A built-in linker or executable writer.
 - Native threads and shared-memory concurrency.

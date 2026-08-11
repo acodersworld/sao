@@ -52,6 +52,10 @@ The parser currently supports:
 - `break`, `continue`, and value-producing loop syntax.
 - Exclusive and inclusive range headers using `..` and `..=`.
 
+Every parser entry point intentionally fails on the first lexical or syntax
+error. Whole-program parsing does not produce a partial AST or collect multiple
+diagnostics.
+
 Range bounds use a deliberately restricted grammar. An unparenthesized bound may
 be a primary expression, a postfix chain, or unary negation. Infix, assignment,
 lambda, struct construction, and block-like bounds must be parenthesized. For
@@ -74,11 +78,7 @@ an interface implementation expression.
 
 ## Parser work queue
 
-Recommended implementation order:
-
-1. Program-level syntax recovery
-   - Extend the existing whole-program parser to synchronize after malformed
-     declarations so one parse can report multiple useful syntax errors.
+No additional parser work is currently queued.
 
 ## Runtime prototype status
 
@@ -136,6 +136,10 @@ changes:
 - General `match` expressions and pattern matching.
 - User-defined generics.
 - Vector and Map APIs and runtime representations.
+- Multi-error program parsing and partial-AST recovery. If declaration-level
+  recovery is added, it should abandon the malformed braced declaration and
+  synchronize at that declaration's matching outer `}`, not the next arbitrary
+  brace. Statement-level recovery remains a separate deferred feature.
 - Nominal data-carrying enums.
 - Modules, imports, and visibility.
 - `errdefer`.
