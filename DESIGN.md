@@ -2,7 +2,7 @@
 
 Status: early design notes  
 Working name: SAO  
-Last updated: 2026-08-09
+Last updated: 2026-08-11
 
 This document records the current direction for SAO, a statically typed,
 expression-oriented toy language. It distinguishes agreed design decisions from

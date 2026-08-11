@@ -9,6 +9,18 @@ their status diverges.
 
 Last reviewed: 2026-08-11
 
+## Lexer status
+
+The lexer implements the lexical grammar in `design/16-lexical-grammar.md`,
+including ASCII identifiers and literals, nested block comments, conservative
+decimal numbers, every documented operator, byte spans, recoverable lexical
+errors, and an explicit end-of-file token.
+
+`co` and `defer` are reserved and tokenized, but they do not yet have AST or
+parser representations. Likewise, `..` and `..=` are tokenized only for the
+implemented range-`for` grammar; they do not yet introduce general range or
+slice expressions.
+
 ## Parser status
 
 The parser currently supports:
@@ -59,25 +71,52 @@ an interface implementation expression.
 Recommended implementation order:
 
 1. `defer` statements
-   - Add the AST and parser representation.
+   - The keyword is already reserved by the lexer; add the AST, parser, and
+     pretty-printer representation.
    - Enforce the call-only syntax `defer function_call();`.
 
-2. `co` coroutine calls
-   - Add the AST and parser representation.
+2. `co` coroutine-start statements
+   - The keyword is already reserved by the lexer; add the AST, parser, and
+     pretty-printer representation.
    - Restrict the operand to a function or method call.
 
 3. Parameterized built-in construction
    - Support expression syntax such as `Queue<int>()` while retaining existing
      parameterized type parsing.
+   - `Error(value)` already parses as an ordinary call; payload construction is
+     validated during semantic analysis.
 
 4. Slicing syntax
    - First settle the source syntax in the design documents.
-   - The lexer and parser currently reserve `..` and `..=` for range `for`
-     headers, although byte slicing semantics are mentioned in the design.
+   - The design specifies copy semantics but deliberately leaves the spelling
+     unsettled. The lexer and parser currently reserve `..` and `..=` for range
+     `for` headers.
 
 5. Program-level syntax recovery
-   - After whole-program parsing exists, synchronize after malformed declarations
-     so one parse can report multiple useful syntax errors.
+   - Extend the existing whole-program parser to synchronize after malformed
+     declarations so one parse can report multiple useful syntax errors.
+
+## Runtime prototype status
+
+The C code under `runtime/` is an isolated runtime prototype; the compiler does
+not emit or link against it yet. It currently provides:
+
+- An intrusive FIFO list used by the scheduler and C test harness.
+- Resumable functions with explicit call, yield, and return statuses.
+- Copied, aligned activation records held on a bounded task-owned byte stack.
+- A FIFO cooperative scheduler in which the first successfully queued task is
+  `main`, completed non-main tasks yield to the next ready task, and completion
+  of `main` abandons the remaining tasks.
+- A temporary universally tagged `SaoValue` used to pass prototype call results.
+
+The scheduler behaviour matches the ordering and main-termination rules in the
+coroutine design. The storage and value representations do not yet implement the
+final design: there is no tracing collector, heap-linked activation-frame chain,
+specialized union layout, concrete object model, queue object, deferred-call
+storage, or compiler integration. In particular, `SaoValue` and the bounded byte
+stack are prototype mechanisms rather than the language ABI described in
+`design/12-backend-oriented-lowering.md` and
+`design/13-runtime-representation-and-memory-management.md`.
 
 ## Work outside the parser
 
@@ -87,8 +126,8 @@ additional parsing:
 - Name and scope resolution.
 - Entry-point validation, including the required unique `main` signature.
 - Type checking and inference.
-- Primitive conversion validation, including defining the accepted inputs and
-  result of `bool(value)`.
+- Primitive conversion validation. The accepted inputs and result of
+  `bool(value)` still require a design decision before semantic implementation.
 - Assignment-target and mutability validation.
 - Validating `self`, `return`, `break`, and `continue` placement.
 - Range-bound types and immutable induction bindings.
@@ -97,7 +136,8 @@ additional parsing:
 - Struct field validation, interface satisfaction, and contextual
   struct-to-interface conversion.
 - Error propagation, coroutine, and `defer` lowering.
-- Runtime representation and code generation.
+- Integrating or replacing the runtime prototype as typed IR and code generation
+  adopt the designed frame, value, object, queue, and garbage-collection models.
 
 ## Deferred language features
 

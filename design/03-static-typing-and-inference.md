@@ -304,7 +304,8 @@ values from 0 through 255. It is separate from `string`:
 - A `const bytes` reference is transitively read-only.
 - A `mut bytes` reference supports indexed mutation, append, extend, and resize.
 - `length()` returns the byte count in constant time.
-- Slicing initially creates an independent copy.
+- Slicing will initially create an independent copy. Its source syntax is not
+  yet settled, so slicing is not currently part of the parser grammar.
 - `bytes.concat(left, right)` creates a new mutable byte sequence containing the
   contents of `left` followed by `right`.
 - Files and other binary I/O use `bytes`.
