@@ -7,13 +7,18 @@ source
   -> lexer
   -> parser
   -> AST
-  -> name resolution and type checking
+  -> semantic analysis
   -> typed high-level IR
   -> lowered middle IR
   -> C backend
   -> clang/gcc
   -> native executable
 ```
+
+Semantic analysis is internally staged as name and scope resolution, contextual
+validation, type checking and inference, and post-type analyses such as capture
+analysis. Each validation rule belongs to the earliest stage with enough
+information to decide it; validation is not a separate catch-all pass.
 
 The IR should belong to SAO rather than mirror C. This leaves room for an
 interpreter or a Cranelift JIT/AOT backend in the future:

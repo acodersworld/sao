@@ -1,159 +1,63 @@
 # Current work
 
-This file is a concise implementation snapshot. It exists to avoid repeatedly
-reconstructing project status from the design documents and source tree.
+This file tracks the active implementation queue and the work expected to
+follow it. The stable inventory of implemented features lives in
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
+remain the language specification.
 
-The design documents remain the language specification, and the source remains
-the implementation. Periodically compare all three and update this file when
-their status diverges.
+Last reviewed: 2026-08-12
 
-Last reviewed: 2026-08-11
+## Current phase
 
-## Lexer status
+Frontend syntax work is complete for the currently designed language. The
+active phase is semantic analysis, followed by typed IR and lowering.
 
-The lexer implements the lexical grammar in `design/16-lexical-grammar.md`,
-including ASCII identifiers and literals, nested block comments, conservative
-decimal numbers, every documented operator, byte spans, recoverable lexical
-errors, and an explicit end-of-file token.
+## Semantic analysis work queue
 
-`co` and `defer` are reserved and tokenized for their implemented call-only
-statement forms. The compiler-known names `Queue`, `Vector`, `Map`, and `Error`
-are also reserved and tokenized distinctly from identifiers. `..` and `..=` are
-tokenized for the implemented range-`for` grammar, and `..` also delimits
-exclusive `string` and `bytes` slices. Inclusive `..=` slices are rejected.
+Semantic analysis is one compiler subsystem with ordered internal passes.
+Validation is performed by the earliest pass that has enough information for
+the rule rather than collected into one miscellaneous final pass.
 
-## Parser status
+Recommended implementation order:
 
-The parser currently supports:
+1. Name and scope resolution
+   - Introduce semantic symbol identities and nested value/type scopes.
+   - Collect top-level and nested named declarations, resolve every name, and
+     diagnose unknown names, duplicate declarations, and a missing or non-unique
+     top-level `main` entry point.
+2. Context validation
+   - Validate `self`, `return`, `break`, `continue`, `defer`, and `co` against
+     their documented enclosing function, method, loop, and executable-block
+     contexts.
+   - Validate assignment-target shape and binding-controlled restrictions such
+     as immutable range induction variables.
+3. Type checking and inference
+   - Define semantic types and produce type information for expressions,
+     bindings, declarations, and callable signatures.
+   - Check operators, calls, assignments and mutability, returns, blocks, loop
+     results, ranges, slices, conversions, parameterized built-ins, unions,
+     intersections, structs, and structural interface satisfaction.
+   - Validate the required `main` signature after its parameter and return types
+     are known.
+   - Infer local binding types and `Error(value)` payloads within the documented
+     inference boundary. Settle `bool(value)` before implementing its primitive
+     conversion rules.
+4. Post-type semantic analysis
+   - Analyze lambda and anonymous-struct captures, shared mutable capture cells,
+     and forbidden captures by nested named functions.
+   - Record the Error-propagation, coroutine-call, and deferred-call metadata
+     required by lowering, and emit a typed program representation.
 
-- Single-expression, single-type, single-statement, and whole-program entry
-  points.
-- File-level programs containing ordered top-level function, named struct, and
-  structural interface declarations.
-- Semicolon-terminated interface method requirements with receiver, parameter,
-  and return-type syntax.
-- Primitive, named, parameterized, mutable, grouped, callable, union, and
-  intersection type syntax.
-- Literals, identifiers, `self`, grouping, and expression-oriented blocks.
-- Prefix, binary, assignment, type-test, and postfix operators.
-- Calls, member access, indexing, exclusive open or bounded slicing, and postfix
-  error propagation with `?`.
-- Dedicated `int`, `float`, `bool`, `char`, and `string` conversion expressions
-  with exactly one argument.
-- Fixed-arity `Queue<T>`, `Vector<T>`, `Map<K, V>`, and `Error<T>` types, plus
-  their canonical construction expressions. Both inferred `Error(value)` and
-  explicit `Error<T>(value)` forms are supported.
-- Named struct construction and unconstrained anonymous `struct { ... }`
-  expressions, including initialized fields and methods.
-- Immutable and mutable bindings.
-- Named and nested functions, method receivers, returns, and lambdas.
-- Call-only `defer` and coroutine-start `co` statements.
-- `if`/`else if`/`else`, `loop`, `while`, and integer range `for` expressions.
-- `break`, `continue`, and value-producing loop syntax.
-- Exclusive and inclusive range headers using `..` and `..=`.
+## Later compiler work
 
-Every parser entry point intentionally fails on the first lexical or syntax
-error. Whole-program parsing does not produce a partial AST or collect multiple
-diagnostics.
+After semantic analysis, the remaining compiler work includes:
 
-Range bounds use a deliberately restricted grammar. An unparenthesized bound may
-be a primary expression, a postfix chain, or unary negation. Infix, assignment,
-lambda, struct construction, and block-like bounds must be parenthesized. For
-example:
-
-```text
-for index in -start..items.length() {}
-for index in (start + offset)..(if ready { limit } else { fallback }) {}
-```
-
-Brace-based struct construction is also disabled directly in `if`, `while`,
-and range `for` heads so the following brace always begins the control-flow
-body. Parentheses re-enable it, as in `if (Position { x: 1.0, y: 2.0 }) {}`.
-
-Interfaces use contextual structural conversion rather than dedicated
-construction syntax. `struct { ... }` is the only anonymous-struct expression;
-an annotation, parameter, or return type may later convert its hidden concrete
-type to a satisfied interface during semantic analysis. `Writer { ... }` is not
-an interface implementation expression.
-
-## Parser work queue
-
-No additional parser work is currently queued.
-
-## Runtime prototype status
-
-The C code under `runtime/` is an isolated runtime prototype; the compiler does
-not emit or link against it yet. It currently provides:
-
-- An intrusive FIFO list used by the scheduler and C test harness.
-- Resumable functions with explicit call, yield, and return statuses.
-- Copied, aligned activation records held on a bounded task-owned byte stack.
-- A FIFO cooperative scheduler in which the first successfully queued task is
-  `main`, completed non-main tasks yield to the next ready task, and completion
-  of `main` abandons the remaining tasks.
-- A temporary universally tagged `SaoValue` used to pass prototype call results.
-
-The scheduler behaviour matches the ordering and main-termination rules in the
-coroutine design. The storage and value representations do not yet implement the
-final design: there is no tracing collector, heap-linked activation-frame chain,
-specialized union layout, concrete object model, queue object, deferred-call
-storage, or compiler integration. In particular, `SaoValue` and the bounded byte
-stack are prototype mechanisms rather than the language ABI described in
-`design/12-backend-oriented-lowering.md` and
-`design/13-runtime-representation-and-memory-management.md`.
-
-## Work outside the parser
-
-The following require semantic analysis or later compiler phases rather than
-additional parsing:
-
-- Name and scope resolution.
-- Entry-point validation, including the required unique `main` signature.
-- Type checking and inference.
-- Parameterized built-in element/key/payload validation, `Error(value)` payload
-  inference, and the eventual Vector and Map APIs and lowering.
-- Primitive conversion validation. The accepted inputs and result of
-  `bool(value)` still require a design decision before semantic implementation.
-- Assignment-target and mutability validation.
-- Slice receiver and bound type validation, runtime negative-bound
-  normalization and bounds checks, and allocating copy implementation.
-- Validating `self`, `return`, `break`, and `continue` placement.
-- Range-bound types and immutable induction bindings.
-- Loop result and `else` typing.
-- Lambda, nested-function, and anonymous-object capture analysis.
-- Struct field validation, interface satisfaction, and contextual
-  struct-to-interface conversion.
+- Runtime slice negative-bound normalization, bounds checks, and allocating
+  copy implementation.
 - Error propagation, coroutine, and `defer` lowering.
-- Integrating or replacing the runtime prototype as typed IR and code generation
-  adopt the designed frame, value, object, queue, and garbage-collection models.
+- Typed IR and code generation, including integration or replacement of the
+  runtime prototype with the designed frame, value, object, queue, and
+  garbage-collection models.
 
-## Deferred language features
-
-Do not treat the following as immediate parser work unless the design scope
-changes:
-
-- Collection-based `for item in collection` loops.
-- General `match` expressions and pattern matching.
-- User-defined generics.
-- Vector and Map APIs and runtime representations.
-- Multi-error program parsing and partial-AST recovery. If declaration-level
-  recovery is added, it should abandon the malformed braced declaration and
-  synchronize at that declaration's matching outer `}`, not the next arbitrary
-  brace. Statement-level recovery remains a separate deferred feature.
-- Nominal data-carrying enums.
-- Modules, imports, and visibility.
-- `errdefer`.
-
-See `design/14-deferred-features.md` for the complete deferred-feature list.
-
-## Synchronization checklist
-
-When synchronizing design, current work, and source:
-
-1. Confirm each non-deferred design syntax has an AST representation.
-2. Confirm each AST form is parsed and pretty-printed.
-3. Confirm positive, composition, malformed-input, and diagnostic tests exist.
-4. Remove completed items from the work queue and update the parser-status list.
-5. Record newly deferred or newly agreed syntax in both the design documents and
-   this file.
-6. Update the review date above.
+Deferred features are recorded in `design/14-deferred-features.md` and summarized
+in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
