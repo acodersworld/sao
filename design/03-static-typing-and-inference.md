@@ -304,11 +304,42 @@ values from 0 through 255. It is separate from `string`:
 - A `const bytes` reference is transitively read-only.
 - A `mut bytes` reference supports indexed mutation, append, extend, and resize.
 - `length()` returns the byte count in constant time.
-- Slicing will initially create an independent copy. Its source syntax is not
-  yet settled, so slicing is not currently part of the parser grammar.
 - `bytes.concat(left, right)` creates a new mutable byte sequence containing the
   contents of `left` followed by `right`.
 - Files and other binary I/O use `bytes`.
+
+Both `string` and `bytes` support end-exclusive slicing:
+
+```text
+value[start..end]
+value[..end]
+value[start..]
+value[..]
+```
+
+No other type supports slicing.
+
+This is a copy-oriented sequence operation, analogous to ordinary Python
+sequence slicing rather than its separate zero-copy
+[`memoryview`](https://docs.python.org/3/library/stdtypes.html#memory-views)
+mechanism.
+
+Each present bound is an `int` expression. A non-negative bound is measured
+from the beginning. A negative bound is normalized by adding the sequence
+length, so `value[-2..]` selects the final two elements and `value[..-1]`
+excludes the final element. An omitted start is zero and an omitted end is the
+sequence length.
+
+Slicing evaluates the receiver once, followed by each present bound once from
+left to right. It panics if either normalized bound lies outside zero through
+the sequence length, inclusive, or if the normalized start exceeds the
+normalized end. Empty and full slices are valid.
+
+The result is a newly allocated mutable object of the same type with an
+independent buffer. Binding that result with `const` reduces access normally;
+mutating either object never changes the other. Inclusive ends, steps, slice
+assignment, shared views, clamping, and first-class range values are not
+supported.
 
 ASCII conversion is explicit. Encoding always succeeds; decoding fails when a
 byte exceeds 127:

@@ -56,6 +56,7 @@ pub enum ParseErrorKind {
         expected: usize,
         found: usize,
     },
+    InclusiveSliceNotSupported,
     RangeBoundRequiresGrouping,
     ExpectedToken {
         expected: TokenKind,
@@ -810,7 +811,7 @@ where
             left = match self.current()?.kind {
                 TokenKind::LeftParen => self.call(left)?,
                 TokenKind::Dot => self.member_access(left)?,
-                TokenKind::LeftBracket => self.index(left)?,
+                TokenKind::LeftBracket => self.index_or_slice(left)?,
                 TokenKind::Question => self.try_expression(left)?,
                 // A construction target is a nominal name, not an arbitrary
                 // expression. Control-flow heads disable this branch so their
@@ -928,9 +929,39 @@ where
         ))
     }
 
-    fn index(&mut self, object: Expression) -> ParseResult {
+    fn index_or_slice(&mut self, object: Expression) -> ParseResult {
         self.expect(TokenKind::LeftBracket)?;
+
+        if self.current()?.kind == TokenKind::DotDotEqual {
+            let delimiter = self.current()?;
+            return Err(ParseError {
+                kind: ParseErrorKind::InclusiveSliceNotSupported,
+                span: delimiter.span,
+            }
+            .into());
+        }
+
+        if self.current()?.kind == TokenKind::DotDot {
+            self.advance()?;
+            return self.finish_slice(object, None);
+        }
+
         let index = self.expression(LOWEST_BINDING_POWER, true)?;
+
+        if self.current()?.kind == TokenKind::DotDotEqual {
+            let delimiter = self.current()?;
+            return Err(ParseError {
+                kind: ParseErrorKind::InclusiveSliceNotSupported,
+                span: delimiter.span,
+            }
+            .into());
+        }
+
+        if self.current()?.kind == TokenKind::DotDot {
+            self.advance()?;
+            return self.finish_slice(object, Some(index));
+        }
+
         let right_bracket = self.expect(TokenKind::RightBracket)?;
         let span = Span::new(object.span.start, right_bracket.span.end);
 
@@ -938,6 +969,37 @@ where
             ExpressionKind::Index {
                 object: Box::new(object),
                 index: Box::new(index),
+            },
+            span,
+        ))
+    }
+
+    fn finish_slice(&mut self, object: Expression, start: Option<Expression>) -> ParseResult {
+        let token = self.current()?;
+        if token.kind == TokenKind::Eof {
+            return Err(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBracket,
+                    found: TokenKind::Eof,
+                },
+                span: token.span,
+            }
+            .into());
+        }
+
+        let end = if token.kind == TokenKind::RightBracket {
+            None
+        } else {
+            Some(self.expression(LOWEST_BINDING_POWER, true)?)
+        };
+        let right_bracket = self.expect(TokenKind::RightBracket)?;
+        let span = Span::new(object.span.start, right_bracket.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::Slice {
+                object: Box::new(object),
+                start: start.map(Box::new),
+                end: end.map(Box::new),
             },
             span,
         ))
@@ -1591,9 +1653,9 @@ fn range_bound_is_simple(expression: &Expression) -> bool {
         | ExpressionKind::Literal(_)
         | ExpressionKind::Group(_) => true,
         ExpressionKind::Call { callee, .. } => range_bound_is_simple(callee),
-        ExpressionKind::MemberAccess { object, .. } | ExpressionKind::Index { object, .. } => {
-            range_bound_is_simple(object)
-        }
+        ExpressionKind::MemberAccess { object, .. }
+        | ExpressionKind::Index { object, .. }
+        | ExpressionKind::Slice { object, .. } => range_bound_is_simple(object),
         ExpressionKind::Try { expression } => range_bound_is_simple(expression),
         ExpressionKind::PrimitiveConversion { .. } | ExpressionKind::BuiltinConstruction { .. } => {
             true
@@ -4994,6 +5056,108 @@ mod tests {
     }
 
     #[test]
+    fn parses_open_and_bounded_slices() {
+        for (source, has_start, has_end) in [
+            ("items[1..4]", true, true),
+            ("items[..4]", false, true),
+            ("items[1..]", true, false),
+            ("items[..]", false, false),
+        ] {
+            let expression = parse(source).expect("slice should parse");
+            let ExpressionKind::Slice { start, end, object } = expression.kind else {
+                panic!("expected a slice for {source}");
+            };
+            assert_eq!(start.is_some(), has_start);
+            assert_eq!(end.is_some(), has_end);
+            assert!(matches!(object.kind, ExpressionKind::Identifier));
+            assert_eq!(expression.span, Span::new(0, source.len()));
+        }
+    }
+
+    #[test]
+    fn slice_bounds_accept_negative_and_full_expressions() {
+        let expression = parse("items[-2..-1]").expect("negative slice bounds should parse");
+        let ExpressionKind::Slice {
+            start: Some(start),
+            end: Some(end),
+            ..
+        } = expression.kind
+        else {
+            panic!("expected a bounded slice");
+        };
+        assert!(matches!(
+            start.kind,
+            ExpressionKind::Unary {
+                operator: UnaryOperator::Negate,
+                ..
+            }
+        ));
+        assert!(matches!(
+            end.kind,
+            ExpressionKind::Unary {
+                operator: UnaryOperator::Negate,
+                ..
+            }
+        ));
+
+        let expression = parse("items[start + offset..end - trim]")
+            .expect("complete bound expressions should parse");
+        let ExpressionKind::Slice {
+            start: Some(start),
+            end: Some(end),
+            ..
+        } = expression.kind
+        else {
+            panic!("expected a bounded slice");
+        };
+        assert!(matches!(
+            start.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+        assert!(matches!(
+            end.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Subtract,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn slices_compose_with_postfix_and_infix_expressions() {
+        let expression = parse("items[1..-1].length() + 1")
+            .expect("slice should compose with postfix and infix syntax");
+        let ExpressionKind::Binary {
+            left,
+            operator: BinaryOperator::Add,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected addition at the root");
+        };
+        let ExpressionKind::Call { callee, .. } = left.kind else {
+            panic!("expected a call before addition");
+        };
+        let ExpressionKind::MemberAccess { object, .. } = callee.kind else {
+            panic!("expected member access before the call");
+        };
+        assert!(matches!(object.kind, ExpressionKind::Slice { .. }));
+    }
+
+    #[test]
+    fn slice_assignment_remains_an_assignment_for_later_validation() {
+        let expression = parse("items[1..2] = replacement")
+            .expect("slice assignment should remain syntactically representable");
+        let ExpressionKind::Assignment { target, .. } = expression.kind else {
+            panic!("expected an assignment at the root");
+        };
+        assert!(matches!(target.kind, ExpressionKind::Slice { .. }));
+    }
+
+    #[test]
     fn postfix_expressions_chain_from_left_to_right() {
         let expression = parse("service.worker(1)[0]?").expect("postfix chain should parse");
         let ExpressionKind::Try { expression } = expression.kind else {
@@ -5045,6 +5209,45 @@ mod tests {
                     found: TokenKind::RightBracket,
                 },
                 span: Span::new(6, 7),
+            }))
+        );
+
+        for source in ["items[..=end]", "items[start..=end]"] {
+            let delimiter = source
+                .find("..=")
+                .expect("source has an inclusive delimiter");
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::InclusiveSliceNotSupported,
+                    span: Span::new(delimiter, delimiter + 3),
+                }))
+            );
+        }
+
+        for source in ["items[1..", "items[.."] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::ExpectedToken {
+                        expected: TokenKind::RightBracket,
+                        found: TokenKind::Eof,
+                    },
+                    span: Span::new(source.len(), source.len()),
+                }))
+            );
+        }
+
+        let source = "items[1..2..3]";
+        let delimiter = source.rfind("..").expect("source has a second delimiter");
+        assert_eq!(
+            parse(source),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBracket,
+                    found: TokenKind::DotDot,
+                },
+                span: Span::new(delimiter, delimiter + 2),
             }))
         );
     }

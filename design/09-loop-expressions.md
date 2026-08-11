@@ -76,11 +76,13 @@ for index in start..end {
 }
 ```
 
-The `..` and `..=` forms initially exist only in `for` headers and do not create
-first-class range values. Descending ranges, configurable steps, open-ended
-ranges, and traditional three-clause loops are unsupported. Collection
-iteration may later reuse `for item in collection` after SAO defines iterable
-types and their iteration protocol.
+Range values exist only in `for` headers and neither delimiter creates a
+first-class range value. The exclusive `..` token is also used to delimit
+`string` and `bytes` slices; `..=` is rejected in slice syntax. Descending
+ranges, configurable steps, open-ended ranges, and traditional three-clause
+loops are unsupported. Collection iteration may later reuse
+`for item in collection` after SAO defines iterable types and their iteration
+protocol.
 
 ## 9.3 Naturally terminating loops
 

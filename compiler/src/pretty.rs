@@ -484,6 +484,12 @@ fn format_expression_into(
             child_expression(output, source, "object", object, depth);
             child_expression(output, source, "index", index, depth);
         }
+        ExpressionKind::Slice { object, start, end } => {
+            line(output, depth, format_args!("Slice {}", location(span)));
+            child_expression(output, source, "object", object, depth);
+            optional_expression(output, source, "start", start.as_deref(), depth);
+            optional_expression(output, source, "end", end.as_deref(), depth);
+        }
         ExpressionKind::Try { expression: inner } => {
             line(output, depth, format_args!("Try {}", location(span)));
             child_expression(output, source, "expression", inner, depth);
@@ -869,6 +875,25 @@ mod tests {
         assert_eq!(
             format_expression(source, &expression),
             "Binary Add @ 0..9\n  left:\n    Literal Integer \"1\" @ 0..1\n  right:\n    Identifier \"value\" @ 4..9"
+        );
+    }
+
+    #[test]
+    fn formats_slice_expressions() {
+        let source = "items[-2..-1]";
+        let expression = parse_expression(Lexer::new(source)).expect("slice should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "Slice @ 0..13\n  object:\n    Identifier \"items\" @ 0..5\n  start:\n    Unary Negate @ 6..8\n      operand:\n        Literal Integer \"2\" @ 7..8\n  end:\n    Unary Negate @ 10..12\n      operand:\n        Literal Integer \"1\" @ 11..12"
+        );
+
+        let source = "items[..]";
+        let expression = parse_expression(Lexer::new(source)).expect("full slice should parse");
+
+        assert_eq!(
+            format_expression(source, &expression),
+            "Slice @ 0..9\n  object:\n    Identifier \"items\" @ 0..5\n  start:\n    (none)\n  end:\n    (none)"
         );
     }
 

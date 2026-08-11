@@ -108,6 +108,10 @@ sweeps the outer object, its runtime release function frees the raw buffer
 before the object itself. String storage contains ASCII bytes; `bytes` storage
 contains unrestricted byte values.
 
+Slicing a `string` or `bytes` value allocates an ordinary sequence object of the
+same type and a separate raw buffer containing the selected elements. A slice
+does not share its buffer with the source, including for empty and full slices.
+
 A struct value is a stable pointer to one garbage-collected object. Declared
 fields follow the common header in declaration order, with backend-required
 padding. Anonymous structs place hidden captures after their declared fields.

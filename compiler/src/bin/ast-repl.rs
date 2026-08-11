@@ -183,6 +183,9 @@ fn syntax_error_message(error: ParseError) -> String {
             "{builtin:?} construction expects {expected} value {}, found {found}",
             argument_word(expected)
         ),
+        ParseErrorKind::InclusiveSliceNotSupported => {
+            "inclusive slice ends are not supported; use ..".to_owned()
+        }
         ParseErrorKind::RangeBoundRequiresGrouping => {
             "complex range bounds must be parenthesized".to_owned()
         }
@@ -309,6 +312,17 @@ mod tests {
                 span: Span::new(3, 8),
             }),
             "expected a function or method call after co"
+        );
+    }
+
+    #[test]
+    fn describes_inclusive_slices() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::InclusiveSliceNotSupported,
+                span: Span::new(7, 10),
+            }),
+            "inclusive slice ends are not supported; use .."
         );
     }
 

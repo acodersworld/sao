@@ -19,8 +19,8 @@ errors, and an explicit end-of-file token.
 `co` and `defer` are reserved and tokenized for their implemented call-only
 statement forms. The compiler-known names `Queue`, `Vector`, `Map`, and `Error`
 are also reserved and tokenized distinctly from identifiers. `..` and `..=` are
-tokenized only for the implemented range-`for` grammar; they do not yet
-introduce general range or slice expressions.
+tokenized for the implemented range-`for` grammar, and `..` also delimits
+exclusive `string` and `bytes` slices. Inclusive `..=` slices are rejected.
 
 ## Parser status
 
@@ -36,7 +36,8 @@ The parser currently supports:
   intersection type syntax.
 - Literals, identifiers, `self`, grouping, and expression-oriented blocks.
 - Prefix, binary, assignment, type-test, and postfix operators.
-- Calls, member access, indexing, and postfix error propagation with `?`.
+- Calls, member access, indexing, exclusive open or bounded slicing, and postfix
+  error propagation with `?`.
 - Dedicated `int`, `float`, `bool`, `char`, and `string` conversion expressions
   with exactly one argument.
 - Fixed-arity `Queue<T>`, `Vector<T>`, `Map<K, V>`, and `Error<T>` types, plus
@@ -75,13 +76,7 @@ an interface implementation expression.
 
 Recommended implementation order:
 
-1. Slicing syntax
-   - First settle the source syntax in the design documents.
-   - The design specifies copy semantics but deliberately leaves the spelling
-     unsettled. The lexer and parser currently reserve `..` and `..=` for range
-     `for` headers.
-
-2. Program-level syntax recovery
+1. Program-level syntax recovery
    - Extend the existing whole-program parser to synchronize after malformed
      declarations so one parse can report multiple useful syntax errors.
 
@@ -120,6 +115,8 @@ additional parsing:
 - Primitive conversion validation. The accepted inputs and result of
   `bool(value)` still require a design decision before semantic implementation.
 - Assignment-target and mutability validation.
+- Slice receiver and bound type validation, runtime negative-bound
+  normalization and bounds checks, and allocating copy implementation.
 - Validating `self`, `return`, `break`, and `continue` placement.
 - Range-bound types and immutable induction bindings.
 - Loop result and `else` typing.

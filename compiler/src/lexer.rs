@@ -195,9 +195,9 @@ define_token_kinds! {
     #[token("{")] LeftBrace,
     // Closes a block, structure body, or object expression.
     #[token("}")] RightBrace,
-    // Opens an indexing expression.
+    // Opens an indexing or slicing expression.
     #[token("[")] LeftBracket,
-    // Closes an indexing expression.
+    // Closes an indexing or slicing expression.
     #[token("]")] RightBracket,
     // Separates parameters, arguments, fields, and related list elements.
     #[token(",")] Comma,
@@ -205,9 +205,9 @@ define_token_kinds! {
     #[token(";")] Semicolon,
     // Separates a name from its type or field initializer context.
     #[token(":")] Colon,
-    // Separates the bounds of an exclusive range in a `for` header.
+    // Separates the bounds of an exclusive range or sequence slice.
     #[token("..")] DotDot,
-    // Separates the bounds of an inclusive range in a `for` header.
+    // Separates inclusive range bounds; inclusive slices reject this token.
     #[token("..=")] DotDotEqual,
     // Selects a member from a value.
     #[token(".")] Dot,

@@ -454,6 +454,13 @@ pub enum ExpressionKind {
         object: Box<Expression>,
         index: Box<Expression>,
     },
+    Slice {
+        object: Box<Expression>,
+        /// Omitted by `value[..end]` and `value[..]`.
+        start: Option<Box<Expression>>,
+        /// Omitted by `value[start..]` and `value[..]`.
+        end: Option<Box<Expression>>,
+    },
     Try {
         expression: Box<Expression>,
     },
