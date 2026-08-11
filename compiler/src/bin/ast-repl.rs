@@ -153,6 +153,12 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedInterfaceMember { found } => {
             format!("expected an interface method requirement, found {found:?}")
         }
+        ParseErrorKind::ExpectedDeferredCall => {
+            "expected a function or method call after defer".to_owned()
+        }
+        ParseErrorKind::ExpectedCoroutineCall => {
+            "expected a function or method call after co".to_owned()
+        }
         ParseErrorKind::RangeBoundRequiresGrouping => {
             "complex range bounds must be parenthesized".to_owned()
         }
@@ -257,6 +263,24 @@ mod tests {
                 span: Span::new(0, 5),
             }),
             "expected an interface method requirement, found Identifier"
+        );
+    }
+
+    #[test]
+    fn describes_invalid_call_only_statements() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedDeferredCall,
+                span: Span::new(6, 11),
+            }),
+            "expected a function or method call after defer"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedCoroutineCall,
+                span: Span::new(3, 8),
+            }),
+            "expected a function or method call after co"
         );
     }
 

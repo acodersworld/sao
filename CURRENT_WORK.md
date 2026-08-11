@@ -16,10 +16,10 @@ including ASCII identifiers and literals, nested block comments, conservative
 decimal numbers, every documented operator, byte spans, recoverable lexical
 errors, and an explicit end-of-file token.
 
-`co` and `defer` are reserved and tokenized, but they do not yet have AST or
-parser representations. Likewise, `..` and `..=` are tokenized only for the
-implemented range-`for` grammar; they do not yet introduce general range or
-slice expressions.
+`co` and `defer` are reserved and tokenized for their implemented call-only
+statement forms. `..` and `..=` are tokenized only for the implemented
+range-`for` grammar; they do not yet introduce general range or slice
+expressions.
 
 ## Parser status
 
@@ -42,6 +42,7 @@ The parser currently supports:
   expressions, including initialized fields and methods.
 - Immutable and mutable bindings.
 - Named and nested functions, method receivers, returns, and lambdas.
+- Call-only `defer` and coroutine-start `co` statements.
 - `if`/`else if`/`else`, `loop`, `while`, and integer range `for` expressions.
 - `break`, `continue`, and value-producing loop syntax.
 - Exclusive and inclusive range headers using `..` and `..=`.
@@ -70,29 +71,19 @@ an interface implementation expression.
 
 Recommended implementation order:
 
-1. `defer` statements
-   - The keyword is already reserved by the lexer; add the AST, parser, and
-     pretty-printer representation.
-   - Enforce the call-only syntax `defer function_call();`.
-
-2. `co` coroutine-start statements
-   - The keyword is already reserved by the lexer; add the AST, parser, and
-     pretty-printer representation.
-   - Restrict the operand to a function or method call.
-
-3. Parameterized built-in construction
+1. Parameterized built-in construction
    - Support expression syntax such as `Queue<int>()` while retaining existing
      parameterized type parsing.
    - `Error(value)` already parses as an ordinary call; payload construction is
      validated during semantic analysis.
 
-4. Slicing syntax
+2. Slicing syntax
    - First settle the source syntax in the design documents.
    - The design specifies copy semantics but deliberately leaves the spelling
      unsettled. The lexer and parser currently reserve `..` and `..=` for range
      `for` headers.
 
-5. Program-level syntax recovery
+3. Program-level syntax recovery
    - Extend the existing whole-program parser to synchronize after malformed
      declarations so one parse can report multiple useful syntax errors.
 

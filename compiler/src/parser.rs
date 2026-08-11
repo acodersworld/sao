@@ -36,6 +36,8 @@ pub enum ParseErrorKind {
     ExpectedInterfaceMember {
         found: TokenKind,
     },
+    ExpectedDeferredCall,
+    ExpectedCoroutineCall,
     RangeBoundRequiresGrouping,
     ExpectedToken {
         expected: TokenKind,
@@ -161,6 +163,12 @@ where
     /// two nested parameterized types.
     pending: Option<Token>,
     last_end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallStatementKind {
+    Defer,
+    Coroutine,
 }
 
 impl<I> Parser<I>
@@ -290,6 +298,8 @@ where
             TokenKind::Fn => self.function_statement(),
             TokenKind::Const => self.binding_statement(BindingMutability::Const),
             TokenKind::Mut => self.binding_statement(BindingMutability::Mut),
+            TokenKind::Defer => self.call_statement(CallStatementKind::Defer),
+            TokenKind::Co => self.call_statement(CallStatementKind::Coroutine),
             TokenKind::Break => self.break_statement(),
             TokenKind::Continue => self.continue_statement(),
             TokenKind::Return => self.return_statement(),
@@ -428,6 +438,47 @@ where
             Span::new(expression.span.start, semicolon.span.end)
         };
         Ok(Statement::new(StatementKind::Expression(expression), span))
+    }
+
+    fn call_statement(&mut self, kind: CallStatementKind) -> ParseResult<Statement> {
+        let keyword_kind = match kind {
+            CallStatementKind::Defer => TokenKind::Defer,
+            CallStatementKind::Coroutine => TokenKind::Co,
+        };
+        let keyword = self.expect(keyword_kind)?;
+        let token = self.current()?;
+
+        if matches!(
+            token.kind,
+            TokenKind::Semicolon | TokenKind::RightBrace | TokenKind::Eof
+        ) {
+            return Err(ParseError {
+                kind: expected_call_error(kind),
+                span: token.span,
+            }
+            .into());
+        }
+
+        let call = self.expression(LOWEST_BINDING_POWER, true)?;
+
+        if !matches!(&call.kind, ExpressionKind::Call { .. }) {
+            return Err(ParseError {
+                kind: expected_call_error(kind),
+                span: call.span,
+            }
+            .into());
+        }
+
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+        let statement_kind = match kind {
+            CallStatementKind::Defer => StatementKind::Defer(call),
+            CallStatementKind::Coroutine => StatementKind::Coroutine(call),
+        };
+
+        Ok(Statement::new(
+            statement_kind,
+            Span::new(keyword.span.start, semicolon.span.end),
+        ))
     }
 
     fn break_statement(&mut self) -> ParseResult<Statement> {
@@ -1077,6 +1128,12 @@ where
                 TokenKind::Mut => {
                     statements.push(self.binding_statement(BindingMutability::Mut)?);
                 }
+                TokenKind::Defer => {
+                    statements.push(self.call_statement(CallStatementKind::Defer)?);
+                }
+                TokenKind::Co => {
+                    statements.push(self.call_statement(CallStatementKind::Coroutine)?);
+                }
                 TokenKind::Break => {
                     statements.push(self.break_statement()?);
                 }
@@ -1348,6 +1405,13 @@ fn expression_may_omit_statement_semicolon(expression: &Expression) -> bool {
             | ExpressionKind::While { .. }
             | ExpressionKind::RangeFor { .. }
     )
+}
+
+const fn expected_call_error(kind: CallStatementKind) -> ParseErrorKind {
+    match kind {
+        CallStatementKind::Defer => ParseErrorKind::ExpectedDeferredCall,
+        CallStatementKind::Coroutine => ParseErrorKind::ExpectedCoroutineCall,
+    }
 }
 
 fn range_bound_is_simple(expression: &Expression) -> bool {
@@ -2005,6 +2069,8 @@ mod tests {
     fn rejects_non_declarations_at_top_level() {
         for (source, found, span) in [
             ("const value = 1;", TokenKind::Const, Span::new(0, 5)),
+            ("defer run();", TokenKind::Defer, Span::new(0, 5)),
+            ("co run();", TokenKind::Co, Span::new(0, 2)),
             ("run();", TokenKind::Identifier, Span::new(0, 3)),
             ("return;", TokenKind::Return, Span::new(0, 6)),
             (
@@ -2552,6 +2618,138 @@ mod tests {
                     found: TokenKind::RightBrace,
                 },
                 span: Span::new(9, 10),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_deferred_and_coroutine_calls() {
+        let statement =
+            parse_statement_source("defer cleanup();").expect("defer statement should parse");
+        let StatementKind::Defer(call) = statement.kind else {
+            panic!("expected a defer statement");
+        };
+        assert_eq!(statement.span, Span::new(0, 16));
+        assert_eq!(call.span, Span::new(6, 15));
+        assert!(matches!(
+            call.kind,
+            ExpressionKind::Call {
+                callee,
+                arguments,
+            } if matches!(callee.kind, ExpressionKind::Identifier) && arguments.is_empty()
+        ));
+
+        let statement = parse_statement_source("co service.process(request);")
+            .expect("coroutine statement should parse");
+        let StatementKind::Coroutine(call) = statement.kind else {
+            panic!("expected a coroutine statement");
+        };
+        assert_eq!(statement.span, Span::new(0, 28));
+        assert_eq!(call.span, Span::new(3, 27));
+        assert!(matches!(
+            call.kind,
+            ExpressionKind::Call {
+                callee,
+                arguments,
+            } if matches!(callee.kind, ExpressionKind::MemberAccess { .. })
+                && arguments.len() == 1
+        ));
+    }
+
+    #[test]
+    fn call_only_statements_accept_composed_callees_and_arguments() {
+        for source in [
+            "defer factory()();",
+            "co lambda(value: int) { consume(value); }(item);",
+        ] {
+            let statement = parse_statement_source(source)
+                .expect("an outermost call expression should be accepted");
+            let call = match statement.kind {
+                StatementKind::Defer(call) | StatementKind::Coroutine(call) => call,
+                _ => panic!("expected a call-only statement"),
+            };
+            assert!(matches!(call.kind, ExpressionKind::Call { .. }));
+        }
+
+        let block = parse("{ defer cleanup(first + second); co service.process(load()?); }")
+            .expect("call-only statements should parse in executable blocks");
+        let ExpressionKind::Block(block) = block.kind else {
+            panic!("expected a block");
+        };
+        assert_eq!(block.statements.len(), 2);
+        assert!(matches!(&block.statements[0].kind, StatementKind::Defer(_)));
+        assert!(matches!(
+            &block.statements[1].kind,
+            StatementKind::Coroutine(_)
+        ));
+        assert!(block.value.is_none());
+    }
+
+    #[test]
+    fn call_only_statements_reject_non_call_operands() {
+        for (source, expected_kind) in [
+            ("defer worker;", ParseErrorKind::ExpectedDeferredCall),
+            ("co service.run;", ParseErrorKind::ExpectedCoroutineCall),
+            ("defer 1 + 2;", ParseErrorKind::ExpectedDeferredCall),
+            ("co target = value;", ParseErrorKind::ExpectedCoroutineCall),
+            ("defer {};", ParseErrorKind::ExpectedDeferredCall),
+            ("co cleanup()?;", ParseErrorKind::ExpectedCoroutineCall),
+        ] {
+            let operand_start = source.find(' ').expect("test source has an operand") + 1;
+            let operand_end = source.len() - 1;
+            assert_eq!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: Span::new(operand_start, operand_end),
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn call_only_statements_require_an_operand_and_semicolon() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "defer;",
+                ParseErrorKind::ExpectedDeferredCall,
+                Span::new(5, 6),
+            ),
+            (
+                "co;",
+                ParseErrorKind::ExpectedCoroutineCall,
+                Span::new(2, 3),
+            ),
+        ] {
+            assert_eq!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+
+        assert_eq!(
+            parse_statement_source("defer cleanup()"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::Eof,
+                },
+                span: Span::new(15, 15),
+            }))
+        );
+        assert_eq!(
+            parse("{ co run() }"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::RightBrace,
+                },
+                span: Span::new(11, 12),
             }))
         );
     }

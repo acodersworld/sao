@@ -314,6 +314,12 @@ pub enum StatementKind {
     },
     Expression(Expression),
     Function(Function),
+    /// Registers a call to run when the current lexical block exits. The
+    /// parser guarantees that the expression is an [`ExpressionKind::Call`].
+    Defer(Expression),
+    /// Starts a call in a new coroutine. The parser guarantees that the
+    /// expression is an [`ExpressionKind::Call`].
+    Coroutine(Expression),
     Break(Option<Expression>),
     Continue,
     Return(Option<Expression>),

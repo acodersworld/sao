@@ -210,6 +210,14 @@ fn format_statement_into(output: &mut String, source: &str, statement: &Statemen
         StatementKind::Function(function) => {
             format_function_into(output, source, function, depth);
         }
+        StatementKind::Defer(call) => {
+            line(output, depth, format_args!("Defer {}", location(span)));
+            child_expression(output, source, "call", call, depth);
+        }
+        StatementKind::Coroutine(call) => {
+            line(output, depth, format_args!("Coroutine {}", location(span)));
+            child_expression(output, source, "call", call, depth);
+        }
         StatementKind::Break(value) => {
             line(output, depth, format_args!("Break {}", location(span)));
             optional_expression(output, source, "value", value.as_ref(), depth);
@@ -917,6 +925,23 @@ mod tests {
         assert_eq!(
             format_statement(source, &statement),
             "ExpressionStatement @ 0..6\n  expression:\n    Call @ 0..5\n      callee:\n        Identifier \"run\" @ 0..3\n      arguments:\n        (empty)"
+        );
+    }
+
+    #[test]
+    fn formats_deferred_and_coroutine_calls() {
+        let source = "defer cleanup(resource);";
+        let statement = parse_statement(Lexer::new(source)).expect("defer should parse");
+        assert_eq!(
+            format_statement(source, &statement),
+            "Defer @ 0..24\n  call:\n    Call @ 6..23\n      callee:\n        Identifier \"cleanup\" @ 6..13\n      arguments:\n        [0]:\n          Identifier \"resource\" @ 14..22"
+        );
+
+        let source = "co service.process(request);";
+        let statement = parse_statement(Lexer::new(source)).expect("coroutine should parse");
+        assert_eq!(
+            format_statement(source, &statement),
+            "Coroutine @ 0..28\n  call:\n    Call @ 3..27\n      callee:\n        MemberAccess \"process\" @ 3..18\n          object:\n            Identifier \"service\" @ 3..10\n      arguments:\n        [0]:\n          Identifier \"request\" @ 19..26"
         );
     }
 
