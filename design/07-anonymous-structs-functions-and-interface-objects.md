@@ -1,15 +1,16 @@
 # 7. Anonymous structs, lambdas, and interface objects
 
-## 7.1 Interface-constrained anonymous structs
+## 7.1 Contextually typed anonymous structs
 
-An interface can be used to construct an anonymous implementation:
+An ordinary anonymous struct can be converted to a structural interface through
+an expected type:
 
 ```text
 interface Greeter {
     fn greet(self, name: string) -> string;
 }
 
-const greeter = Greeter {
+const greeter: Greeter = struct {
     prefix: string = "Hello";
 
     fn greet(self, name: string) -> string {
@@ -18,16 +19,20 @@ const greeter = Greeter {
 };
 ```
 
-This is the interface-constrained form of an anonymous struct expression. It
-does not instantiate the interface itself. The compiler creates a hidden nominal
-struct containing the declared fields and methods, verifies that it satisfies
-the interface, and converts it to an interface value.
+The `struct { ... }` expression creates a hidden nominal struct containing the
+declared fields and methods. The `Greeter` annotation supplies the expected
+type, so the compiler verifies structural satisfaction and converts the result
+to an interface value. Function arguments and return expressions receive the
+same contextual conversion from their parameter or return type.
 
-Anonymous interface object rules:
+Contextual interface-conversion rules:
 
-- `Interface { ... }` constructs a hidden implementation.
-- General `struct { ... }` expressions construct unconstrained anonymous
-  structs.
+- `struct { ... }` is the only anonymous-struct construction syntax; an
+  interface name is never itself constructed.
+- An expected interface or interface-intersection type checks the hidden
+  struct's method set and converts the resulting reference to that type.
+- Without an expected interface type, local inference retains the anonymous
+  struct's exact hidden type until it is used in an interface context.
 - Field initializers at object scope define hidden fields and are written
   `name: Type = expression;`. The type annotation may be omitted when it can be
   inferred unambiguously.
@@ -35,8 +40,10 @@ Anonymous interface object rules:
 - All required interface methods must be present.
 - Non-unit method return types remain explicit; an omitted annotation defaults
   to `()`.
-- Hidden fields are not accessible through the interface value.
-- Extra implementation methods are not visible through the interface value.
+- Hidden fields are not accessible after conversion through the interface
+  value.
+- Extra implementation methods are not visible through the converted interface
+  value.
 - The source program cannot name the compiler-generated backing type.
 
 ## 7.2 Capture semantics
@@ -51,7 +58,7 @@ interface IntPredicate {
 }
 
 fn greater_than(limit: int) -> IntPredicate {
-    IntPredicate {
+    struct {
         fn test(self, value: int) -> bool {
             value > limit
         }
@@ -213,7 +220,7 @@ captures together:
 ```
 
 Every method receives that object as `self`, so all methods share the same
-captures. Interface-constrained anonymous structs use this same representation
+captures. Contextually converted anonymous structs use this same representation
 behind their interface value.
 
 SAO execution is single-threaded. Closure environments, shared capture cells,

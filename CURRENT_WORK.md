@@ -7,7 +7,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-08-10
+Last reviewed: 2026-08-11
 
 ## Parser status
 
@@ -15,8 +15,10 @@ The parser currently supports:
 
 - Single-expression, single-type, single-statement, and whole-program entry
   points.
-- File-level programs containing ordered top-level function and named struct
-  declarations.
+- File-level programs containing ordered top-level function, named struct, and
+  structural interface declarations.
+- Semicolon-terminated interface method requirements with receiver, parameter,
+  and return-type syntax.
 - Primitive, named, parameterized, mutable, grouped, callable, union, and
   intersection type syntax.
 - Literals, identifiers, `self`, grouping, and expression-oriented blocks.
@@ -46,34 +48,34 @@ Brace-based struct construction is also disabled directly in `if`, `while`,
 and range `for` heads so the following brace always begins the control-flow
 body. Parentheses re-enable it, as in `if (Position { x: 1.0, y: 2.0 }) {}`.
 
+Interfaces use contextual structural conversion rather than dedicated
+construction syntax. `struct { ... }` is the only anonymous-struct expression;
+an annotation, parameter, or return type may later convert its hidden concrete
+type to a satisfied interface during semantic analysis. `Writer { ... }` is not
+an interface implementation expression.
+
 ## Parser work queue
 
 Recommended implementation order:
 
-1. Interface declarations and anonymous implementations
-   - Parse semicolon-terminated interface method requirements.
-   - Parse interface-constrained anonymous objects such as `Writer { ... }`.
-   - Reuse the struct-construction disambiguation rule: construction in `if`,
-     `while`, and range `for` heads must be parenthesized.
-
-2. `defer` statements
+1. `defer` statements
    - Add the AST and parser representation.
    - Enforce the call-only syntax `defer function_call();`.
 
-3. `co` coroutine calls
+2. `co` coroutine calls
    - Add the AST and parser representation.
    - Restrict the operand to a function or method call.
 
-4. Parameterized built-in construction
+3. Parameterized built-in construction
    - Support expression syntax such as `Queue<int>()` while retaining existing
      parameterized type parsing.
 
-5. Slicing syntax
+4. Slicing syntax
    - First settle the source syntax in the design documents.
    - The lexer and parser currently reserve `..` and `..=` for range `for`
      headers, although byte slicing semantics are mentioned in the design.
 
-6. Program-level syntax recovery
+5. Program-level syntax recovery
    - After whole-program parsing exists, synchronize after malformed declarations
      so one parse can report multiple useful syntax errors.
 
@@ -92,7 +94,8 @@ additional parsing:
 - Range-bound types and immutable induction bindings.
 - Loop result and `else` typing.
 - Lambda, nested-function, and anonymous-object capture analysis.
-- Struct field validation and interface satisfaction.
+- Struct field validation, interface satisfaction, and contextual
+  struct-to-interface conversion.
 - Error propagation, coroutine, and `defer` lowering.
 - Runtime representation and code generation.
 

@@ -36,11 +36,11 @@ fn copy(mut stream: Reader & Writer) -> () {
 }
 ```
 
-A value of `Reader & Writer` must satisfy both interfaces. Intersections can also
-be used for anonymous implementations:
+A value of `Reader & Writer` must satisfy both interfaces. An intersection type
+can contextually accept an anonymous struct that satisfies every member:
 
 ```text
-mut stream = Reader & Writer {
+mut stream: Reader & Writer = struct {
     fn read(mut self, count: int) -> bytes {
         // ...
     }

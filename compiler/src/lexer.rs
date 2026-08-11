@@ -126,7 +126,7 @@ define_token_kinds! {
     #[token("lambda")] Lambda,
     // Begins a named or anonymous structure declaration.
     #[token("struct")] Struct,
-    // Begins an interface declaration or interface-object expression.
+    // Begins a named structural interface declaration.
     #[token("interface")] Interface,
     // Declares an immutable local binding.
     #[token("const")] Const,

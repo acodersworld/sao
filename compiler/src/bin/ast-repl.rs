@@ -150,6 +150,9 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedAnonymousStructMember { found } => {
             format!("expected an anonymous struct field or method, found {found:?}")
         }
+        ParseErrorKind::ExpectedInterfaceMember { found } => {
+            format!("expected an interface method requirement, found {found:?}")
+        }
         ParseErrorKind::RangeBoundRequiresGrouping => {
             "complex range bounds must be parenthesized".to_owned()
         }
@@ -241,6 +244,19 @@ mod tests {
                 span: Span::new(0, 6),
             }),
             "expected an anonymous struct field or method, found Return"
+        );
+    }
+
+    #[test]
+    fn describes_invalid_interface_members() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedInterfaceMember {
+                    found: sao_compiler::lexer::TokenKind::Identifier,
+                },
+                span: Span::new(0, 5),
+            }),
+            "expected an interface method requirement, found Identifier"
         );
     }
 

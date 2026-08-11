@@ -3,9 +3,10 @@ use std::iter::Peekable;
 use crate::ast::{
     AnonymousStructField, AnonymousStructMember, AssignmentOperator, BinaryOperator,
     BindingMutability, Block, ConditionalElse, Declaration, Expression, ExpressionKind, Function,
-    FunctionParameter, FunctionParameterKind, LiteralKind, PrimitiveType, Program,
-    RangeInclusivity, Statement, StatementKind, StructDeclaration, StructField,
-    StructFieldInitializer, StructMember, TypeKind, TypeSyntax, UnaryOperator,
+    FunctionParameter, FunctionParameterKind, InterfaceDeclaration, InterfaceMethodRequirement,
+    LiteralKind, PrimitiveType, Program, RangeInclusivity, Statement, StatementKind,
+    StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
+    UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -30,6 +31,9 @@ pub enum ParseErrorKind {
         found: TokenKind,
     },
     ExpectedAnonymousStructMember {
+        found: TokenKind,
+    },
+    ExpectedInterfaceMember {
         found: TokenKind,
     },
     RangeBoundRequiresGrouping,
@@ -189,12 +193,57 @@ where
         match token.kind {
             TokenKind::Fn => Ok(Declaration::Function(self.function()?)),
             TokenKind::Struct => Ok(Declaration::Struct(self.struct_declaration()?)),
+            TokenKind::Interface => Ok(Declaration::Interface(self.interface_declaration()?)),
             _ => Err(ParseError {
                 kind: ParseErrorKind::ExpectedTopLevelDeclaration { found: token.kind },
                 span: token.span,
             }
             .into()),
         }
+    }
+
+    fn interface_declaration(&mut self) -> ParseResult<InterfaceDeclaration> {
+        let keyword = self.expect(TokenKind::Interface)?;
+        let name = self.expect(TokenKind::Identifier)?;
+        self.expect(TokenKind::LeftBrace)?;
+        let mut requirements = Vec::new();
+
+        let right_brace = loop {
+            let token = self.current()?;
+            match token.kind {
+                TokenKind::RightBrace => break self.advance()?,
+                TokenKind::Eof => break self.expect(TokenKind::RightBrace)?,
+                TokenKind::Fn => requirements.push(self.interface_method_requirement()?),
+                _ => {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::ExpectedInterfaceMember { found: token.kind },
+                        span: token.span,
+                    }
+                    .into());
+                }
+            }
+        };
+
+        Ok(InterfaceDeclaration::new(
+            name.span,
+            requirements,
+            Span::new(keyword.span.start, right_brace.span.end),
+        ))
+    }
+
+    fn interface_method_requirement(&mut self) -> ParseResult<InterfaceMethodRequirement> {
+        let keyword = self.expect(TokenKind::Fn)?;
+        let name = self.expect(TokenKind::Identifier)?;
+        let parameters = self.function_parameters(true)?;
+        let return_type = self.optional_return_type()?;
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+
+        Ok(InterfaceMethodRequirement::new(
+            name.span,
+            parameters,
+            return_type,
+            Span::new(keyword.span.start, semicolon.span.end),
+        ))
     }
 
     fn struct_declaration(&mut self) -> ParseResult<StructDeclaration> {
@@ -1698,6 +1747,258 @@ mod tests {
                 "incorrect diagnostic for {source}",
             );
         }
+    }
+
+    #[test]
+    fn parses_empty_and_multi_method_interface_declarations() {
+        let source = concat!(
+            "interface Empty {}\n",
+            "interface Stream {\n",
+            "    fn read(mut self, count: int,) -> Queue<Result<bytes>>;\n",
+            "    fn copy(self, source: Reader & Seekable) -> bytes | none;\n",
+            "    fn close(self);\n",
+            "}\n",
+            "struct Buffer {}\n",
+            "fn main() {}",
+        );
+        let program = parse_program_source(source).expect("interfaces should parse");
+
+        assert_eq!(program.declarations.len(), 4);
+        let Declaration::Interface(empty) = &program.declarations[0] else {
+            panic!("expected Empty interface");
+        };
+        let Declaration::Interface(stream) = &program.declarations[1] else {
+            panic!("expected Stream interface");
+        };
+        let Declaration::Struct(_) = &program.declarations[2] else {
+            panic!("expected Buffer struct");
+        };
+        let Declaration::Function(_) = &program.declarations[3] else {
+            panic!("expected main function");
+        };
+
+        assert!(empty.requirements.is_empty());
+        assert_eq!(&source[empty.name.start..empty.name.end], "Empty");
+        assert_eq!(stream.requirements.len(), 3);
+        assert_eq!(&source[stream.name.start..stream.name.end], "Stream");
+
+        let read = &stream.requirements[0];
+        assert_eq!(&source[read.name.start..read.name.end], "read");
+        assert_eq!(read.parameters.len(), 2);
+        assert_eq!(read.parameters[0].mutability, BindingMutability::Mut);
+        assert!(matches!(
+            &read.parameters[0].kind,
+            FunctionParameterKind::Receiver { .. }
+        ));
+        assert!(matches!(
+            read.return_type.as_ref(),
+            Some(TypeSyntax {
+                kind: TypeKind::Named { arguments, .. },
+                ..
+            }) if arguments.len() == 1
+        ));
+        assert_eq!(&source[read.span.end - 1..read.span.end], ";");
+
+        let copy = &stream.requirements[1];
+        assert!(matches!(
+            &copy.parameters[1].kind,
+            FunctionParameterKind::Named {
+                type_annotation: TypeSyntax {
+                    kind: TypeKind::Intersection { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            copy.return_type.as_ref(),
+            Some(TypeSyntax {
+                kind: TypeKind::Union { .. },
+                ..
+            })
+        ));
+
+        let close = &stream.requirements[2];
+        assert_eq!(&source[close.name.start..close.name.end], "close");
+        assert!(close.return_type.is_none());
+        assert_eq!(stream.span.end, source.find("\nstruct Buffer").unwrap());
+    }
+
+    #[test]
+    fn reports_malformed_interface_declarations() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "interface",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Eof,
+                },
+                Span::new(9, 9),
+            ),
+            (
+                "interface Reader",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::LeftBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(16, 16),
+            ),
+            (
+                "interface Reader { value: int, }",
+                ParseErrorKind::ExpectedInterfaceMember {
+                    found: TokenKind::Identifier,
+                },
+                Span::new(19, 24),
+            ),
+            (
+                "interface Reader { fn (self); }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::LeftParen,
+                },
+                Span::new(22, 23),
+            ),
+            (
+                "interface Reader { fn read(value); }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Colon,
+                    found: TokenKind::RightParen,
+                },
+                Span::new(32, 33),
+            ),
+            (
+                "interface Reader { fn read(self) {} }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::LeftBrace,
+                },
+                Span::new(33, 34),
+            ),
+            (
+                "interface Reader { fn read(self) }",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Semicolon,
+                    found: TokenKind::RightBrace,
+                },
+                Span::new(33, 34),
+            ),
+            (
+                "interface Reader {",
+                ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::RightBrace,
+                    found: TokenKind::Eof,
+                },
+                Span::new(18, 18),
+            ),
+        ] {
+            assert_eq!(
+                parse_program_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+    }
+
+    #[test]
+    fn interface_declarations_are_file_level_only() {
+        assert_eq!(
+            parse_statement_source("interface Local {}"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Interface,
+                },
+                span: Span::new(0, 9),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_contextually_typed_anonymous_struct_examples() {
+        let statement = parse_statement_source(concat!(
+            "const writer: Writer = struct { ",
+            "fn write(mut self, data: bytes) -> int { 1 }",
+            " };",
+        ))
+        .expect("annotated anonymous struct should parse");
+        let StatementKind::Binding {
+            type_annotation,
+            initializer,
+            ..
+        } = statement.kind
+        else {
+            panic!("expected binding");
+        };
+        assert!(matches!(
+            type_annotation,
+            Some(TypeSyntax {
+                kind: TypeKind::Named { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            initializer.kind,
+            ExpressionKind::AnonymousStruct { .. }
+        ));
+
+        let source = concat!(
+            "fn make_writer() -> Writer { ",
+            "struct { fn write(mut self, data: bytes) -> int { 1 } }",
+            " }",
+        );
+        let program = parse_program_source(source).expect("contextual return should parse");
+        let Declaration::Function(function) = &program.declarations[0] else {
+            panic!("expected function");
+        };
+        assert!(matches!(
+            function.body.value.as_deref(),
+            Some(Expression {
+                kind: ExpressionKind::AnonymousStruct { .. },
+                ..
+            })
+        ));
+
+        let statement = parse_statement_source(concat!(
+            "consume_writer(struct { ",
+            "fn write(mut self, data: bytes) -> int { 1 }",
+            " });",
+        ))
+        .expect("anonymous struct argument should parse");
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::Call { arguments, .. },
+            ..
+        }) = statement.kind
+        else {
+            panic!("expected call statement");
+        };
+        assert!(matches!(
+            arguments[0].kind,
+            ExpressionKind::AnonymousStruct { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_removed_interface_construction_syntax() {
+        let source = "Writer { fn write(self) {} }";
+        assert_eq!(
+            parse(source),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Fn,
+                },
+                span: Span::new(9, 11),
+            }))
+        );
+
+        assert!(matches!(
+            parse("Position { x: 1 }")
+                .expect("named struct construction should remain valid")
+                .kind,
+            ExpressionKind::StructConstruction { .. }
+        ));
     }
 
     #[test]

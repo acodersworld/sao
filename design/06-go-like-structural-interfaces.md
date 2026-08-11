@@ -12,6 +12,12 @@ Interface satisfaction is structural and implicit. A type satisfies an
 interface when it has the required method set with compatible signatures. No
 explicit `implements` declaration is required.
 
+When an expression is expected to have an interface or interface-intersection
+type, a satisfying named or anonymous struct reference is implicitly converted
+to that type. Interface names do not provide construction expressions of their
+own. An interface with no method requirements is valid and is satisfied by
+every struct.
+
 ```text
 struct User {
     name: string,

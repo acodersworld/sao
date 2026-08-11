@@ -2,9 +2,9 @@ use std::fmt::{Arguments, Write};
 
 use crate::ast::{
     AnonymousStructField, AnonymousStructMember, Block, ConditionalElse, Declaration, Expression,
-    ExpressionKind, Function, FunctionParameter, FunctionParameterKind, Program, Statement,
-    StatementKind, StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind,
-    TypeSyntax,
+    ExpressionKind, Function, FunctionParameter, FunctionParameterKind, InterfaceDeclaration,
+    InterfaceMethodRequirement, Program, Statement, StatementKind, StructDeclaration, StructField,
+    StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
 };
 use crate::lexer::Span;
 
@@ -74,7 +74,57 @@ fn format_declaration_into(
         Declaration::Struct(structure) => {
             format_struct_declaration_into(output, source, structure, depth);
         }
+        Declaration::Interface(interface) => {
+            format_interface_declaration_into(output, source, interface, depth);
+        }
     }
+}
+
+fn format_interface_declaration_into(
+    output: &mut String,
+    source: &str,
+    interface: &InterfaceDeclaration,
+    depth: usize,
+) {
+    line(
+        output,
+        depth,
+        format_args!(
+            "Interface {:?} {}",
+            text(source, interface.name),
+            location(interface.span)
+        ),
+    );
+    line(output, depth + 1, format_args!("requirements:"));
+
+    if interface.requirements.is_empty() {
+        line(output, depth + 2, format_args!("(empty)"));
+        return;
+    }
+
+    for (index, requirement) in interface.requirements.iter().enumerate() {
+        line(output, depth + 2, format_args!("[{index}]:"));
+        format_interface_requirement_into(output, source, requirement, depth + 3);
+    }
+}
+
+fn format_interface_requirement_into(
+    output: &mut String,
+    source: &str,
+    requirement: &InterfaceMethodRequirement,
+    depth: usize,
+) {
+    line(
+        output,
+        depth,
+        format_args!(
+            "MethodRequirement {:?} {}",
+            text(source, requirement.name),
+            location(requirement.span)
+        ),
+    );
+    parameter_list(output, source, &requirement.parameters, depth);
+    optional_return_type(output, source, requirement.return_type.as_ref(), depth);
 }
 
 fn format_struct_declaration_into(
@@ -751,6 +801,35 @@ mod tests {
         assert!(output.contains("Primitive Float @ 18..23"));
         assert!(output.contains("Function \"get_x\" @ 25..59"));
         assert!(output.contains("Parameter Const Self"));
+    }
+
+    #[test]
+    fn formats_interface_declarations() {
+        let source = concat!(
+            "interface Writer { ",
+            "fn write(mut self, data: bytes) -> int; ",
+            "fn close(self);",
+            " }",
+        );
+        let program = parse_program(Lexer::new(source)).expect("interface should parse");
+        let output = format_program(source, &program);
+
+        assert!(output.contains(&format!("Interface \"Writer\" @ 0..{}", source.len())));
+        assert!(output.contains("requirements:"));
+        assert!(output.contains("MethodRequirement \"write\""));
+        assert!(output.contains("Parameter Mut Self"));
+        assert!(output.contains("Parameter Const \"data\""));
+        assert!(output.contains("Primitive Bytes"));
+        assert!(output.contains("Primitive Int"));
+        assert!(output.contains("MethodRequirement \"close\""));
+        assert!(output.contains("(default ())"));
+
+        let source = "interface Empty {}";
+        let program = parse_program(Lexer::new(source)).expect("empty interface should parse");
+        assert_eq!(
+            format_program(source, &program),
+            "Program @ 0..18\n  declarations:\n    [0]:\n      Interface \"Empty\" @ 0..18\n        requirements:\n          (empty)"
+        );
     }
 
     #[test]

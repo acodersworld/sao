@@ -43,7 +43,7 @@ fn copy_once(mut stream: Reader & Writer) -> int {
 }
 
 fn prefixed_writer(prefix: bytes, mut destination: Writer) -> mut Writer {
-    Writer {
+    struct {
         fn write(mut self, data: bytes) -> int {
             destination.write(bytes.concat(prefix, data))
         }

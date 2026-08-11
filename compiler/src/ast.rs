@@ -19,6 +19,57 @@ impl Program {
 pub enum Declaration {
     Function(Function),
     Struct(StructDeclaration),
+    Interface(InterfaceDeclaration),
+}
+
+/// A named structural interface declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceDeclaration {
+    pub name: Span,
+    pub requirements: Vec<InterfaceMethodRequirement>,
+    pub span: Span,
+}
+
+impl InterfaceDeclaration {
+    #[must_use]
+    pub const fn new(
+        name: Span,
+        requirements: Vec<InterfaceMethodRequirement>,
+        span: Span,
+    ) -> Self {
+        Self {
+            name,
+            requirements,
+            span,
+        }
+    }
+}
+
+/// One bodyless method signature required by an interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceMethodRequirement {
+    pub name: Span,
+    pub parameters: Vec<FunctionParameter>,
+    /// An explicit return annotation. Its absence defaults to unit.
+    pub return_type: Option<TypeSyntax>,
+    pub span: Span,
+}
+
+impl InterfaceMethodRequirement {
+    #[must_use]
+    pub const fn new(
+        name: Span,
+        parameters: Vec<FunctionParameter>,
+        return_type: Option<TypeSyntax>,
+        span: Span,
+    ) -> Self {
+        Self {
+            name,
+            parameters,
+            return_type,
+            span,
+        }
+    }
 }
 
 /// A named nominal struct declaration.
