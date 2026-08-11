@@ -128,16 +128,23 @@ fn myfunc() -> int | Error<string> {
 SAO does not initially support user-defined generic structs, functions, or
 interfaces. `Error<T>` is a compiler-known type constructor with dedicated
 type-checking and lowering rules, not an instance of a general source-language
-generic facility. Other built-in parameterized types may be added later without
-enabling user-defined generics.
+generic facility. The other initial compiler-known parameterized types are
+described in Section 17. They do not enable user-defined generics.
 
 Each `Error<T>` instantiation is distinct from its payload type, from every
 non-error member of a union, and from `Error<U>` when `T` and `U` differ.
-`Error(value)` is the initial construction syntax. Without an expected type,
-the payload type is the exact type of `value`:
+Both `Error(value)` and `Error<T>(value)` are construction syntax. In the first
+form, without an expected type, the payload type is the exact type of `value`:
 
 ```text
 const error = Error("operation failed"); // Error<string>
+```
+
+The explicit form supplies the payload type directly and requires the value to
+be assignable to it:
+
+```text
+const error = Error<string>("operation failed");
 ```
 
 An expected `Error<T>` type may instead guide construction when the value is

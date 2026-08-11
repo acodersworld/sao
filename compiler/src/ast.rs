@@ -343,6 +343,10 @@ pub enum RangeInclusivity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
     Primitive(PrimitiveType),
+    Builtin {
+        builtin: BuiltinType,
+        arguments: Vec<TypeSyntax>,
+    },
     Named {
         name: Span,
         arguments: Vec<TypeSyntax>,
@@ -361,6 +365,15 @@ pub enum TypeKind {
     Union {
         members: Vec<TypeSyntax>,
     },
+}
+
+/// A reserved compiler-known parameterized type constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinType {
+    Queue,
+    Vector,
+    Map,
+    Error,
 }
 
 /// A built-in type with a reserved source spelling.
@@ -415,6 +428,12 @@ pub enum ExpressionKind {
     PrimitiveConversion {
         target: PrimitiveType,
         value: Box<Expression>,
+    },
+    BuiltinConstruction {
+        builtin: BuiltinType,
+        /// Empty only for `Error(value)`, whose payload type is inferred later.
+        type_arguments: Vec<TypeSyntax>,
+        arguments: Vec<Expression>,
     },
     StructConstruction {
         name: Span,

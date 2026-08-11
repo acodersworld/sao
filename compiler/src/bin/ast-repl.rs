@@ -1,5 +1,7 @@
 use std::io::{self, BufRead, Write};
 
+#[cfg(test)]
+use sao_compiler::ast::BuiltinType;
 use sao_compiler::lexer::{Lexer, Span};
 use sao_compiler::parser::{
     FrontendError, ParseError, ParseErrorKind, parse_expression, parse_statement, parse_type,
@@ -159,6 +161,28 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedCoroutineCall => {
             "expected a function or method call after co".to_owned()
         }
+        ParseErrorKind::ExpectedBuiltinTypeArguments { builtin, found } => {
+            format!("expected type arguments after {builtin:?}, found {found:?}")
+        }
+        ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+            builtin,
+            expected,
+            found,
+        } => format!(
+            "{builtin:?} expects {expected} type {}, found {found}",
+            argument_word(expected)
+        ),
+        ParseErrorKind::ExpectedBuiltinConstructor { builtin, found } => {
+            format!("expected ( to construct {builtin:?}, found {found:?}")
+        }
+        ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
+            builtin,
+            expected,
+            found,
+        } => format!(
+            "{builtin:?} construction expects {expected} value {}, found {found}",
+            argument_word(expected)
+        ),
         ParseErrorKind::RangeBoundRequiresGrouping => {
             "complex range bounds must be parenthesized".to_owned()
         }
@@ -167,6 +191,10 @@ fn syntax_error_message(error: ParseError) -> String {
         }
         ParseErrorKind::UnexpectedToken { found } => format!("unexpected token {found:?}"),
     }
+}
+
+const fn argument_word(count: usize) -> &'static str {
+    if count == 1 { "argument" } else { "arguments" }
 }
 
 fn character_count(source: &str, span: Span) -> usize {
@@ -281,6 +309,52 @@ mod tests {
                 span: Span::new(3, 8),
             }),
             "expected a function or method call after co"
+        );
+    }
+
+    #[test]
+    fn describes_invalid_parameterized_builtin_syntax() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedBuiltinTypeArguments {
+                    builtin: BuiltinType::Queue,
+                    found: sao_compiler::lexer::TokenKind::LeftParen,
+                },
+                span: Span::new(5, 6),
+            }),
+            "expected type arguments after Queue, found LeftParen"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+                    builtin: BuiltinType::Map,
+                    expected: 2,
+                    found: 1,
+                },
+                span: Span::new(0, 8),
+            }),
+            "Map expects 2 type arguments, found 1"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::ExpectedBuiltinConstructor {
+                    builtin: BuiltinType::Vector,
+                    found: sao_compiler::lexer::TokenKind::Eof,
+                },
+                span: Span::new(11, 11),
+            }),
+            "expected ( to construct Vector, found Eof"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
+                    builtin: BuiltinType::Error,
+                    expected: 1,
+                    found: 0,
+                },
+                span: Span::new(0, 7),
+            }),
+            "Error construction expects 1 value argument, found 0"
         );
     }
 

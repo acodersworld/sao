@@ -26,3 +26,4 @@ provisional syntax and ideas intentionally deferred until later.
 14. [14. Deferred features](design/14-deferred-features.md)
 15. [15. Current language sketch](design/15-current-language-sketch.md)
 16. [16. Lexical grammar](design/16-lexical-grammar.md)
+17. [17. Parameterized built-ins](design/17-parameterized-built-ins.md)

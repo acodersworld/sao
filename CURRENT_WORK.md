@@ -17,9 +17,10 @@ decimal numbers, every documented operator, byte spans, recoverable lexical
 errors, and an explicit end-of-file token.
 
 `co` and `defer` are reserved and tokenized for their implemented call-only
-statement forms. `..` and `..=` are tokenized only for the implemented
-range-`for` grammar; they do not yet introduce general range or slice
-expressions.
+statement forms. The compiler-known names `Queue`, `Vector`, `Map`, and `Error`
+are also reserved and tokenized distinctly from identifiers. `..` and `..=` are
+tokenized only for the implemented range-`for` grammar; they do not yet
+introduce general range or slice expressions.
 
 ## Parser status
 
@@ -38,6 +39,9 @@ The parser currently supports:
 - Calls, member access, indexing, and postfix error propagation with `?`.
 - Dedicated `int`, `float`, `bool`, `char`, and `string` conversion expressions
   with exactly one argument.
+- Fixed-arity `Queue<T>`, `Vector<T>`, `Map<K, V>`, and `Error<T>` types, plus
+  their canonical construction expressions. Both inferred `Error(value)` and
+  explicit `Error<T>(value)` forms are supported.
 - Named struct construction and unconstrained anonymous `struct { ... }`
   expressions, including initialized fields and methods.
 - Immutable and mutable bindings.
@@ -71,19 +75,13 @@ an interface implementation expression.
 
 Recommended implementation order:
 
-1. Parameterized built-in construction
-   - Support expression syntax such as `Queue<int>()` while retaining existing
-     parameterized type parsing.
-   - `Error(value)` already parses as an ordinary call; payload construction is
-     validated during semantic analysis.
-
-2. Slicing syntax
+1. Slicing syntax
    - First settle the source syntax in the design documents.
    - The design specifies copy semantics but deliberately leaves the spelling
      unsettled. The lexer and parser currently reserve `..` and `..=` for range
      `for` headers.
 
-3. Program-level syntax recovery
+2. Program-level syntax recovery
    - Extend the existing whole-program parser to synchronize after malformed
      declarations so one parse can report multiple useful syntax errors.
 
@@ -117,6 +115,8 @@ additional parsing:
 - Name and scope resolution.
 - Entry-point validation, including the required unique `main` signature.
 - Type checking and inference.
+- Parameterized built-in element/key/payload validation, `Error(value)` payload
+  inference, and the eventual Vector and Map APIs and lowering.
 - Primitive conversion validation. The accepted inputs and result of
   `bool(value)` still require a design decision before semantic implementation.
 - Assignment-target and mutability validation.
@@ -138,6 +138,7 @@ changes:
 - Collection-based `for item in collection` loops.
 - General `match` expressions and pattern matching.
 - User-defined generics.
+- Vector and Map APIs and runtime representations.
 - Nominal data-carrying enums.
 - Modules, imports, and visibility.
 - `errdefer`.

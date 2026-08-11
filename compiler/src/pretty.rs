@@ -429,6 +429,19 @@ fn format_expression_into(
             );
             child_expression(output, source, "value", value, depth);
         }
+        ExpressionKind::BuiltinConstruction {
+            builtin,
+            type_arguments,
+            arguments,
+        } => {
+            line(
+                output,
+                depth,
+                format_args!("BuiltinConstruction {builtin:?} {}", location(span)),
+            );
+            type_list(output, source, "type_arguments", type_arguments, depth);
+            expression_list(output, source, "arguments", arguments, depth);
+        }
         ExpressionKind::StructConstruction { name, fields } => {
             line(
                 output,
@@ -685,6 +698,14 @@ fn format_type_into(output: &mut String, source: &str, type_syntax: &TypeSyntax,
             depth,
             format_args!("Primitive {primitive:?} {}", location(span)),
         ),
+        TypeKind::Builtin { builtin, arguments } => {
+            line(
+                output,
+                depth,
+                format_args!("Builtin {builtin:?} {}", location(span)),
+            );
+            type_list(output, source, "arguments", arguments, depth);
+        }
         TypeKind::Named { name, arguments } => {
             line(
                 output,
@@ -863,6 +884,46 @@ mod tests {
     }
 
     #[test]
+    fn formats_parameterized_builtin_construction() {
+        for (source, builtin) in [
+            ("Queue<int>()", "Queue"),
+            ("Vector<string>()", "Vector"),
+            ("Map<string, int>()", "Map"),
+        ] {
+            let expression =
+                parse_expression(Lexer::new(source)).expect("collection construction should parse");
+            assert!(
+                format_expression(source, &expression)
+                    .starts_with(&format!("BuiltinConstruction {builtin}"))
+            );
+        }
+
+        let source = "Error<string>(message)";
+        let expression =
+            parse_expression(Lexer::new(source)).expect("built-in construction should parse");
+        assert_eq!(
+            format_expression(source, &expression),
+            "BuiltinConstruction Error @ 0..22\n  type_arguments:\n    [0]:\n      Primitive String @ 6..12\n  arguments:\n    [0]:\n      Identifier \"message\" @ 14..21"
+        );
+
+        let source = "Error(message)";
+        let expression = parse_expression(Lexer::new(source)).expect("inferred Error should parse");
+        let output = format_expression(source, &expression);
+        assert!(output.starts_with("BuiltinConstruction Error @ 0..14"));
+        assert!(output.contains("type_arguments:\n    (empty)"));
+
+        for (source, builtin) in [
+            ("Queue<int>", "Queue"),
+            ("Vector<string>", "Vector"),
+            ("Map<string, int>", "Map"),
+            ("Error<int>", "Error"),
+        ] {
+            let type_syntax = parse_type(Lexer::new(source)).expect("built-in type should parse");
+            assert!(format_type(source, &type_syntax).starts_with(&format!("Builtin {builtin}")));
+        }
+    }
+
+    #[test]
     fn formats_named_and_anonymous_struct_expressions() {
         let source = "Point { x: 1 + 2 }";
         let expression = parse_expression(Lexer::new(source)).expect("construction should parse");
@@ -890,7 +951,7 @@ mod tests {
 
         assert_eq!(
             format_expression(source, &expression),
-            "TypeTest @ 0..30\n  value:\n    Identifier \"result\" @ 0..6\n  type:\n    Union @ 10..30\n      members:\n        [0]:\n          Named \"Error\" @ 10..23\n            arguments:\n              [0]:\n                Primitive String @ 16..22\n        [1]:\n          Primitive None @ 26..30"
+            "TypeTest @ 0..30\n  value:\n    Identifier \"result\" @ 0..6\n  type:\n    Union @ 10..30\n      members:\n        [0]:\n          Builtin Error @ 10..23\n            arguments:\n              [0]:\n                Primitive String @ 16..22\n        [1]:\n          Primitive None @ 26..30"
         );
     }
 

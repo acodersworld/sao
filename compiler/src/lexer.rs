@@ -178,6 +178,15 @@ define_token_kinds! {
     // Names the mutable byte-sequence built-in type.
     #[token("bytes")] Bytes,
 
+    // Names the compiler-known FIFO queue type constructor.
+    #[token("Queue")] Queue,
+    // Names the compiler-known vector type constructor.
+    #[token("Vector")] Vector,
+    // Names the compiler-known map type constructor.
+    #[token("Map")] Map,
+    // Names the compiler-known recoverable-error type constructor.
+    #[token("Error")] Error,
+
     // Opens a parenthesized expression, call argument list, or unit value.
     #[token("(")] LeftParen,
     // Closes a parenthesized expression, call argument list, or unit value.
@@ -645,6 +654,7 @@ mod tests {
         let source = concat!(
             "fn lambda struct interface const mut self if else loop while for in break continue ",
             "return is co defer true false none int float bool char string bytes ",
+            "Queue Vector Map Error ",
             "name _private fnord",
         );
 
@@ -679,6 +689,10 @@ mod tests {
                 TokenKind::Char,
                 TokenKind::String,
                 TokenKind::Bytes,
+                TokenKind::Queue,
+                TokenKind::Vector,
+                TokenKind::Map,
+                TokenKind::Error,
                 TokenKind::Identifier,
                 TokenKind::Identifier,
                 TokenKind::Identifier,

@@ -12,6 +12,8 @@ core:
 - User-defined generic structs, functions, and interfaces, including generic
   constraints, general-purpose generic inference, and associated types.
 - `errdefer`.
+- Vector and Map APIs, mutation rules, and runtime representations beyond their
+  reserved type and empty-construction syntax.
 - A Cranelift JIT or native object backend.
 - A built-in linker or executable writer.
 - Native threads and shared-memory concurrency.

@@ -332,8 +332,8 @@ Current inference boundary:
   which defaults to `()`; lambda return types are not inferred from the body.
 - Contextual lambda signature inference is deferred.
 - User-defined generic declarations and general-purpose generic inference are
-  not part of the initial language. Built-in parameterized types such as
-  `Error<T>` have their own limited inference rules.
+  not part of the initial language. The compiler-known `Queue<T>`, `Vector<T>`,
+  `Map<K, V>`, and `Error<T>` types have dedicated rules instead.
 
 For example:
 

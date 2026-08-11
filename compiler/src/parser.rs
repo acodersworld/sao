@@ -2,11 +2,11 @@ use std::iter::Peekable;
 
 use crate::ast::{
     AnonymousStructField, AnonymousStructMember, AssignmentOperator, BinaryOperator,
-    BindingMutability, Block, ConditionalElse, Declaration, Expression, ExpressionKind, Function,
-    FunctionParameter, FunctionParameterKind, InterfaceDeclaration, InterfaceMethodRequirement,
-    LiteralKind, PrimitiveType, Program, RangeInclusivity, Statement, StatementKind,
-    StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
-    UnaryOperator,
+    BindingMutability, Block, BuiltinType, ConditionalElse, Declaration, Expression,
+    ExpressionKind, Function, FunctionParameter, FunctionParameterKind, InterfaceDeclaration,
+    InterfaceMethodRequirement, LiteralKind, PrimitiveType, Program, RangeInclusivity, Statement,
+    StatementKind, StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind,
+    TypeSyntax, UnaryOperator,
 };
 use crate::lexer::{LexError, Span, Token, TokenKind};
 
@@ -38,6 +38,24 @@ pub enum ParseErrorKind {
     },
     ExpectedDeferredCall,
     ExpectedCoroutineCall,
+    ExpectedBuiltinTypeArguments {
+        builtin: BuiltinType,
+        found: TokenKind,
+    },
+    InvalidBuiltinTypeArgumentCount {
+        builtin: BuiltinType,
+        expected: usize,
+        found: usize,
+    },
+    ExpectedBuiltinConstructor {
+        builtin: BuiltinType,
+        found: TokenKind,
+    },
+    InvalidBuiltinConstructorArgumentCount {
+        builtin: BuiltinType,
+        expected: usize,
+        found: usize,
+    },
     RangeBoundRequiresGrouping,
     ExpectedToken {
         expected: TokenKind,
@@ -612,6 +630,10 @@ where
             TokenKind::String => self.primitive_type(PrimitiveType::String),
             TokenKind::Bytes => self.primitive_type(PrimitiveType::Bytes),
             TokenKind::None => self.primitive_type(PrimitiveType::None),
+            TokenKind::Queue => self.builtin_type(BuiltinType::Queue),
+            TokenKind::Vector => self.builtin_type(BuiltinType::Vector),
+            TokenKind::Map => self.builtin_type(BuiltinType::Map),
+            TokenKind::Error => self.builtin_type(BuiltinType::Error),
             TokenKind::Identifier => self.named_type(),
             TokenKind::Fn => self.callable_type(),
             TokenKind::LeftParen => self.parenthesized_type(),
@@ -630,28 +652,12 @@ where
 
     fn named_type(&mut self) -> ParseResult<TypeSyntax> {
         let name = self.expect(TokenKind::Identifier)?;
-        let mut arguments = Vec::new();
-        let mut end = name.span.end;
-
-        if self.current()?.kind == TokenKind::Less {
-            self.advance()?;
-            arguments.push(self.type_expression()?);
-
-            while self.current()?.kind == TokenKind::Comma {
-                self.advance()?;
-
-                if matches!(
-                    self.current()?.kind,
-                    TokenKind::Greater | TokenKind::ShiftRight
-                ) {
-                    break;
-                }
-
-                arguments.push(self.type_expression()?);
-            }
-
-            end = self.expect_type_argument_close()?.span.end;
-        }
+        let (arguments, end) = if self.current()?.kind == TokenKind::Less {
+            let (arguments, close) = self.type_arguments()?;
+            (arguments, close.span.end)
+        } else {
+            (Vec::new(), name.span.end)
+        };
 
         Ok(TypeSyntax::new(
             TypeKind::Named {
@@ -660,6 +666,55 @@ where
             },
             Span::new(name.span.start, end),
         ))
+    }
+
+    fn builtin_type(&mut self, builtin: BuiltinType) -> ParseResult<TypeSyntax> {
+        let name = self.advance()?;
+        let token = self.current()?;
+
+        if token.kind != TokenKind::Less {
+            return Err(ParseError {
+                kind: ParseErrorKind::ExpectedBuiltinTypeArguments {
+                    builtin,
+                    found: token.kind,
+                },
+                span: token.span,
+            }
+            .into());
+        }
+
+        let (arguments, close) = self.type_arguments()?;
+        validate_builtin_type_argument_count(
+            builtin,
+            arguments.len(),
+            Span::new(name.span.start, close.span.end),
+        )?;
+
+        Ok(TypeSyntax::new(
+            TypeKind::Builtin { builtin, arguments },
+            Span::new(name.span.start, close.span.end),
+        ))
+    }
+
+    fn type_arguments(&mut self) -> ParseResult<(Vec<TypeSyntax>, Token)> {
+        self.expect(TokenKind::Less)?;
+        let mut arguments = vec![self.type_expression()?];
+
+        while self.current()?.kind == TokenKind::Comma {
+            self.advance()?;
+
+            if matches!(
+                self.current()?.kind,
+                TokenKind::Greater | TokenKind::ShiftRight
+            ) {
+                break;
+            }
+
+            arguments.push(self.type_expression()?);
+        }
+
+        let close = self.expect_type_argument_close()?;
+        Ok((arguments, close))
     }
 
     fn callable_type(&mut self) -> ParseResult<TypeSyntax> {
@@ -823,6 +878,19 @@ where
     }
 
     fn call(&mut self, callee: Expression) -> ParseResult {
+        let (arguments, right_parenthesis) = self.call_arguments()?;
+        let span = Span::new(callee.span.start, right_parenthesis.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::Call {
+                callee: Box::new(callee),
+                arguments,
+            },
+            span,
+        ))
+    }
+
+    fn call_arguments(&mut self) -> ParseResult<(Vec<Expression>, Token)> {
         self.expect(TokenKind::LeftParen)?;
         let mut arguments = Vec::new();
 
@@ -843,15 +911,7 @@ where
         }
 
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
-        let span = Span::new(callee.span.start, right_parenthesis.span.end);
-
-        Ok(Expression::new(
-            ExpressionKind::Call {
-                callee: Box::new(callee),
-                arguments,
-            },
-            span,
-        ))
+        Ok((arguments, right_parenthesis))
     }
 
     fn member_access(&mut self, object: Expression) -> ParseResult {
@@ -944,6 +1004,10 @@ where
             TokenKind::Bool => self.primitive_conversion(PrimitiveType::Bool),
             TokenKind::Char => self.primitive_conversion(PrimitiveType::Char),
             TokenKind::String => self.primitive_conversion(PrimitiveType::String),
+            TokenKind::Queue => self.builtin_construction(BuiltinType::Queue),
+            TokenKind::Vector => self.builtin_construction(BuiltinType::Vector),
+            TokenKind::Map => self.builtin_construction(BuiltinType::Map),
+            TokenKind::Error => self.builtin_construction(BuiltinType::Error),
             TokenKind::Struct if allow_struct_construction => self.anonymous_struct_expression(),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
@@ -960,6 +1024,56 @@ where
             }
             .into()),
         }
+    }
+
+    fn builtin_construction(&mut self, builtin: BuiltinType) -> ParseResult {
+        let name = self.advance()?;
+        let mut type_arguments = Vec::new();
+
+        if self.current()?.kind == TokenKind::Less {
+            let (arguments, close) = self.type_arguments()?;
+            validate_builtin_type_argument_count(
+                builtin,
+                arguments.len(),
+                Span::new(name.span.start, close.span.end),
+            )?;
+            type_arguments = arguments;
+        } else if builtin != BuiltinType::Error {
+            let token = self.current()?;
+            return Err(ParseError {
+                kind: ParseErrorKind::ExpectedBuiltinTypeArguments {
+                    builtin,
+                    found: token.kind,
+                },
+                span: token.span,
+            }
+            .into());
+        }
+
+        let token = self.current()?;
+        if token.kind != TokenKind::LeftParen {
+            return Err(ParseError {
+                kind: ParseErrorKind::ExpectedBuiltinConstructor {
+                    builtin,
+                    found: token.kind,
+                },
+                span: token.span,
+            }
+            .into());
+        }
+
+        let (arguments, right_parenthesis) = self.call_arguments()?;
+        let span = Span::new(name.span.start, right_parenthesis.span.end);
+        validate_builtin_constructor_argument_count(builtin, arguments.len(), span)?;
+
+        Ok(Expression::new(
+            ExpressionKind::BuiltinConstruction {
+                builtin,
+                type_arguments,
+                arguments,
+            },
+            span,
+        ))
     }
 
     fn lambda_expression(&mut self) -> ParseResult {
@@ -1414,6 +1528,62 @@ const fn expected_call_error(kind: CallStatementKind) -> ParseErrorKind {
     }
 }
 
+const fn builtin_type_argument_count(builtin: BuiltinType) -> usize {
+    match builtin {
+        BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Error => 1,
+        BuiltinType::Map => 2,
+    }
+}
+
+const fn builtin_constructor_argument_count(builtin: BuiltinType) -> usize {
+    match builtin {
+        BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Map => 0,
+        BuiltinType::Error => 1,
+    }
+}
+
+fn validate_builtin_type_argument_count(
+    builtin: BuiltinType,
+    found: usize,
+    span: Span,
+) -> ParseResult<()> {
+    let expected = builtin_type_argument_count(builtin);
+    if found == expected {
+        return Ok(());
+    }
+
+    Err(ParseError {
+        kind: ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+            builtin,
+            expected,
+            found,
+        },
+        span,
+    }
+    .into())
+}
+
+fn validate_builtin_constructor_argument_count(
+    builtin: BuiltinType,
+    found: usize,
+    span: Span,
+) -> ParseResult<()> {
+    let expected = builtin_constructor_argument_count(builtin);
+    if found == expected {
+        return Ok(());
+    }
+
+    Err(ParseError {
+        kind: ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
+            builtin,
+            expected,
+            found,
+        },
+        span,
+    }
+    .into())
+}
+
 fn range_bound_is_simple(expression: &Expression) -> bool {
     match &expression.kind {
         ExpressionKind::Identifier
@@ -1425,7 +1595,9 @@ fn range_bound_is_simple(expression: &Expression) -> bool {
             range_bound_is_simple(object)
         }
         ExpressionKind::Try { expression } => range_bound_is_simple(expression),
-        ExpressionKind::PrimitiveConversion { .. } => true,
+        ExpressionKind::PrimitiveConversion { .. } | ExpressionKind::BuiltinConstruction { .. } => {
+            true
+        }
         ExpressionKind::Unary {
             operator: UnaryOperator::Negate,
             operand,
@@ -2088,6 +2260,30 @@ mod tests {
                 "incorrect diagnostic for {source}",
             );
         }
+    }
+
+    #[test]
+    fn parameterized_builtin_names_are_reserved() {
+        assert_eq!(
+            parse_program_source("struct Queue {}"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Queue,
+                },
+                span: Span::new(7, 12),
+            }))
+        );
+        assert_eq!(
+            parse_statement_source("const Map = 1;"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Map,
+                },
+                span: Span::new(6, 9),
+            }))
+        );
     }
 
     #[test]
@@ -4364,6 +4560,173 @@ mod tests {
     }
 
     #[test]
+    fn parses_parameterized_builtin_construction() {
+        for (source, expected_builtin, type_count, argument_count) in [
+            ("Queue<int>()", BuiltinType::Queue, 1, 0),
+            ("Vector<string>()", BuiltinType::Vector, 1, 0),
+            ("Map<string, Vector<int>>()", BuiltinType::Map, 2, 0),
+            ("Error(value)", BuiltinType::Error, 0, 1),
+            ("Error<string>(value)", BuiltinType::Error, 1, 1),
+        ] {
+            let expression = parse(source).expect("built-in construction should parse");
+            let ExpressionKind::BuiltinConstruction {
+                builtin,
+                type_arguments,
+                arguments,
+            } = expression.kind
+            else {
+                panic!("expected built-in construction for {source}");
+            };
+            assert_eq!(builtin, expected_builtin);
+            assert_eq!(type_arguments.len(), type_count);
+            assert_eq!(arguments.len(), argument_count);
+            assert_eq!(expression.span, Span::new(0, source.len()));
+        }
+    }
+
+    #[test]
+    fn builtin_construction_composes_with_expressions() {
+        let expression = parse("Vector<int>().length() + 1")
+            .expect("built-in construction should compose with postfix and infix syntax");
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::Binary {
+                left,
+                operator: BinaryOperator::Add,
+                ..
+            } if matches!(left.kind, ExpressionKind::Call { .. })
+        ));
+
+        let expression = parse("Map<string, int>()[key]")
+            .expect("built-in construction should compose with indexing");
+        assert!(matches!(expression.kind, ExpressionKind::Index { .. }));
+
+        let expression = parse("Error<int>(value + 1)")
+            .expect("Error should accept a complete payload expression");
+        let ExpressionKind::BuiltinConstruction { arguments, .. } = expression.kind else {
+            panic!("expected Error construction");
+        };
+        assert!(matches!(&arguments[0].kind, ExpressionKind::Binary { .. }));
+    }
+
+    #[test]
+    fn builtin_construction_is_not_an_ordinary_call() {
+        for (source, expected_kind) in [
+            ("defer Queue<int>();", ParseErrorKind::ExpectedDeferredCall),
+            ("co Error(value);", ParseErrorKind::ExpectedCoroutineCall),
+        ] {
+            let operand_start = source.find(' ').expect("statement has an operand") + 1;
+            assert_eq!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: Span::new(operand_start, source.len() - 1),
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn reports_malformed_builtin_construction() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "Queue()",
+                ParseErrorKind::ExpectedBuiltinTypeArguments {
+                    builtin: BuiltinType::Queue,
+                    found: TokenKind::LeftParen,
+                },
+                Span::new(5, 6),
+            ),
+            (
+                "Vector<int>",
+                ParseErrorKind::ExpectedBuiltinConstructor {
+                    builtin: BuiltinType::Vector,
+                    found: TokenKind::Eof,
+                },
+                Span::new(11, 11),
+            ),
+            (
+                "Map<int>()",
+                ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+                    builtin: BuiltinType::Map,
+                    expected: 2,
+                    found: 1,
+                },
+                Span::new(0, 8),
+            ),
+            (
+                "Queue<int, string>()",
+                ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+                    builtin: BuiltinType::Queue,
+                    expected: 1,
+                    found: 2,
+                },
+                Span::new(0, 18),
+            ),
+            (
+                "Error()",
+                ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
+                    builtin: BuiltinType::Error,
+                    expected: 1,
+                    found: 0,
+                },
+                Span::new(0, 7),
+            ),
+            (
+                "Error<int>()",
+                ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
+                    builtin: BuiltinType::Error,
+                    expected: 1,
+                    found: 0,
+                },
+                Span::new(0, 12),
+            ),
+            (
+                "Queue<int>(value)",
+                ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
+                    builtin: BuiltinType::Queue,
+                    expected: 0,
+                    found: 1,
+                },
+                Span::new(0, 17),
+            ),
+            (
+                "Error<int, string>(value)",
+                ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+                    builtin: BuiltinType::Error,
+                    expected: 1,
+                    found: 2,
+                },
+                Span::new(0, 18),
+            ),
+            (
+                "Error<>(value)",
+                ParseErrorKind::ExpectedType {
+                    found: TokenKind::Greater,
+                },
+                Span::new(6, 7),
+            ),
+            (
+                "Error value",
+                ParseErrorKind::ExpectedBuiltinConstructor {
+                    builtin: BuiltinType::Error,
+                    found: TokenKind::Identifier,
+                },
+                Span::new(6, 11),
+            ),
+        ] {
+            assert_eq!(
+                parse(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
+    }
+
+    #[test]
     fn parses_primitive_conversions() {
         for (source, expected_target) in [
             ("int(value)", PrimitiveType::Int),
@@ -5015,22 +5378,84 @@ mod tests {
 
     #[test]
     fn parses_parameterized_and_nested_parameterized_types() {
-        let type_syntax =
-            parse_type_source("Map<string, Error<int | none>>").expect("named type should parse");
-        let TypeKind::Named { arguments, .. } = type_syntax.kind else {
-            panic!("expected a named type");
+        let type_syntax = parse_type_source("Map<string, Error<int | none>>")
+            .expect("built-in type should parse");
+        let TypeKind::Builtin {
+            builtin: BuiltinType::Map,
+            arguments,
+        } = type_syntax.kind
+        else {
+            panic!("expected Map type");
         };
 
         assert_eq!(arguments.len(), 2);
-        let TypeKind::Named {
+        let TypeKind::Builtin {
+            builtin: BuiltinType::Error,
             arguments: error_arguments,
-            ..
         } = &arguments[1].kind
         else {
-            panic!("expected a nested named type");
+            panic!("expected a nested Error type");
         };
         assert_eq!(error_arguments.len(), 1);
         assert!(matches!(&error_arguments[0].kind, TypeKind::Union { .. }));
+
+        let type_syntax = parse_type_source("Container<string, Result<int>>")
+            .expect("ordinary parameterized named types should remain valid");
+        let TypeKind::Named { arguments, .. } = type_syntax.kind else {
+            panic!("expected an ordinary named type");
+        };
+        assert_eq!(arguments.len(), 2);
+        assert!(matches!(&arguments[1].kind, TypeKind::Named { .. }));
+    }
+
+    #[test]
+    fn reports_invalid_builtin_type_arity() {
+        for (source, expected_kind, expected_span) in [
+            (
+                "Queue",
+                ParseErrorKind::ExpectedBuiltinTypeArguments {
+                    builtin: BuiltinType::Queue,
+                    found: TokenKind::Eof,
+                },
+                Span::new(5, 5),
+            ),
+            (
+                "Vector<int, string>",
+                ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+                    builtin: BuiltinType::Vector,
+                    expected: 1,
+                    found: 2,
+                },
+                Span::new(0, 19),
+            ),
+            (
+                "Map<int>",
+                ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+                    builtin: BuiltinType::Map,
+                    expected: 2,
+                    found: 1,
+                },
+                Span::new(0, 8),
+            ),
+            (
+                "Error<int, string>",
+                ParseErrorKind::InvalidBuiltinTypeArgumentCount {
+                    builtin: BuiltinType::Error,
+                    expected: 1,
+                    found: 2,
+                },
+                Span::new(0, 18),
+            ),
+        ] {
+            assert_eq!(
+                parse_type_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: expected_span,
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
     }
 
     #[test]

@@ -11,7 +11,12 @@ words are:
 ```text
 fn lambda struct interface const mut self if else loop while for in break continue
 return is co defer true false none int float bool char string bytes
+Queue Vector Map Error
 ```
+
+The capitalized names `Queue`, `Vector`, `Map`, and `Error` are reserved
+compiler-known parameterized type constructors. They are tokens distinct from
+ordinary identifiers, so declarations and bindings cannot reuse them.
 
 Whitespace is insignificant. Spaces, horizontal tabs, form feeds, carriage
 returns, and line feeds are skipped.
