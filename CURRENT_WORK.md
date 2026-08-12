@@ -12,6 +12,13 @@ Last reviewed: 2026-08-12
 Frontend syntax work is complete for the currently designed language. The
 active phase is semantic analysis, followed by typed IR and lowering.
 
+For the semantic-analysis phase, use a hands-on, guided workflow. The project
+owner should write a substantial portion of the implementation in small,
+reviewable increments, while the assisting agent explains unfamiliar semantic
+analysis concepts, helps define each increment, reviews the resulting code, and
+supports diagnosis and testing. Do not implement an entire semantic pass on the
+owner's behalf unless explicitly asked.
+
 ## Semantic analysis work queue
 
 Semantic analysis is one compiler subsystem with ordered internal passes.
