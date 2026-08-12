@@ -30,8 +30,10 @@ Recommended implementation order:
 1. Name and scope resolution
    - Introduce semantic symbol identities and nested value/type scopes.
    - Collect top-level and nested named declarations, resolve every name, and
-     diagnose unknown names, duplicate declarations, and a missing or non-unique
-     top-level `main` entry point.
+     diagnose unknown names, invalid duplicate declarations, and a missing or
+     non-unique top-level `main` entry point. Permit sequential local bindings
+     to shadow earlier bindings in the same block after their initializer has
+     been resolved.
 2. Context validation
    - Validate `self`, `return`, `break`, `continue`, `defer`, and `co` against
      their documented enclosing function, method, loop, and executable-block

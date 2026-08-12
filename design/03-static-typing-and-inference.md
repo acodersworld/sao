@@ -32,6 +32,21 @@ unqualified local declaration. A `const` binding cannot be reassigned or used
 to mutate a referenced object. A `mut` binding can be reassigned and permits
 mutation through its reference.
 
+Local bindings may shadow earlier local bindings and parameters, including in
+the same lexical block. The initializer is resolved and evaluated before the
+new binding enters scope, so it may refer to the binding being shadowed:
+
+```text
+const count = 1;
+const count = count + 1; // The initializer reads the first count.
+```
+
+After the declaration, subsequent references resolve to the new binding. Each
+declaration has its own symbol identity, type, mutability, and storage; earlier
+references remain resolved to the earlier declaration. This permission applies
+to local binding shadowing, not to duplicate parameters or duplicate named
+function, struct, or interface declarations, which are compile-time errors.
+
 For reference types, `const` is a transitive read-only access capability rather
 than a deep-immutability guarantee:
 

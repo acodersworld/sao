@@ -2091,7 +2091,9 @@ mod tests {
         assert!(matches!(
             read.return_type.as_ref(),
             Some(TypeSyntax {
-                kind: TypeKind::Named { arguments, .. },
+                kind: TypeKind::Builtin { 
+                    builtin: BuiltinType::Queue,
+                    arguments, .. },
                 ..
             }) if arguments.len() == 1
         ));
