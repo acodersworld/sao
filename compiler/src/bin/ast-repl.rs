@@ -2,11 +2,15 @@ use std::io::{self, BufRead, Write};
 
 #[cfg(test)]
 use sao_compiler::ast::BuiltinType;
-use sao_compiler::lexer::{Lexer, Span};
+use sao_compiler::lexer::Lexer;
 use sao_compiler::parser::{
-    FrontendError, ParseError, ParseErrorKind, parse_expression, parse_statement, parse_type,
+    parse_expression, parse_statement, parse_type, FrontendError, ParseContext, ParseError,
+    ParseErrorKind,
 };
 use sao_compiler::pretty::{format_expression, format_statement, format_type};
+#[cfg(test)]
+use sao_compiler::source::ModuleId;
+use sao_compiler::source::{SourceModuleRegistry, Span};
 
 fn main() -> io::Result<()> {
     let stdin = io::stdin();
@@ -95,22 +99,28 @@ fn print_help(output: &mut impl Write) -> io::Result<()> {
 }
 
 fn print_expression(output: &mut impl Write, source: &str) -> io::Result<()> {
-    match parse_expression(Lexer::new(source)) {
-        Ok(expression) => writeln!(output, "{}", format_expression(source, &expression)),
+    let module = SourceModuleRegistry::new().add(source);
+    let mut context = ParseContext::new(module.module_id());
+    match parse_expression(&mut context, Lexer::new(&module)) {
+        Ok(expression) => writeln!(output, "{}", format_expression(&module, &expression)),
         Err(error) => print_error(output, source, error),
     }
 }
 
 fn print_statement(output: &mut impl Write, source: &str) -> io::Result<()> {
-    match parse_statement(Lexer::new(source)) {
-        Ok(statement) => writeln!(output, "{}", format_statement(source, &statement)),
+    let module = SourceModuleRegistry::new().add(source);
+    let mut context = ParseContext::new(module.module_id());
+    match parse_statement(&mut context, Lexer::new(&module)) {
+        Ok(statement) => writeln!(output, "{}", format_statement(&module, &statement)),
         Err(error) => print_error(output, source, error),
     }
 }
 
 fn print_type(output: &mut impl Write, source: &str) -> io::Result<()> {
-    match parse_type(Lexer::new(source)) {
-        Ok(type_syntax) => writeln!(output, "{}", format_type(source, &type_syntax)),
+    let module = SourceModuleRegistry::new().add(source);
+    let mut context = ParseContext::new(module.module_id());
+    match parse_type(&mut context, Lexer::new(&module)) {
+        Ok(type_syntax) => writeln!(output, "{}", format_type(&module, &type_syntax)),
         Err(error) => print_error(output, source, error),
     }
 }
@@ -124,7 +134,7 @@ fn print_error(output: &mut impl Write, source: &str, error: FrontendError) -> i
     writeln!(output, "error: {message}")?;
     writeln!(output, "  {source}")?;
 
-    let start = character_count(source, Span::new(0, span.start));
+    let start = character_count(source, Span::new(span.module_id, 0, span.start));
     let length = character_count(source, span).max(1);
     writeln!(output, "  {}{}", " ".repeat(start), "^".repeat(length))
 }
@@ -193,11 +203,18 @@ fn syntax_error_message(error: ParseError) -> String {
             format!("expected {expected:?}, found {found:?}")
         }
         ParseErrorKind::UnexpectedToken { found } => format!("unexpected token {found:?}"),
+        ParseErrorKind::TokenModuleMismatch { expected, found } => {
+            format!("token belongs to module {found:?}, expected {expected:?}")
+        }
     }
 }
 
 const fn argument_word(count: usize) -> &'static str {
-    if count == 1 { "argument" } else { "arguments" }
+    if count == 1 {
+        "argument"
+    } else {
+        "arguments"
+    }
 }
 
 fn character_count(source: &str, span: Span) -> usize {
@@ -230,7 +247,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedElseBranch {
                     found: sao_compiler::lexer::TokenKind::Identifier,
                 },
-                span: Span::new(0, 5),
+                span: Span::new(ModuleId::PRELUDE, 0, 5),
             }),
             "expected a block or if after else, found Identifier"
         );
@@ -243,7 +260,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedRangeOperator {
                     found: sao_compiler::lexer::TokenKind::LeftBrace,
                 },
-                span: Span::new(0, 1),
+                span: Span::new(ModuleId::PRELUDE, 0, 1),
             }),
             "expected .. or ..= in for range, found LeftBrace"
         );
@@ -256,7 +273,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedTopLevelDeclaration {
                     found: sao_compiler::lexer::TokenKind::Const,
                 },
-                span: Span::new(0, 5),
+                span: Span::new(ModuleId::PRELUDE, 0, 5),
             }),
             "expected a top-level declaration, found Const"
         );
@@ -269,7 +286,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedStructMember {
                     found: sao_compiler::lexer::TokenKind::Const,
                 },
-                span: Span::new(0, 5),
+                span: Span::new(ModuleId::PRELUDE, 0, 5),
             }),
             "expected a struct field or method, found Const"
         );
@@ -278,7 +295,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedAnonymousStructMember {
                     found: sao_compiler::lexer::TokenKind::Return,
                 },
-                span: Span::new(0, 6),
+                span: Span::new(ModuleId::PRELUDE, 0, 6),
             }),
             "expected an anonymous struct field or method, found Return"
         );
@@ -291,7 +308,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedInterfaceMember {
                     found: sao_compiler::lexer::TokenKind::Identifier,
                 },
-                span: Span::new(0, 5),
+                span: Span::new(ModuleId::PRELUDE, 0, 5),
             }),
             "expected an interface method requirement, found Identifier"
         );
@@ -302,14 +319,14 @@ mod tests {
         assert_eq!(
             syntax_error_message(ParseError {
                 kind: ParseErrorKind::ExpectedDeferredCall,
-                span: Span::new(6, 11),
+                span: Span::new(ModuleId::PRELUDE, 6, 11),
             }),
             "expected a function or method call after defer"
         );
         assert_eq!(
             syntax_error_message(ParseError {
                 kind: ParseErrorKind::ExpectedCoroutineCall,
-                span: Span::new(3, 8),
+                span: Span::new(ModuleId::PRELUDE, 3, 8),
             }),
             "expected a function or method call after co"
         );
@@ -320,7 +337,7 @@ mod tests {
         assert_eq!(
             syntax_error_message(ParseError {
                 kind: ParseErrorKind::InclusiveSliceNotSupported,
-                span: Span::new(7, 10),
+                span: Span::new(ModuleId::PRELUDE, 7, 10),
             }),
             "inclusive slice ends are not supported; use .."
         );
@@ -334,7 +351,7 @@ mod tests {
                     builtin: BuiltinType::Queue,
                     found: sao_compiler::lexer::TokenKind::LeftParen,
                 },
-                span: Span::new(5, 6),
+                span: Span::new(ModuleId::PRELUDE, 5, 6),
             }),
             "expected type arguments after Queue, found LeftParen"
         );
@@ -345,7 +362,7 @@ mod tests {
                     expected: 2,
                     found: 1,
                 },
-                span: Span::new(0, 8),
+                span: Span::new(ModuleId::PRELUDE, 0, 8),
             }),
             "Map expects 2 type arguments, found 1"
         );
@@ -355,7 +372,7 @@ mod tests {
                     builtin: BuiltinType::Vector,
                     found: sao_compiler::lexer::TokenKind::Eof,
                 },
-                span: Span::new(11, 11),
+                span: Span::new(ModuleId::PRELUDE, 11, 11),
             }),
             "expected ( to construct Vector, found Eof"
         );
@@ -366,7 +383,7 @@ mod tests {
                     expected: 1,
                     found: 0,
                 },
-                span: Span::new(0, 7),
+                span: Span::new(ModuleId::PRELUDE, 0, 7),
             }),
             "Error construction expects 1 value argument, found 0"
         );
@@ -377,7 +394,7 @@ mod tests {
         assert_eq!(
             syntax_error_message(ParseError {
                 kind: ParseErrorKind::RangeBoundRequiresGrouping,
-                span: Span::new(0, 1),
+                span: Span::new(ModuleId::PRELUDE, 0, 1),
             }),
             "complex range bounds must be parenthesized"
         );

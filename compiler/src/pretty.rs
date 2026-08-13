@@ -6,11 +6,11 @@ use crate::ast::{
     InterfaceMethodRequirement, Program, Statement, StatementKind, StructDeclaration, StructField,
     StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
 };
-use crate::lexer::Span;
+use crate::source::{SourceModule, Span};
 
 /// Formats one complete program as an indented syntax tree.
 #[must_use]
-pub fn format_program(source: &str, program: &Program) -> String {
+pub fn format_program(source: &SourceModule, program: &Program) -> String {
     let mut output = String::new();
     format_program_into(&mut output, source, program, 0);
     output.truncate(output.len().saturating_sub(1));
@@ -19,7 +19,7 @@ pub fn format_program(source: &str, program: &Program) -> String {
 
 /// Formats an expression as an indented syntax tree.
 #[must_use]
-pub fn format_expression(source: &str, expression: &Expression) -> String {
+pub fn format_expression(source: &SourceModule, expression: &Expression) -> String {
     let mut output = String::new();
     format_expression_into(&mut output, source, expression, 0);
     output.truncate(output.len().saturating_sub(1));
@@ -28,7 +28,7 @@ pub fn format_expression(source: &str, expression: &Expression) -> String {
 
 /// Formats a type expression as an indented syntax tree.
 #[must_use]
-pub fn format_type(source: &str, type_syntax: &TypeSyntax) -> String {
+pub fn format_type(source: &SourceModule, type_syntax: &TypeSyntax) -> String {
     let mut output = String::new();
     format_type_into(&mut output, source, type_syntax, 0);
     output.truncate(output.len().saturating_sub(1));
@@ -37,14 +37,19 @@ pub fn format_type(source: &str, type_syntax: &TypeSyntax) -> String {
 
 /// Formats a statement as an indented syntax tree.
 #[must_use]
-pub fn format_statement(source: &str, statement: &Statement) -> String {
+pub fn format_statement(source: &SourceModule, statement: &Statement) -> String {
     let mut output = String::new();
     format_statement_into(&mut output, source, statement, 0);
     output.truncate(output.len().saturating_sub(1));
     output
 }
 
-fn format_program_into(output: &mut String, source: &str, program: &Program, depth: usize) {
+fn format_program_into(
+    output: &mut String,
+    source: &SourceModule,
+    program: &Program,
+    depth: usize,
+) {
     line(
         output,
         depth,
@@ -65,7 +70,7 @@ fn format_program_into(output: &mut String, source: &str, program: &Program, dep
 
 fn format_declaration_into(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     declaration: &Declaration,
     depth: usize,
 ) {
@@ -82,7 +87,7 @@ fn format_declaration_into(
 
 fn format_interface_declaration_into(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     interface: &InterfaceDeclaration,
     depth: usize,
 ) {
@@ -110,7 +115,7 @@ fn format_interface_declaration_into(
 
 fn format_interface_requirement_into(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     requirement: &InterfaceMethodRequirement,
     depth: usize,
 ) {
@@ -129,7 +134,7 @@ fn format_interface_requirement_into(
 
 fn format_struct_declaration_into(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     structure: &StructDeclaration,
     depth: usize,
 ) {
@@ -162,7 +167,12 @@ fn format_struct_declaration_into(
     }
 }
 
-fn format_struct_field_into(output: &mut String, source: &str, field: &StructField, depth: usize) {
+fn format_struct_field_into(
+    output: &mut String,
+    source: &SourceModule,
+    field: &StructField,
+    depth: usize,
+) {
     line(
         output,
         depth,
@@ -175,7 +185,12 @@ fn format_struct_field_into(output: &mut String, source: &str, field: &StructFie
     child_type(output, source, "type", &field.type_annotation, depth);
 }
 
-fn format_statement_into(output: &mut String, source: &str, statement: &Statement, depth: usize) {
+fn format_statement_into(
+    output: &mut String,
+    source: &SourceModule,
+    statement: &Statement,
+    depth: usize,
+) {
     let span = statement.span;
 
     match &statement.kind {
@@ -232,7 +247,12 @@ fn format_statement_into(output: &mut String, source: &str, statement: &Statemen
     }
 }
 
-fn format_function_into(output: &mut String, source: &str, function: &Function, depth: usize) {
+fn format_function_into(
+    output: &mut String,
+    source: &SourceModule,
+    function: &Function,
+    depth: usize,
+) {
     line(
         output,
         depth,
@@ -249,7 +269,7 @@ fn format_function_into(output: &mut String, source: &str, function: &Function, 
 
 fn parameter_list(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     parameters: &[FunctionParameter],
     depth: usize,
 ) {
@@ -268,7 +288,7 @@ fn parameter_list(
 
 fn format_parameter_into(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     parameter: &FunctionParameter,
     depth: usize,
 ) {
@@ -305,7 +325,7 @@ fn format_parameter_into(
 
 fn optional_return_type(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     return_type: Option<&TypeSyntax>,
     depth: usize,
 ) {
@@ -319,7 +339,7 @@ fn optional_return_type(
 
 fn format_expression_into(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     expression: &Expression,
     depth: usize,
 ) {
@@ -538,7 +558,7 @@ fn format_expression_into(
 
 fn struct_initializer_list(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     fields: &[StructFieldInitializer],
     depth: usize,
 ) {
@@ -565,7 +585,7 @@ fn struct_initializer_list(
 
 fn anonymous_struct_member_list(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     members: &[AnonymousStructMember],
     depth: usize,
 ) {
@@ -590,7 +610,7 @@ fn anonymous_struct_member_list(
 
 fn format_anonymous_struct_field_into(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     field: &AnonymousStructField,
     depth: usize,
 ) {
@@ -609,7 +629,7 @@ fn format_anonymous_struct_field_into(
     child_expression(output, source, "initializer", &field.initializer, depth);
 }
 
-fn format_block_into(output: &mut String, source: &str, block: &Block, depth: usize) {
+fn format_block_into(output: &mut String, source: &SourceModule, block: &Block, depth: usize) {
     line(
         output,
         depth,
@@ -626,7 +646,7 @@ fn format_block_into(output: &mut String, source: &str, block: &Block, depth: us
 
 fn child_expression(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     label: &str,
     expression: &Expression,
     depth: usize,
@@ -637,7 +657,7 @@ fn child_expression(
 
 fn optional_expression(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     label: &str,
     expression: Option<&Expression>,
     depth: usize,
@@ -650,14 +670,20 @@ fn optional_expression(
     }
 }
 
-fn child_block(output: &mut String, source: &str, label: &str, block: &Block, depth: usize) {
+fn child_block(
+    output: &mut String,
+    source: &SourceModule,
+    label: &str,
+    block: &Block,
+    depth: usize,
+) {
     line(output, depth + 1, format_args!("{label}:"));
     format_block_into(output, source, block, depth + 2);
 }
 
 fn expression_list(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     label: &str,
     expressions: &[Expression],
     depth: usize,
@@ -677,7 +703,7 @@ fn expression_list(
 
 fn statement_list(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     label: &str,
     statements: &[Statement],
     depth: usize,
@@ -695,7 +721,12 @@ fn statement_list(
     }
 }
 
-fn format_type_into(output: &mut String, source: &str, type_syntax: &TypeSyntax, depth: usize) {
+fn format_type_into(
+    output: &mut String,
+    source: &SourceModule,
+    type_syntax: &TypeSyntax,
+    depth: usize,
+) {
     let span = type_syntax.span;
 
     match &type_syntax.kind {
@@ -755,7 +786,7 @@ fn format_type_into(output: &mut String, source: &str, type_syntax: &TypeSyntax,
 
 fn child_type(
     output: &mut String,
-    source: &str,
+    source: &SourceModule,
     label: &str,
     type_syntax: &TypeSyntax,
     depth: usize,
@@ -764,7 +795,13 @@ fn child_type(
     format_type_into(output, source, type_syntax, depth + 2);
 }
 
-fn type_list(output: &mut String, source: &str, label: &str, types: &[TypeSyntax], depth: usize) {
+fn type_list(
+    output: &mut String,
+    source: &SourceModule,
+    label: &str,
+    types: &[TypeSyntax],
+    depth: usize,
+) {
     line(output, depth + 1, format_args!("{label}:"));
 
     if types.is_empty() {
@@ -789,8 +826,8 @@ fn line(output: &mut String, depth: usize, arguments: Arguments<'_>) {
     output.push('\n');
 }
 
-fn text(source: &str, span: Span) -> &str {
-    source.get(span.start..span.end).unwrap_or("<invalid span>")
+fn text(source: &SourceModule, span: Span) -> &str {
+    source.text(span).unwrap_or("<invalid span>")
 }
 
 fn location(span: Span) -> String {
@@ -801,13 +838,44 @@ fn location(span: Span) -> String {
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
-    use crate::parser::{parse_expression, parse_program, parse_statement, parse_type};
+    use crate::parser::{
+        parse_expression, parse_program, parse_statement, parse_type, ParseContext,
+    };
+    use crate::source::SourceModuleRegistry;
+
+    fn module(source: &str) -> SourceModule {
+        SourceModuleRegistry::new().add(source)
+    }
+
+    fn parse_program_source(source: &str) -> Program {
+        let module = module(source);
+        let mut context = ParseContext::new(module.module_id());
+        parse_program(&mut context, Lexer::new(&module)).expect("program should parse")
+    }
+
+    fn parse_expression_source(source: &str) -> Expression {
+        let module = module(source);
+        let mut context = ParseContext::new(module.module_id());
+        parse_expression(&mut context, Lexer::new(&module)).expect("expression should parse")
+    }
+
+    fn parse_statement_source(source: &str) -> Statement {
+        let module = module(source);
+        let mut context = ParseContext::new(module.module_id());
+        parse_statement(&mut context, Lexer::new(&module)).expect("statement should parse")
+    }
+
+    fn parse_type_source(source: &str) -> TypeSyntax {
+        let module = module(source);
+        let mut context = ParseContext::new(module.module_id());
+        parse_type(&mut context, Lexer::new(&module)).expect("type should parse")
+    }
 
     #[test]
     fn formats_programs() {
         let source = "fn first() {}\nfn second() {}";
-        let program = parse_program(Lexer::new(source)).expect("program should parse");
-        let output = format_program(source, &program);
+        let program = parse_program_source(source);
+        let output = format_program(&module(source), &program);
 
         assert!(output.starts_with("Program @ 0..28\n  declarations:"));
         assert!(output.contains("[0]:\n      Function \"first\" @ 0..13"));
@@ -817,10 +885,10 @@ mod tests {
     #[test]
     fn formats_empty_programs() {
         let source = "// no declarations";
-        let program = parse_program(Lexer::new(source)).expect("empty program should parse");
+        let program = parse_program_source(source);
 
         assert_eq!(
-            format_program(source, &program),
+            format_program(&module(source), &program),
             "Program @ 0..18\n  declarations:\n    (empty)"
         );
     }
@@ -828,8 +896,8 @@ mod tests {
     #[test]
     fn formats_named_struct_declarations() {
         let source = "struct Point { x: float, fn get_x(self) -> float { self.x } }";
-        let program = parse_program(Lexer::new(source)).expect("struct should parse");
-        let output = format_program(source, &program);
+        let program = parse_program_source(source);
+        let output = format_program(&module(source), &program);
 
         assert!(output.contains("Struct \"Point\" @ 0..61"));
         assert!(output.contains("Field \"x\" @ 15..24"));
@@ -846,8 +914,8 @@ mod tests {
             "fn close(self);",
             " }",
         );
-        let program = parse_program(Lexer::new(source)).expect("interface should parse");
-        let output = format_program(source, &program);
+        let program = parse_program_source(source);
+        let output = format_program(&module(source), &program);
 
         assert!(output.contains(&format!("Interface \"Writer\" @ 0..{}", source.len())));
         assert!(output.contains("requirements:"));
@@ -860,9 +928,9 @@ mod tests {
         assert!(output.contains("(default ())"));
 
         let source = "interface Empty {}";
-        let program = parse_program(Lexer::new(source)).expect("empty interface should parse");
+        let program = parse_program_source(source);
         assert_eq!(
-            format_program(source, &program),
+            format_program(&module(source), &program),
             "Program @ 0..18\n  declarations:\n    [0]:\n      Interface \"Empty\" @ 0..18\n        requirements:\n          (empty)"
         );
     }
@@ -870,10 +938,10 @@ mod tests {
     #[test]
     fn formats_expression_structure_and_source_text() {
         let source = "1 + value";
-        let expression = parse_expression(Lexer::new(source)).expect("expression should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "Binary Add @ 0..9\n  left:\n    Literal Integer \"1\" @ 0..1\n  right:\n    Identifier \"value\" @ 4..9"
         );
     }
@@ -881,18 +949,18 @@ mod tests {
     #[test]
     fn formats_slice_expressions() {
         let source = "items[-2..-1]";
-        let expression = parse_expression(Lexer::new(source)).expect("slice should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "Slice @ 0..13\n  object:\n    Identifier \"items\" @ 0..5\n  start:\n    Unary Negate @ 6..8\n      operand:\n        Literal Integer \"2\" @ 7..8\n  end:\n    Unary Negate @ 10..12\n      operand:\n        Literal Integer \"1\" @ 11..12"
         );
 
         let source = "items[..]";
-        let expression = parse_expression(Lexer::new(source)).expect("full slice should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "Slice @ 0..9\n  object:\n    Identifier \"items\" @ 0..5\n  start:\n    (none)\n  end:\n    (none)"
         );
     }
@@ -900,10 +968,10 @@ mod tests {
     #[test]
     fn formats_primitive_conversions() {
         let source = "string(value + 1)";
-        let expression = parse_expression(Lexer::new(source)).expect("conversion should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "PrimitiveConversion String @ 0..17\n  value:\n    Binary Add @ 7..16\n      left:\n        Identifier \"value\" @ 7..12\n      right:\n        Literal Integer \"1\" @ 15..16"
         );
     }
@@ -915,25 +983,21 @@ mod tests {
             ("Vector<string>()", "Vector"),
             ("Map<string, int>()", "Map"),
         ] {
-            let expression =
-                parse_expression(Lexer::new(source)).expect("collection construction should parse");
-            assert!(
-                format_expression(source, &expression)
-                    .starts_with(&format!("BuiltinConstruction {builtin}"))
-            );
+            let expression = parse_expression_source(source);
+            assert!(format_expression(&module(source), &expression)
+                .starts_with(&format!("BuiltinConstruction {builtin}")));
         }
 
         let source = "Error<string>(message)";
-        let expression =
-            parse_expression(Lexer::new(source)).expect("built-in construction should parse");
+        let expression = parse_expression_source(source);
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "BuiltinConstruction Error @ 0..22\n  type_arguments:\n    [0]:\n      Primitive String @ 6..12\n  arguments:\n    [0]:\n      Identifier \"message\" @ 14..21"
         );
 
         let source = "Error(message)";
-        let expression = parse_expression(Lexer::new(source)).expect("inferred Error should parse");
-        let output = format_expression(source, &expression);
+        let expression = parse_expression_source(source);
+        let output = format_expression(&module(source), &expression);
         assert!(output.starts_with("BuiltinConstruction Error @ 0..14"));
         assert!(output.contains("type_arguments:\n    (empty)"));
 
@@ -943,25 +1007,25 @@ mod tests {
             ("Map<string, int>", "Map"),
             ("Error<int>", "Error"),
         ] {
-            let type_syntax = parse_type(Lexer::new(source)).expect("built-in type should parse");
-            assert!(format_type(source, &type_syntax).starts_with(&format!("Builtin {builtin}")));
+            let type_syntax = parse_type_source(source);
+            assert!(format_type(&module(source), &type_syntax)
+                .starts_with(&format!("Builtin {builtin}")));
         }
     }
 
     #[test]
     fn formats_named_and_anonymous_struct_expressions() {
         let source = "Point { x: 1 + 2 }";
-        let expression = parse_expression(Lexer::new(source)).expect("construction should parse");
-        let output = format_expression(source, &expression);
+        let expression = parse_expression_source(source);
+        let output = format_expression(&module(source), &expression);
 
         assert!(output.starts_with("StructConstruction \"Point\" @ 0..18"));
         assert!(output.contains("FieldInitializer \"x\" @ 8..16"));
         assert!(output.contains("Binary Add @ 11..16"));
 
         let source = "struct { value: int = 1; fn get(self) { self.value } }";
-        let expression =
-            parse_expression(Lexer::new(source)).expect("anonymous struct should parse");
-        let output = format_expression(source, &expression);
+        let expression = parse_expression_source(source);
+        let output = format_expression(&module(source), &expression);
 
         assert!(output.starts_with("AnonymousStruct @ 0..54"));
         assert!(output.contains("Field \"value\" @ 9..24"));
@@ -972,10 +1036,10 @@ mod tests {
     #[test]
     fn formats_type_test_expressions() {
         let source = "result is Error<string> | none";
-        let expression = parse_expression(Lexer::new(source)).expect("type test should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "TypeTest @ 0..30\n  value:\n    Identifier \"result\" @ 0..6\n  type:\n    Union @ 10..30\n      members:\n        [0]:\n          Builtin Error @ 10..23\n            arguments:\n              [0]:\n                Primitive String @ 16..22\n        [1]:\n          Primitive None @ 26..30"
         );
     }
@@ -983,8 +1047,8 @@ mod tests {
     #[test]
     fn formats_type_lists_and_named_types() {
         let source = "Reader & Writer | none";
-        let type_syntax = parse_type(Lexer::new(source)).expect("type should parse");
-        let output = format_type(source, &type_syntax);
+        let type_syntax = parse_type_source(source);
+        let output = format_type(&module(source), &type_syntax);
 
         assert!(output.starts_with("Union @ 0..22"));
         assert!(output.contains("Intersection @ 0..15"));
@@ -995,10 +1059,10 @@ mod tests {
     #[test]
     fn formats_binding_statements() {
         let source = "mut total: int = first + second;";
-        let statement = parse_statement(Lexer::new(source)).expect("statement should parse");
+        let statement = parse_statement_source(source);
 
         assert_eq!(
-            format_statement(source, &statement),
+            format_statement(&module(source), &statement),
             "Binding Mut \"total\" @ 0..32\n  type:\n    Primitive Int @ 11..14\n  initializer:\n    Binary Add @ 17..31\n      left:\n        Identifier \"first\" @ 17..22\n      right:\n        Identifier \"second\" @ 25..31"
         );
     }
@@ -1006,10 +1070,10 @@ mod tests {
     #[test]
     fn formats_expression_statements() {
         let source = "run();";
-        let statement = parse_statement(Lexer::new(source)).expect("statement should parse");
+        let statement = parse_statement_source(source);
 
         assert_eq!(
-            format_statement(source, &statement),
+            format_statement(&module(source), &statement),
             "ExpressionStatement @ 0..6\n  expression:\n    Call @ 0..5\n      callee:\n        Identifier \"run\" @ 0..3\n      arguments:\n        (empty)"
         );
     }
@@ -1017,16 +1081,16 @@ mod tests {
     #[test]
     fn formats_deferred_and_coroutine_calls() {
         let source = "defer cleanup(resource);";
-        let statement = parse_statement(Lexer::new(source)).expect("defer should parse");
+        let statement = parse_statement_source(source);
         assert_eq!(
-            format_statement(source, &statement),
+            format_statement(&module(source), &statement),
             "Defer @ 0..24\n  call:\n    Call @ 6..23\n      callee:\n        Identifier \"cleanup\" @ 6..13\n      arguments:\n        [0]:\n          Identifier \"resource\" @ 14..22"
         );
 
         let source = "co service.process(request);";
-        let statement = parse_statement(Lexer::new(source)).expect("coroutine should parse");
+        let statement = parse_statement_source(source);
         assert_eq!(
-            format_statement(source, &statement),
+            format_statement(&module(source), &statement),
             "Coroutine @ 0..28\n  call:\n    Call @ 3..27\n      callee:\n        MemberAccess \"process\" @ 3..18\n          object:\n            Identifier \"service\" @ 3..10\n      arguments:\n        [0]:\n          Identifier \"request\" @ 19..26"
         );
     }
@@ -1034,10 +1098,10 @@ mod tests {
     #[test]
     fn formats_empty_blocks() {
         let source = "{}";
-        let expression = parse_expression(Lexer::new(source)).expect("block should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "Block @ 0..2\n  statements:\n    (empty)\n  value:\n    (none)"
         );
     }
@@ -1045,10 +1109,10 @@ mod tests {
     #[test]
     fn formats_blocks_with_statements_and_a_value() {
         let source = "{ const x = 1; x + 2 }";
-        let expression = parse_expression(Lexer::new(source)).expect("block should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "Block @ 0..22\n  statements:\n    [0]:\n      Binding Const \"x\" @ 2..14\n        initializer:\n          Literal Integer \"1\" @ 12..13\n  value:\n    Binary Add @ 15..20\n      left:\n        Identifier \"x\" @ 15..16\n      right:\n        Literal Integer \"2\" @ 19..20"
         );
     }
@@ -1056,10 +1120,10 @@ mod tests {
     #[test]
     fn formats_conditionals_without_else_branches() {
         let source = "if ready { 1 }";
-        let expression = parse_expression(Lexer::new(source)).expect("conditional should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "If @ 0..14\n  condition:\n    Identifier \"ready\" @ 3..8\n  then_branch:\n    Block @ 9..14\n      statements:\n        (empty)\n      value:\n        Literal Integer \"1\" @ 11..12\n  else_branch:\n    (none)"
         );
     }
@@ -1067,10 +1131,10 @@ mod tests {
     #[test]
     fn formats_conditionals_with_braced_else_branches() {
         let source = "if ready { 1 } else { 2 }";
-        let expression = parse_expression(Lexer::new(source)).expect("conditional should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "If @ 0..25\n  condition:\n    Identifier \"ready\" @ 3..8\n  then_branch:\n    Block @ 9..14\n      statements:\n        (empty)\n      value:\n        Literal Integer \"1\" @ 11..12\n  else_branch:\n    Block @ 20..25\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 22..23"
         );
     }
@@ -1078,10 +1142,10 @@ mod tests {
     #[test]
     fn formats_else_if_branches_as_nested_conditionals() {
         let source = "if a {} else if b {}";
-        let expression = parse_expression(Lexer::new(source)).expect("else-if should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "If @ 0..20\n  condition:\n    Identifier \"a\" @ 3..4\n  then_branch:\n    Block @ 5..7\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    If @ 13..20\n      condition:\n        Identifier \"b\" @ 16..17\n      then_branch:\n        Block @ 18..20\n          statements:\n            (empty)\n          value:\n            (none)\n      else_branch:\n        (none)"
         );
     }
@@ -1089,24 +1153,27 @@ mod tests {
     #[test]
     fn formats_break_and_continue_statements() {
         let source = "break value + 1;";
-        let statement = parse_statement(Lexer::new(source)).expect("break should parse");
+        let statement = parse_statement_source(source);
         assert_eq!(
-            format_statement(source, &statement),
+            format_statement(&module(source), &statement),
             "Break @ 0..16\n  value:\n    Binary Add @ 6..15\n      left:\n        Identifier \"value\" @ 6..11\n      right:\n        Literal Integer \"1\" @ 14..15"
         );
 
         let source = "continue;";
-        let statement = parse_statement(Lexer::new(source)).expect("continue should parse");
-        assert_eq!(format_statement(source, &statement), "Continue @ 0..9");
+        let statement = parse_statement_source(source);
+        assert_eq!(
+            format_statement(&module(source), &statement),
+            "Continue @ 0..9"
+        );
     }
 
     #[test]
     fn formats_infinite_loops() {
         let source = "loop { break 42; }";
-        let expression = parse_expression(Lexer::new(source)).expect("loop should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "Loop @ 0..18\n  body:\n    Block @ 5..18\n      statements:\n        [0]:\n          Break @ 7..16\n            value:\n              Literal Integer \"42\" @ 13..15\n      value:\n        (none)"
         );
     }
@@ -1114,10 +1181,10 @@ mod tests {
     #[test]
     fn formats_while_loops_with_else_blocks() {
         let source = "while ready {} else { 2 }";
-        let expression = parse_expression(Lexer::new(source)).expect("while loop should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "While @ 0..25\n  condition:\n    Identifier \"ready\" @ 6..11\n  body:\n    Block @ 12..14\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    Block @ 20..25\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 22..23"
         );
     }
@@ -1125,10 +1192,10 @@ mod tests {
     #[test]
     fn formats_exclusive_range_for_loops() {
         let source = "for i in 0..10 {}";
-        let expression = parse_expression(Lexer::new(source)).expect("range loop should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "RangeFor Exclusive \"i\" @ 0..17\n  start:\n    Literal Integer \"0\" @ 9..10\n  end:\n    Literal Integer \"10\" @ 12..14\n  body:\n    Block @ 15..17\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    (none)"
         );
     }
@@ -1136,10 +1203,10 @@ mod tests {
     #[test]
     fn formats_inclusive_range_for_loops_with_else_blocks() {
         let source = "for i in 0..=1 {} else { 2 }";
-        let expression = parse_expression(Lexer::new(source)).expect("range loop should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "RangeFor Inclusive \"i\" @ 0..28\n  start:\n    Literal Integer \"0\" @ 9..10\n  end:\n    Literal Integer \"1\" @ 13..14\n  body:\n    Block @ 15..17\n      statements:\n        (empty)\n      value:\n        (none)\n  else_branch:\n    Block @ 23..28\n      statements:\n        (empty)\n      value:\n        Literal Integer \"2\" @ 25..26"
         );
     }
@@ -1147,10 +1214,10 @@ mod tests {
     #[test]
     fn formats_default_unit_lambdas() {
         let source = "lambda() {}";
-        let expression = parse_expression(Lexer::new(source)).expect("lambda should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "Lambda @ 0..11\n  parameters:\n    (empty)\n  return_type:\n    (default ())\n  body:\n    Block @ 9..11\n      statements:\n        (empty)\n      value:\n        (none)"
         );
     }
@@ -1158,10 +1225,10 @@ mod tests {
     #[test]
     fn formats_value_returning_lambdas() {
         let source = "lambda(value: int) -> int { value }";
-        let expression = parse_expression(Lexer::new(source)).expect("lambda should parse");
+        let expression = parse_expression_source(source);
 
         assert_eq!(
-            format_expression(source, &expression),
+            format_expression(&module(source), &expression),
             "Lambda @ 0..35\n  parameters:\n    [0]:\n      Parameter Const \"value\" @ 7..17\n        type:\n          Primitive Int @ 14..17\n  return_type:\n    Primitive Int @ 22..25\n  body:\n    Block @ 26..35\n      statements:\n        (empty)\n      value:\n        Identifier \"value\" @ 28..33"
         );
     }
@@ -1169,10 +1236,10 @@ mod tests {
     #[test]
     fn formats_named_functions_and_return_statements() {
         let source = "fn add(left: int, mut right: int) -> int { return left + right; }";
-        let statement = parse_statement(Lexer::new(source)).expect("function should parse");
+        let statement = parse_statement_source(source);
 
         assert_eq!(
-            format_statement(source, &statement),
+            format_statement(&module(source), &statement),
             "Function \"add\" @ 0..65\n  parameters:\n    [0]:\n      Parameter Const \"left\" @ 7..16\n        type:\n          Primitive Int @ 13..16\n    [1]:\n      Parameter Mut \"right\" @ 18..32\n        type:\n          Primitive Int @ 29..32\n  return_type:\n    Primitive Int @ 37..40\n  body:\n    Block @ 41..65\n      statements:\n        [0]:\n          Return @ 43..63\n            value:\n              Binary Add @ 50..62\n                left:\n                  Identifier \"left\" @ 50..54\n                right:\n                  Identifier \"right\" @ 57..62\n      value:\n        (none)"
         );
     }
@@ -1180,8 +1247,8 @@ mod tests {
     #[test]
     fn formats_receivers_and_bare_returns() {
         let source = "fn stop(mut self) { return; }";
-        let statement = parse_statement(Lexer::new(source)).expect("function should parse");
-        let output = format_statement(source, &statement);
+        let statement = parse_statement_source(source);
+        let output = format_statement(&module(source), &statement);
 
         assert!(output.contains("Parameter Mut Self @ 8..16"));
         assert!(output.contains("return_type:\n    (default ())"));

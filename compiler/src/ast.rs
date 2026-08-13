@@ -1,8 +1,22 @@
-use crate::lexer::Span;
+use crate::source::{ModuleId, Span};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId {
+    pub module_id: ModuleId,
+    pub node_id: u32,
+}
+
+impl NodeId {
+    pub(crate) const UNASSIGNED: Self = Self {
+        module_id: ModuleId::PRELUDE,
+        node_id: u32::MAX,
+    };
+}
 
 /// One complete source program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
+    pub id: NodeId,
     pub declarations: Vec<Declaration>,
     pub span: Span,
 }
@@ -10,7 +24,11 @@ pub struct Program {
 impl Program {
     #[must_use]
     pub const fn new(declarations: Vec<Declaration>, span: Span) -> Self {
-        Self { declarations, span }
+        Self {
+            id: NodeId::UNASSIGNED,
+            declarations,
+            span,
+        }
     }
 }
 
@@ -25,6 +43,7 @@ pub enum Declaration {
 /// A named structural interface declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceDeclaration {
+    pub id: NodeId,
     pub name: Span,
     pub requirements: Vec<InterfaceMethodRequirement>,
     pub span: Span,
@@ -38,6 +57,7 @@ impl InterfaceDeclaration {
         span: Span,
     ) -> Self {
         Self {
+            id: NodeId::UNASSIGNED,
             name,
             requirements,
             span,
@@ -48,6 +68,7 @@ impl InterfaceDeclaration {
 /// One bodyless method signature required by an interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceMethodRequirement {
+    pub id: NodeId,
     pub name: Span,
     pub parameters: Vec<FunctionParameter>,
     /// An explicit return annotation. Its absence defaults to unit.
@@ -64,6 +85,7 @@ impl InterfaceMethodRequirement {
         span: Span,
     ) -> Self {
         Self {
+            id: NodeId::UNASSIGNED,
             name,
             parameters,
             return_type,
@@ -75,6 +97,7 @@ impl InterfaceMethodRequirement {
 /// A named nominal struct declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructDeclaration {
+    pub id: NodeId,
     pub name: Span,
     pub members: Vec<StructMember>,
     pub span: Span,
@@ -84,6 +107,7 @@ impl StructDeclaration {
     #[must_use]
     pub const fn new(name: Span, members: Vec<StructMember>, span: Span) -> Self {
         Self {
+            id: NodeId::UNASSIGNED,
             name,
             members,
             span,
@@ -101,6 +125,7 @@ pub enum StructMember {
 /// A field declared by a named struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructField {
+    pub id: NodeId,
     pub name: Span,
     pub type_annotation: TypeSyntax,
     pub span: Span,
@@ -110,6 +135,7 @@ impl StructField {
     #[must_use]
     pub const fn new(name: Span, type_annotation: TypeSyntax, span: Span) -> Self {
         Self {
+            id: NodeId::UNASSIGNED,
             name,
             type_annotation,
             span,
@@ -120,6 +146,7 @@ impl StructField {
 /// One field initializer in a named struct construction expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructFieldInitializer {
+    pub id: NodeId,
     pub name: Span,
     pub value: Expression,
     pub span: Span,
@@ -128,7 +155,12 @@ pub struct StructFieldInitializer {
 impl StructFieldInitializer {
     #[must_use]
     pub const fn new(name: Span, value: Expression, span: Span) -> Self {
-        Self { name, value, span }
+        Self {
+            id: NodeId::UNASSIGNED,
+            name,
+            value,
+            span,
+        }
     }
 }
 
@@ -142,6 +174,7 @@ pub enum AnonymousStructMember {
 /// An initialized field in an anonymous struct expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnonymousStructField {
+    pub id: NodeId,
     pub name: Span,
     pub type_annotation: Option<TypeSyntax>,
     pub initializer: Expression,
@@ -157,6 +190,7 @@ impl AnonymousStructField {
         span: Span,
     ) -> Self {
         Self {
+            id: NodeId::UNASSIGNED,
             name,
             type_annotation,
             initializer,
@@ -168,6 +202,7 @@ impl AnonymousStructField {
 /// An expression in the source-level syntax tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expression {
+    pub id: NodeId,
     pub kind: ExpressionKind,
     pub span: Span,
 }
@@ -175,13 +210,18 @@ pub struct Expression {
 impl Expression {
     #[must_use]
     pub const fn new(kind: ExpressionKind, span: Span) -> Self {
-        Self { kind, span }
+        Self {
+            id: NodeId::UNASSIGNED,
+            kind,
+            span,
+        }
     }
 }
 
 /// A type expression in the source-level syntax tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeSyntax {
+    pub id: NodeId,
     pub kind: TypeKind,
     pub span: Span,
 }
@@ -189,13 +229,18 @@ pub struct TypeSyntax {
 impl TypeSyntax {
     #[must_use]
     pub const fn new(kind: TypeKind, span: Span) -> Self {
-        Self { kind, span }
+        Self {
+            id: NodeId::UNASSIGNED,
+            kind,
+            span,
+        }
     }
 }
 
 /// A statement in the source-level syntax tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
+    pub id: NodeId,
     pub kind: StatementKind,
     pub span: Span,
 }
@@ -203,13 +248,18 @@ pub struct Statement {
 impl Statement {
     #[must_use]
     pub const fn new(kind: StatementKind, span: Span) -> Self {
-        Self { kind, span }
+        Self {
+            id: NodeId::UNASSIGNED,
+            kind,
+            span,
+        }
     }
 }
 
 /// A braced executable block containing statements and an optional final value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
+    pub id: NodeId,
     pub statements: Vec<Statement>,
     pub value: Option<Box<Expression>>,
     pub span: Span,
@@ -223,6 +273,7 @@ impl Block {
         span: Span,
     ) -> Self {
         Self {
+            id: NodeId::UNASSIGNED,
             statements,
             value,
             span,
@@ -233,6 +284,7 @@ impl Block {
 /// A named function declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Function {
+    pub id: NodeId,
     pub name: Span,
     pub parameters: Vec<FunctionParameter>,
     /// An explicit return annotation. Its absence defaults to unit.
@@ -251,6 +303,7 @@ impl Function {
         span: Span,
     ) -> Self {
         Self {
+            id: NodeId::UNASSIGNED,
             name,
             parameters,
             return_type,
@@ -263,6 +316,7 @@ impl Function {
 /// A parameter in a named function declaration or lambda expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionParameter {
+    pub id: NodeId,
     pub mutability: BindingMutability,
     pub kind: FunctionParameterKind,
     pub span: Span,
@@ -276,6 +330,7 @@ impl FunctionParameter {
         span: Span,
     ) -> Self {
         Self {
+            id: NodeId::UNASSIGNED,
             mutability,
             kind,
             span,

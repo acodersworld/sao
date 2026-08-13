@@ -4,11 +4,12 @@ use crate::ast::{
     AnonymousStructField, AnonymousStructMember, AssignmentOperator, BinaryOperator,
     BindingMutability, Block, BuiltinType, ConditionalElse, Declaration, Expression,
     ExpressionKind, Function, FunctionParameter, FunctionParameterKind, InterfaceDeclaration,
-    InterfaceMethodRequirement, LiteralKind, PrimitiveType, Program, RangeInclusivity, Statement,
-    StatementKind, StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind,
-    TypeSyntax, UnaryOperator,
+    InterfaceMethodRequirement, LiteralKind, NodeId, PrimitiveType, Program, RangeInclusivity,
+    Statement, StatementKind, StructDeclaration, StructField, StructFieldInitializer, StructMember,
+    TypeKind, TypeSyntax, UnaryOperator,
 };
-use crate::lexer::{LexError, Span, Token, TokenKind};
+use crate::lexer::{LexError, Token, TokenKind};
+use crate::source::{ModuleId, Span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParseErrorKind {
@@ -65,6 +66,10 @@ pub enum ParseErrorKind {
     UnexpectedToken {
         found: TokenKind,
     },
+    TokenModuleMismatch {
+        expected: ModuleId,
+        found: ModuleId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,27 +98,84 @@ impl From<ParseError> for FrontendError {
 
 pub type ParseResult<T = Expression> = Result<T, FrontendError>;
 
+/// Allocates AST node identities for repeated parser entry points in one module.
+///
+/// Reuse one context while parsing independently requested fragments from the
+/// same module so their node IDs remain distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseContext {
+    module_id: ModuleId,
+    next_node_id: u32,
+    #[cfg(test)]
+    leave_ids_unassigned: bool,
+}
+
+impl ParseContext {
+    #[must_use]
+    pub const fn new(module_id: ModuleId) -> Self {
+        Self {
+            module_id,
+            next_node_id: 0,
+            #[cfg(test)]
+            leave_ids_unassigned: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn module_id(&self) -> ModuleId {
+        self.module_id
+    }
+
+    fn next_node_id(&mut self) -> NodeId {
+        #[cfg(test)]
+        if self.leave_ids_unassigned {
+            return NodeId::UNASSIGNED;
+        }
+
+        let id = NodeId {
+            module_id: self.module_id,
+            node_id: self.next_node_id,
+        };
+        self.next_node_id = self
+            .next_node_id
+            .checked_add(1)
+            .expect("node ID space exhausted");
+        id
+    }
+
+    #[cfg(test)]
+    const fn unassigned() -> Self {
+        Self {
+            module_id: ModuleId::PRELUDE,
+            next_node_id: 0,
+            leave_ids_unassigned: true,
+        }
+    }
+}
+
 /// Parses one complete source program.
 ///
 /// The iterator may be the lexer itself and is expected to yield its explicit
 /// [`TokenKind::Eof`] token.
-pub fn parse_program<I>(tokens: I) -> ParseResult<Program>
+pub fn parse_program<I>(context: &mut ParseContext, tokens: I) -> ParseResult<Program>
 where
     I: Iterator<Item = Result<Token, LexError>>,
 {
-    Parser::new(tokens).program()
+    let mut program = Parser::new(tokens, context.module_id()).program()?;
+    assign_program_ids(&mut program, context);
+    Ok(program)
 }
 
 /// Parses one complete expression token stream.
 ///
 /// The iterator may be the lexer itself and is expected to yield its explicit
 /// [`TokenKind::Eof`] token.
-pub fn parse_expression<I>(tokens: I) -> ParseResult
+pub fn parse_expression<I>(context: &mut ParseContext, tokens: I) -> ParseResult
 where
     I: Iterator<Item = Result<Token, LexError>>,
 {
-    let mut parser = Parser::new(tokens);
-    let expression = parser.expression(LOWEST_BINDING_POWER, true)?;
+    let mut parser = Parser::new(tokens, context.module_id());
+    let mut expression = parser.expression(LOWEST_BINDING_POWER, true)?;
     let token = parser.current()?;
 
     if token.kind != TokenKind::Eof {
@@ -124,6 +186,7 @@ where
         .into());
     }
 
+    assign_expression_ids(&mut expression, context);
     Ok(expression)
 }
 
@@ -131,12 +194,12 @@ where
 ///
 /// The iterator may be the lexer itself and is expected to yield its explicit
 /// [`TokenKind::Eof`] token.
-pub fn parse_type<I>(tokens: I) -> ParseResult<TypeSyntax>
+pub fn parse_type<I>(context: &mut ParseContext, tokens: I) -> ParseResult<TypeSyntax>
 where
     I: Iterator<Item = Result<Token, LexError>>,
 {
-    let mut parser = Parser::new(tokens);
-    let type_syntax = parser.type_expression()?;
+    let mut parser = Parser::new(tokens, context.module_id());
+    let mut type_syntax = parser.type_expression()?;
     let token = parser.current()?;
 
     if token.kind != TokenKind::Eof {
@@ -147,6 +210,7 @@ where
         .into());
     }
 
+    assign_type_ids(&mut type_syntax, context);
     Ok(type_syntax)
 }
 
@@ -154,12 +218,12 @@ where
 ///
 /// The iterator may be the lexer itself and is expected to yield its explicit
 /// [`TokenKind::Eof`] token.
-pub fn parse_statement<I>(tokens: I) -> ParseResult<Statement>
+pub fn parse_statement<I>(context: &mut ParseContext, tokens: I) -> ParseResult<Statement>
 where
     I: Iterator<Item = Result<Token, LexError>>,
 {
-    let mut parser = Parser::new(tokens);
-    let statement = parser.statement()?;
+    let mut parser = Parser::new(tokens, context.module_id());
+    let mut statement = parser.statement()?;
     let token = parser.current()?;
 
     if token.kind != TokenKind::Eof {
@@ -170,6 +234,7 @@ where
         .into());
     }
 
+    assign_statement_ids(&mut statement, context);
     Ok(statement)
 }
 
@@ -178,6 +243,7 @@ where
     I: Iterator<Item = Result<Token, LexError>>,
 {
     tokens: Peekable<I>,
+    module_id: ModuleId,
     /// Holds the second `>` when type parsing splits a `>>` token that closes
     /// two nested parameterized types.
     pending: Option<Token>,
@@ -194,9 +260,10 @@ impl<I> Parser<I>
 where
     I: Iterator<Item = Result<Token, LexError>>,
 {
-    fn new(tokens: I) -> Self {
+    fn new(tokens: I, module_id: ModuleId) -> Self {
         Self {
             tokens: tokens.peekable(),
+            module_id,
             pending: None,
             last_end: 0,
         }
@@ -208,7 +275,10 @@ where
         loop {
             let token = self.current()?;
             if token.kind == TokenKind::Eof {
-                return Ok(Program::new(declarations, Span::new(0, token.span.end)));
+                return Ok(Program::new(
+                    declarations,
+                    Span::new      (self.module_id, 0, token.span.end),
+                ));
             }
 
             declarations.push(self.declaration()?);
@@ -254,7 +324,7 @@ where
         Ok(InterfaceDeclaration::new(
             name.span,
             requirements,
-            Span::new(keyword.span.start, right_brace.span.end),
+            Span::new      (self.module_id, keyword.span.start, right_brace.span.end),
         ))
     }
 
@@ -269,7 +339,7 @@ where
             name.span,
             parameters,
             return_type,
-            Span::new(keyword.span.start, semicolon.span.end),
+            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -299,7 +369,7 @@ where
         Ok(StructDeclaration::new(
             name.span,
             members,
-            Span::new(keyword.span.start, right_brace.span.end),
+            Span::new      (self.module_id, keyword.span.start, right_brace.span.end),
         ))
     }
 
@@ -308,7 +378,7 @@ where
         self.expect(TokenKind::Colon)?;
         let type_annotation = self.type_expression()?;
         let comma = self.expect(TokenKind::Comma)?;
-        let span = Span::new(name.span.start, comma.span.end);
+        let span = Span::new      (self.module_id, name.span.start, comma.span.end);
         Ok(StructField::new(name.span, type_annotation, span))
     }
 
@@ -338,7 +408,7 @@ where
         let parameters = self.function_parameters(true)?;
         let return_type = self.optional_return_type()?;
         let body = self.block()?;
-        let span = Span::new(keyword.span.start, body.span.end);
+        let span = Span::new      (self.module_id, keyword.span.start, body.span.end);
 
         Ok(Function::new(
             name.span,
@@ -399,14 +469,14 @@ where
                 FunctionParameterKind::Receiver {
                     name: receiver.span,
                 },
-                Span::new(start, receiver.span.end),
+                Span::new      (self.module_id, start, receiver.span.end),
             ));
         }
 
         let name = self.expect(TokenKind::Identifier)?;
         self.expect(TokenKind::Colon)?;
         let type_annotation = self.type_expression()?;
-        let span = Span::new(start, type_annotation.span.end);
+        let span = Span::new      (self.module_id, start, type_annotation.span.end);
 
         Ok(FunctionParameter::new(
             mutability,
@@ -439,7 +509,7 @@ where
                 type_annotation,
                 initializer,
             },
-            Span::new(keyword.span.start, semicolon.span.end),
+            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -447,14 +517,14 @@ where
         let expression = self.expression(LOWEST_BINDING_POWER, true)?;
         let span = if self.current()?.kind == TokenKind::Semicolon {
             let semicolon = self.advance()?;
-            Span::new(expression.span.start, semicolon.span.end)
+            Span::new      (self.module_id, expression.span.start, semicolon.span.end)
         } else if expression_may_omit_statement_semicolon(&expression)
             && self.current()?.kind == TokenKind::Eof
         {
             expression.span
         } else {
             let semicolon = self.expect(TokenKind::Semicolon)?;
-            Span::new(expression.span.start, semicolon.span.end)
+            Span::new      (self.module_id, expression.span.start, semicolon.span.end)
         };
         Ok(Statement::new(StatementKind::Expression(expression), span))
     }
@@ -496,7 +566,7 @@ where
 
         Ok(Statement::new(
             statement_kind,
-            Span::new(keyword.span.start, semicolon.span.end),
+            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -521,7 +591,7 @@ where
 
         Ok(Statement::new(
             StatementKind::Break(value),
-            Span::new(keyword.span.start, semicolon.span.end),
+            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -530,7 +600,7 @@ where
         let semicolon = self.expect(TokenKind::Semicolon)?;
         Ok(Statement::new(
             StatementKind::Continue,
-            Span::new(keyword.span.start, semicolon.span.end),
+            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -555,7 +625,7 @@ where
 
         Ok(Statement::new(
             StatementKind::Return(value),
-            Span::new(keyword.span.start, semicolon.span.end),
+            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -577,7 +647,7 @@ where
         let end = members.last().expect("a union has members").span.end;
         Ok(TypeSyntax::new(
             TypeKind::Union { members },
-            Span::new(start, end),
+            Span::new      (self.module_id, start, end),
         ))
     }
 
@@ -603,7 +673,7 @@ where
             .end;
         Ok(TypeSyntax::new(
             TypeKind::Intersection { members },
-            Span::new(start, end),
+            Span::new      (self.module_id, start, end),
         ))
     }
 
@@ -616,7 +686,7 @@ where
 
         self.advance()?;
         let inner = self.prefix_type()?;
-        let span = Span::new(token.span.start, inner.span.end);
+        let span = Span::new      (self.module_id, token.span.start, inner.span.end);
         Ok(TypeSyntax::new(TypeKind::Mutable(Box::new(inner)), span))
     }
 
@@ -665,7 +735,7 @@ where
                 name: name.span,
                 arguments,
             },
-            Span::new(name.span.start, end),
+            Span::new      (self.module_id, name.span.start, end),
         ))
     }
 
@@ -688,12 +758,12 @@ where
         validate_builtin_type_argument_count(
             builtin,
             arguments.len(),
-            Span::new(name.span.start, close.span.end),
+            Span::new      (self.module_id, name.span.start, close.span.end),
         )?;
 
         Ok(TypeSyntax::new(
             TypeKind::Builtin { builtin, arguments },
-            Span::new(name.span.start, close.span.end),
+            Span::new      (self.module_id, name.span.start, close.span.end),
         ))
     }
 
@@ -742,7 +812,7 @@ where
         self.expect(TokenKind::RightParen)?;
         self.expect(TokenKind::Arrow)?;
         let return_type = self.type_expression()?;
-        let span = Span::new(function.span.start, return_type.span.end);
+        let span = Span::new      (self.module_id, function.span.start, return_type.span.end);
 
         Ok(TypeSyntax::new(
             TypeKind::Callable {
@@ -760,7 +830,11 @@ where
             let right_parenthesis = self.advance()?;
             return Ok(TypeSyntax::new(
                 TypeKind::Primitive(PrimitiveType::Unit),
-                Span::new(left_parenthesis.span.start, right_parenthesis.span.end),
+                Span::new      (
+                    self.module_id,
+                    left_parenthesis.span.start,
+                    right_parenthesis.span.end,
+                ),
             ));
         }
 
@@ -768,7 +842,11 @@ where
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
         Ok(TypeSyntax::new(
             TypeKind::Group(Box::new(inner)),
-            Span::new(left_parenthesis.span.start, right_parenthesis.span.end),
+            Span::new      (
+                self.module_id,
+                left_parenthesis.span.start,
+                right_parenthesis.span.end,
+            ),
         ))
     }
 
@@ -781,11 +859,11 @@ where
                 self.advance()?;
                 let first = Token::new(
                     TokenKind::Greater,
-                    Span::new(token.span.start, token.span.start + 1),
+                    Span::new      (self.module_id, token.span.start, token.span.start + 1),
                 );
                 self.pending = Some(Token::new(
                     TokenKind::Greater,
-                    Span::new(token.span.start + 1, token.span.end),
+                    Span::new      (self.module_id, token.span.start + 1, token.span.end),
                 ));
                 Ok(first)
             }
@@ -836,7 +914,7 @@ where
                 InfixOperator::Binary(operator) => {
                     let right = self
                         .expression(binding_power.right_binding_power, allow_struct_construction)?;
-                    let span = Span::new(left.span.start, right.span.end);
+                    let span = Span::new      (self.module_id, left.span.start, right.span.end);
                     (
                         ExpressionKind::Binary {
                             left: Box::new(left),
@@ -849,7 +927,7 @@ where
                 InfixOperator::Assignment(operator) => {
                     let right = self
                         .expression(binding_power.right_binding_power, allow_struct_construction)?;
-                    let span = Span::new(left.span.start, right.span.end);
+                    let span = Span::new      (self.module_id, left.span.start, right.span.end);
                     (
                         ExpressionKind::Assignment {
                             target: Box::new(left),
@@ -861,7 +939,8 @@ where
                 }
                 InfixOperator::TypeTest => {
                     let type_syntax = self.type_expression()?;
-                    let span = Span::new(left.span.start, type_syntax.span.end);
+                    let span =
+                        Span::new      (self.module_id, left.span.start, type_syntax.span.end);
                     (
                         ExpressionKind::TypeTest {
                             value: Box::new(left),
@@ -880,7 +959,11 @@ where
 
     fn call(&mut self, callee: Expression) -> ParseResult {
         let (arguments, right_parenthesis) = self.call_arguments()?;
-        let span = Span::new(callee.span.start, right_parenthesis.span.end);
+        let span = Span::new      (
+            self.module_id,
+            callee.span.start,
+            right_parenthesis.span.end,
+        );
 
         Ok(Expression::new(
             ExpressionKind::Call {
@@ -918,7 +1001,7 @@ where
     fn member_access(&mut self, object: Expression) -> ParseResult {
         self.expect(TokenKind::Dot)?;
         let member = self.expect(TokenKind::Identifier)?;
-        let span = Span::new(object.span.start, member.span.end);
+        let span = Span::new      (self.module_id, object.span.start, member.span.end);
 
         Ok(Expression::new(
             ExpressionKind::MemberAccess {
@@ -963,7 +1046,7 @@ where
         }
 
         let right_bracket = self.expect(TokenKind::RightBracket)?;
-        let span = Span::new(object.span.start, right_bracket.span.end);
+        let span = Span::new      (self.module_id, object.span.start, right_bracket.span.end);
 
         Ok(Expression::new(
             ExpressionKind::Index {
@@ -993,7 +1076,7 @@ where
             Some(self.expression(LOWEST_BINDING_POWER, true)?)
         };
         let right_bracket = self.expect(TokenKind::RightBracket)?;
-        let span = Span::new(object.span.start, right_bracket.span.end);
+        let span = Span::new      (self.module_id, object.span.start, right_bracket.span.end);
 
         Ok(Expression::new(
             ExpressionKind::Slice {
@@ -1007,7 +1090,7 @@ where
 
     fn try_expression(&mut self, expression: Expression) -> ParseResult {
         let question = self.expect(TokenKind::Question)?;
-        let span = Span::new(expression.span.start, question.span.end);
+        let span = Span::new      (self.module_id, expression.span.start, question.span.end);
 
         Ok(Expression::new(
             ExpressionKind::Try {
@@ -1025,7 +1108,7 @@ where
                 self.advance()?;
                 let operand =
                     self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
-                let span = Span::new(token.span.start, operand.span.end);
+                let span = Span::new      (self.module_id, token.span.start, operand.span.end);
 
                 Ok(Expression::new(
                     ExpressionKind::Unary {
@@ -1039,7 +1122,7 @@ where
                 self.advance()?;
                 let operand =
                     self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
-                let span = Span::new(token.span.start, operand.span.end);
+                let span = Span::new      (self.module_id, token.span.start, operand.span.end);
                 let operator = match token.kind {
                     TokenKind::Bang => UnaryOperator::LogicalNot,
                     TokenKind::Tilde => UnaryOperator::BitwiseNot,
@@ -1097,7 +1180,7 @@ where
             validate_builtin_type_argument_count(
                 builtin,
                 arguments.len(),
-                Span::new(name.span.start, close.span.end),
+                Span::new      (self.module_id, name.span.start, close.span.end),
             )?;
             type_arguments = arguments;
         } else if builtin != BuiltinType::Error {
@@ -1125,7 +1208,7 @@ where
         }
 
         let (arguments, right_parenthesis) = self.call_arguments()?;
-        let span = Span::new(name.span.start, right_parenthesis.span.end);
+        let span = Span::new      (self.module_id, name.span.start, right_parenthesis.span.end);
         validate_builtin_constructor_argument_count(builtin, arguments.len(), span)?;
 
         Ok(Expression::new(
@@ -1143,7 +1226,7 @@ where
         let parameters = self.function_parameters(false)?;
         let return_type = self.optional_return_type()?;
         let body = self.block()?;
-        let span = Span::new(keyword.span.start, body.span.end);
+        let span = Span::new      (self.module_id, keyword.span.start, body.span.end);
 
         Ok(Expression::new(
             ExpressionKind::Lambda {
@@ -1166,7 +1249,11 @@ where
                 target,
                 value: Box::new(value),
             },
-            Span::new(keyword.span.start, right_parenthesis.span.end),
+            Span::new      (
+                self.module_id,
+                keyword.span.start,
+                right_parenthesis.span.end,
+            ),
         ))
     }
 
@@ -1181,7 +1268,7 @@ where
                 let field_name = self.expect(TokenKind::Identifier)?;
                 self.expect(TokenKind::Colon)?;
                 let value = self.expression(LOWEST_BINDING_POWER, true)?;
-                let span = Span::new(field_name.span.start, value.span.end);
+                let span = Span::new      (self.module_id, field_name.span.start, value.span.end);
                 fields.push(StructFieldInitializer::new(field_name.span, value, span));
 
                 if self.current()?.kind != TokenKind::Comma {
@@ -1198,7 +1285,7 @@ where
         let right_brace = self.expect(TokenKind::RightBrace)?;
         Ok(Expression::new(
             ExpressionKind::StructConstruction { name, fields },
-            Span::new(name.start, right_brace.span.end),
+            Span::new      (self.module_id, name.start, right_brace.span.end),
         ))
     }
 
@@ -1230,7 +1317,7 @@ where
 
         Ok(Expression::new(
             ExpressionKind::AnonymousStruct { members },
-            Span::new(keyword.span.start, right_brace.span.end),
+            Span::new      (self.module_id, keyword.span.start, right_brace.span.end),
         ))
     }
 
@@ -1245,7 +1332,7 @@ where
         self.expect(TokenKind::Assign)?;
         let initializer = self.expression(LOWEST_BINDING_POWER, true)?;
         let semicolon = self.expect(TokenKind::Semicolon)?;
-        let span = Span::new(name.span.start, semicolon.span.end);
+        let span = Span::new      (self.module_id, name.span.start, semicolon.span.end);
 
         Ok(AnonymousStructField::new(
             name.span,
@@ -1262,7 +1349,11 @@ where
             let right_parenthesis = self.advance()?;
             return Ok(Expression::new(
                 ExpressionKind::Literal(LiteralKind::Unit),
-                Span::new(left_parenthesis.span.start, right_parenthesis.span.end),
+                Span::new      (
+                    self.module_id,
+                    left_parenthesis.span.start,
+                    right_parenthesis.span.end,
+                ),
             ));
         }
 
@@ -1274,7 +1365,11 @@ where
 
         Ok(Expression::new(
             ExpressionKind::Group(Box::new(expression)),
-            Span::new(left_parenthesis.span.start, right_parenthesis.span.end),
+            Span::new      (
+                self.module_id,
+                left_parenthesis.span.start,
+                right_parenthesis.span.end,
+            ),
         ))
     }
 
@@ -1326,7 +1421,11 @@ where
                     match following.kind {
                         TokenKind::Semicolon => {
                             let semicolon = self.advance()?;
-                            let span = Span::new(expression.span.start, semicolon.span.end);
+                            let span = Span::new      (
+                                self.module_id,
+                                expression.span.start,
+                                semicolon.span.end,
+                            );
                             statements
                                 .push(Statement::new(StatementKind::Expression(expression), span));
                         }
@@ -1358,7 +1457,7 @@ where
             }
         };
 
-        let span = Span::new(left_brace.span.start, right_brace.span.end);
+        let span = Span::new      (self.module_id, left_brace.span.start, right_brace.span.end);
         Ok(Block::new(statements, value, span))
     }
 
@@ -1397,14 +1496,14 @@ where
                 then_branch,
                 else_branch,
             },
-            Span::new(if_keyword.span.start, end),
+            Span::new      (self.module_id, if_keyword.span.start, end),
         ))
     }
 
     fn loop_expression(&mut self) -> ParseResult {
         let keyword = self.expect(TokenKind::Loop)?;
         let body = self.block()?;
-        let span = Span::new(keyword.span.start, body.span.end);
+        let span = Span::new      (self.module_id, keyword.span.start, body.span.end);
         Ok(Expression::new(ExpressionKind::Loop { body }, span))
     }
 
@@ -1430,7 +1529,7 @@ where
                 body,
                 else_branch,
             },
-            Span::new(keyword.span.start, end),
+            Span::new      (self.module_id, keyword.span.start, end),
         ))
     }
 
@@ -1494,7 +1593,7 @@ where
                 body,
                 else_branch,
             },
-            Span::new(keyword.span.start, end_span),
+            Span::new      (self.module_id, keyword.span.start, end_span),
         ))
     }
 
@@ -1546,7 +1645,11 @@ where
         }
 
         match self.tokens.peek().copied() {
-            Some(result) => result.map_err(FrontendError::Lexical),
+            Some(Ok(token)) => self.validate_token_module(token),
+            Some(Err(error)) => {
+                self.validate_span_module(error.span)?;
+                Err(error.into())
+            }
             None => Ok(self.synthetic_eof()),
         }
     }
@@ -1559,16 +1662,298 @@ where
 
         match self.tokens.next() {
             Some(Ok(token)) => {
+                let token = self.validate_token_module(token)?;
                 self.last_end = token.span.end;
                 Ok(token)
             }
-            Some(Err(error)) => Err(error.into()),
+            Some(Err(error)) => {
+                self.validate_span_module(error.span)?;
+                Err(error.into())
+            }
             None => Ok(self.synthetic_eof()),
         }
     }
 
     fn synthetic_eof(&self) -> Token {
-        Token::new(TokenKind::Eof, Span::new(self.last_end, self.last_end))
+        Token::new(
+            TokenKind::Eof,
+            Span::new      (self.module_id, self.last_end, self.last_end),
+        )
+    }
+
+    fn validate_token_module(&self, token: Token) -> ParseResult<Token> {
+        self.validate_span_module(token.span)?;
+        Ok(token)
+    }
+
+    fn validate_span_module(&self, span: Span) -> ParseResult<()> {
+        if span.module_id == self.module_id {
+            Ok(())
+        } else {
+            Err(ParseError {
+                kind: ParseErrorKind::TokenModuleMismatch {
+                    expected: self.module_id,
+                    found: span.module_id,
+                },
+                span,
+            }
+            .into())
+        }
+    }
+}
+
+fn assign_program_ids(program: &mut Program, context: &mut ParseContext) {
+    program.id = context.next_node_id();
+    for declaration in &mut program.declarations {
+        assign_declaration_ids(declaration, context);
+    }
+}
+
+fn assign_declaration_ids(declaration: &mut Declaration, context: &mut ParseContext) {
+    match declaration {
+        Declaration::Function(function) => assign_function_ids(function, context),
+        Declaration::Struct(structure) => {
+            structure.id = context.next_node_id();
+            for member in &mut structure.members {
+                match member {
+                    StructMember::Field(field) => {
+                        field.id = context.next_node_id();
+                        assign_type_ids(&mut field.type_annotation, context);
+                    }
+                    StructMember::Method(method) => assign_function_ids(method, context),
+                }
+            }
+        }
+        Declaration::Interface(interface) => {
+            interface.id = context.next_node_id();
+            for requirement in &mut interface.requirements {
+                requirement.id = context.next_node_id();
+                for parameter in &mut requirement.parameters {
+                    assign_parameter_ids(parameter, context);
+                }
+                if let Some(return_type) = &mut requirement.return_type {
+                    assign_type_ids(return_type, context);
+                }
+            }
+        }
+    }
+}
+
+fn assign_function_ids(function: &mut Function, context: &mut ParseContext) {
+    function.id = context.next_node_id();
+    for parameter in &mut function.parameters {
+        assign_parameter_ids(parameter, context);
+    }
+    if let Some(return_type) = &mut function.return_type {
+        assign_type_ids(return_type, context);
+    }
+    assign_block_ids(&mut function.body, context);
+}
+
+fn assign_parameter_ids(parameter: &mut FunctionParameter, context: &mut ParseContext) {
+    parameter.id = context.next_node_id();
+    if let FunctionParameterKind::Named {
+        type_annotation, ..
+    } = &mut parameter.kind
+    {
+        assign_type_ids(type_annotation, context);
+    }
+}
+
+fn assign_block_ids(block: &mut Block, context: &mut ParseContext) {
+    block.id = context.next_node_id();
+    for statement in &mut block.statements {
+        assign_statement_ids(statement, context);
+    }
+    if let Some(value) = &mut block.value {
+        assign_expression_ids(value, context);
+    }
+}
+
+fn assign_statement_ids(statement: &mut Statement, context: &mut ParseContext) {
+    statement.id = context.next_node_id();
+    match &mut statement.kind {
+        StatementKind::Binding {
+            type_annotation,
+            initializer,
+            ..
+        } => {
+            if let Some(type_annotation) = type_annotation {
+                assign_type_ids(type_annotation, context);
+            }
+            assign_expression_ids(initializer, context);
+        }
+        StatementKind::Expression(expression)
+        | StatementKind::Defer(expression)
+        | StatementKind::Coroutine(expression) => assign_expression_ids(expression, context),
+        StatementKind::Function(function) => assign_function_ids(function, context),
+        StatementKind::Break(value) | StatementKind::Return(value) => {
+            if let Some(value) = value {
+                assign_expression_ids(value, context);
+            }
+        }
+        StatementKind::Continue => {}
+    }
+}
+
+fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext) {
+    expression.id = context.next_node_id();
+    match &mut expression.kind {
+        ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {}
+        ExpressionKind::Group(inner) => assign_expression_ids(inner, context),
+        ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
+            assign_block_ids(block, context);
+        }
+        ExpressionKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            assign_expression_ids(condition, context);
+            assign_block_ids(then_branch, context);
+            if let Some(else_branch) = else_branch {
+                match else_branch {
+                    ConditionalElse::Block(block) => assign_block_ids(block, context),
+                    ConditionalElse::If(expression) => assign_expression_ids(expression, context),
+                }
+            }
+        }
+        ExpressionKind::While {
+            condition,
+            body,
+            else_branch,
+        } => {
+            assign_expression_ids(condition, context);
+            assign_block_ids(body, context);
+            if let Some(else_branch) = else_branch {
+                assign_block_ids(else_branch, context);
+            }
+        }
+        ExpressionKind::RangeFor {
+            start,
+            end,
+            body,
+            else_branch,
+            ..
+        } => {
+            assign_expression_ids(start, context);
+            assign_expression_ids(end, context);
+            assign_block_ids(body, context);
+            if let Some(else_branch) = else_branch {
+                assign_block_ids(else_branch, context);
+            }
+        }
+        ExpressionKind::Lambda {
+            parameters,
+            return_type,
+            body,
+        } => {
+            for parameter in parameters {
+                assign_parameter_ids(parameter, context);
+            }
+            if let Some(return_type) = return_type {
+                assign_type_ids(return_type, context);
+            }
+            assign_block_ids(body, context);
+        }
+        ExpressionKind::PrimitiveConversion { value, .. } => {
+            assign_expression_ids(value, context);
+        }
+        ExpressionKind::BuiltinConstruction {
+            type_arguments,
+            arguments,
+            ..
+        } => {
+            for argument in type_arguments {
+                assign_type_ids(argument, context);
+            }
+            for argument in arguments {
+                assign_expression_ids(argument, context);
+            }
+        }
+        ExpressionKind::StructConstruction { fields, .. } => {
+            for field in fields {
+                field.id = context.next_node_id();
+                assign_expression_ids(&mut field.value, context);
+            }
+        }
+        ExpressionKind::AnonymousStruct { members } => {
+            for member in members {
+                match member {
+                    AnonymousStructMember::Field(field) => {
+                        field.id = context.next_node_id();
+                        if let Some(type_annotation) = &mut field.type_annotation {
+                            assign_type_ids(type_annotation, context);
+                        }
+                        assign_expression_ids(&mut field.initializer, context);
+                    }
+                    AnonymousStructMember::Method(method) => {
+                        assign_function_ids(method, context);
+                    }
+                }
+            }
+        }
+        ExpressionKind::Call { callee, arguments } => {
+            assign_expression_ids(callee, context);
+            for argument in arguments {
+                assign_expression_ids(argument, context);
+            }
+        }
+        ExpressionKind::MemberAccess { object, .. } => assign_expression_ids(object, context),
+        ExpressionKind::Index { object, index } => {
+            assign_expression_ids(object, context);
+            assign_expression_ids(index, context);
+        }
+        ExpressionKind::Slice { object, start, end } => {
+            assign_expression_ids(object, context);
+            if let Some(start) = start {
+                assign_expression_ids(start, context);
+            }
+            if let Some(end) = end {
+                assign_expression_ids(end, context);
+            }
+        }
+        ExpressionKind::Try { expression } => assign_expression_ids(expression, context),
+        ExpressionKind::TypeTest { value, type_syntax } => {
+            assign_expression_ids(value, context);
+            assign_type_ids(type_syntax, context);
+        }
+        ExpressionKind::Unary { operand, .. } => assign_expression_ids(operand, context),
+        ExpressionKind::Binary { left, right, .. } => {
+            assign_expression_ids(left, context);
+            assign_expression_ids(right, context);
+        }
+        ExpressionKind::Assignment { target, value, .. } => {
+            assign_expression_ids(target, context);
+            assign_expression_ids(value, context);
+        }
+    }
+}
+
+fn assign_type_ids(type_syntax: &mut TypeSyntax, context: &mut ParseContext) {
+    type_syntax.id = context.next_node_id();
+    match &mut type_syntax.kind {
+        TypeKind::Primitive(_) => {}
+        TypeKind::Builtin { arguments, .. } | TypeKind::Named { arguments, .. } => {
+            for argument in arguments {
+                assign_type_ids(argument, context);
+            }
+        }
+        TypeKind::Mutable(inner) | TypeKind::Group(inner) => assign_type_ids(inner, context),
+        TypeKind::Callable {
+            parameters,
+            return_type,
+        } => {
+            for parameter in parameters {
+                assign_type_ids(parameter, context);
+            }
+            assign_type_ids(return_type, context);
+        }
+        TypeKind::Intersection { members } | TypeKind::Union { members } => {
+            for member in members {
+                assign_type_ids(member, context);
+            }
+        }
     }
 }
 
@@ -1860,21 +2245,54 @@ const fn infix_binding_power(kind: TokenKind) -> Option<InfixBindingPower> {
 mod tests {
     use super::*;
     use crate::lexer::{LexErrorKind, Lexer};
+    use crate::source::{SourceModule, SourceModuleRegistry};
+
+    fn module(source: &str) -> SourceModule {
+        SourceModuleRegistry::new().add(source)
+    }
+
+    fn span(start: usize, end: usize) -> Span {
+        Span::new      (ModuleId::TEST_SOURCE, start, end)
+    }
 
     fn parse_program_source(source: &str) -> ParseResult<Program> {
-        parse_program(Lexer::new(source))
+        let module = module(source);
+        let mut context = ParseContext::new(module.module_id());
+        let mut result = parse_program(&mut context, Lexer::new(&module));
+        if let Ok(program) = &mut result {
+            assign_program_ids(program, &mut ParseContext::unassigned());
+        }
+        result
     }
 
     fn parse(source: &str) -> ParseResult {
-        parse_expression(Lexer::new(source))
+        let module = module(source);
+        let mut context = ParseContext::new(module.module_id());
+        let mut result = parse_expression(&mut context, Lexer::new(&module));
+        if let Ok(expression) = &mut result {
+            assign_expression_ids(expression, &mut ParseContext::unassigned());
+        }
+        result
     }
 
     fn parse_type_source(source: &str) -> ParseResult<TypeSyntax> {
-        parse_type(Lexer::new(source))
+        let module = module(source);
+        let mut context = ParseContext::new(module.module_id());
+        let mut result = parse_type(&mut context, Lexer::new(&module));
+        if let Ok(type_syntax) = &mut result {
+            assign_type_ids(type_syntax, &mut ParseContext::unassigned());
+        }
+        result
     }
 
     fn parse_statement_source(source: &str) -> ParseResult<Statement> {
-        parse_statement(Lexer::new(source))
+        let module = module(source);
+        let mut context = ParseContext::new(module.module_id());
+        let mut result = parse_statement(&mut context, Lexer::new(&module));
+        if let Ok(statement) = &mut result {
+            assign_statement_ids(statement, &mut ParseContext::unassigned());
+        }
+        result
     }
 
     fn integer(span: Span) -> Expression {
@@ -1886,7 +2304,7 @@ mod tests {
         let source = " \n// no declarations\n";
         assert_eq!(
             parse_program_source(source),
-            Ok(Program::new(Vec::new(), Span::new(0, source.len())))
+            Ok(Program::new(Vec::new(), span(0, source.len())))
         );
     }
 
@@ -1898,7 +2316,7 @@ mod tests {
         );
         let program = parse_program_source(source).expect("program should parse");
 
-        assert_eq!(program.span, Span::new(0, source.len()));
+        assert_eq!(program.span, span(0, source.len()));
         assert_eq!(program.declarations.len(), 2);
         let Declaration::Function(helper) = &program.declarations[0] else {
             panic!("expected helper function");
@@ -1906,8 +2324,8 @@ mod tests {
         let Declaration::Function(main) = &program.declarations[1] else {
             panic!("expected main function");
         };
-        assert_eq!(helper.name, Span::new(3, 9));
-        assert_eq!(main.name, Span::new(42, 46));
+        assert_eq!(helper.name, span(3, 9));
+        assert_eq!(main.name, span(42, 46));
         assert_eq!(helper.parameters.len(), 1);
         assert_eq!(main.body.statements.len(), 1);
     }
@@ -1933,8 +2351,8 @@ mod tests {
         };
 
         let struct_end = source.find("\nfn main").expect("main follows struct");
-        assert_eq!(structure.name, Span::new(7, 11));
-        assert_eq!(structure.span, Span::new(0, struct_end));
+        assert_eq!(structure.name, span(7, 11));
+        assert_eq!(structure.span, span(0, struct_end));
         assert_eq!(structure.members.len(), 3);
         let StructMember::Field(value) = &structure.members[0] else {
             panic!("expected value field");
@@ -1987,7 +2405,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Eof,
                 },
-                Span::new(6, 6),
+                span(6, 6),
             ),
             (
                 "struct Thing",
@@ -1995,7 +2413,7 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(12, 12),
+                span(12, 12),
             ),
             (
                 "struct Thing { field int, }",
@@ -2003,14 +2421,14 @@ mod tests {
                     expected: TokenKind::Colon,
                     found: TokenKind::Int,
                 },
-                Span::new(21, 24),
+                span(21, 24),
             ),
             (
                 "struct Thing { field: , }",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::Comma,
                 },
-                Span::new(22, 23),
+                span(22, 23),
             ),
             (
                 "struct Thing { field: int }",
@@ -2018,14 +2436,14 @@ mod tests {
                     expected: TokenKind::Comma,
                     found: TokenKind::RightBrace,
                 },
-                Span::new(26, 27),
+                span(26, 27),
             ),
             (
                 "struct Thing { const }",
                 ParseErrorKind::ExpectedStructMember {
                     found: TokenKind::Const,
                 },
-                Span::new(15, 20),
+                span(15, 20),
             ),
             (
                 "struct Thing {",
@@ -2033,7 +2451,7 @@ mod tests {
                     expected: TokenKind::RightBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(14, 14),
+                span(14, 14),
             ),
         ] {
             assert_eq!(
@@ -2133,7 +2551,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Eof,
                 },
-                Span::new(9, 9),
+                span(9, 9),
             ),
             (
                 "interface Reader",
@@ -2141,14 +2559,14 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(16, 16),
+                span(16, 16),
             ),
             (
                 "interface Reader { value: int, }",
                 ParseErrorKind::ExpectedInterfaceMember {
                     found: TokenKind::Identifier,
                 },
-                Span::new(19, 24),
+                span(19, 24),
             ),
             (
                 "interface Reader { fn (self); }",
@@ -2156,7 +2574,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::LeftParen,
                 },
-                Span::new(22, 23),
+                span(22, 23),
             ),
             (
                 "interface Reader { fn read(value); }",
@@ -2164,7 +2582,7 @@ mod tests {
                     expected: TokenKind::Colon,
                     found: TokenKind::RightParen,
                 },
-                Span::new(32, 33),
+                span(32, 33),
             ),
             (
                 "interface Reader { fn read(self) {} }",
@@ -2172,7 +2590,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::LeftBrace,
                 },
-                Span::new(33, 34),
+                span(33, 34),
             ),
             (
                 "interface Reader { fn read(self) }",
@@ -2180,7 +2598,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::RightBrace,
                 },
-                Span::new(33, 34),
+                span(33, 34),
             ),
             (
                 "interface Reader {",
@@ -2188,7 +2606,7 @@ mod tests {
                     expected: TokenKind::RightBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(18, 18),
+                span(18, 18),
             ),
         ] {
             assert_eq!(
@@ -2210,7 +2628,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Interface,
                 },
-                span: Span::new(0, 9),
+                span: span(0, 9),
             }))
         );
     }
@@ -2289,7 +2707,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Fn,
                 },
-                span: Span::new(9, 11),
+                span: span(9, 11),
             }))
         );
 
@@ -2304,16 +2722,12 @@ mod tests {
     #[test]
     fn rejects_non_declarations_at_top_level() {
         for (source, found, span) in [
-            ("const value = 1;", TokenKind::Const, Span::new(0, 5)),
-            ("defer run();", TokenKind::Defer, Span::new(0, 5)),
-            ("co run();", TokenKind::Co, Span::new(0, 2)),
-            ("run();", TokenKind::Identifier, Span::new(0, 3)),
-            ("return;", TokenKind::Return, Span::new(0, 6)),
-            (
-                "fn first() {} 42",
-                TokenKind::IntegerLiteral,
-                Span::new(14, 16),
-            ),
+            ("const value = 1;", TokenKind::Const, span(0, 5)),
+            ("defer run();", TokenKind::Defer, span(0, 5)),
+            ("co run();", TokenKind::Co, span(0, 2)),
+            ("run();", TokenKind::Identifier, span(0, 3)),
+            ("return;", TokenKind::Return, span(0, 6)),
+            ("fn first() {} 42", TokenKind::IntegerLiteral, span(14, 16)),
         ] {
             assert_eq!(
                 parse_program_source(source),
@@ -2335,7 +2749,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Queue,
                 },
-                span: Span::new(7, 12),
+                span: span(7, 12),
             }))
         );
         assert_eq!(
@@ -2345,7 +2759,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Map,
                 },
-                span: Span::new(6, 9),
+                span: span(6, 9),
             }))
         );
     }
@@ -2356,7 +2770,7 @@ mod tests {
             parse_program_source("fn main() {} @"),
             Err(FrontendError::Lexical(LexError {
                 kind: LexErrorKind::UnexpectedCharacter,
-                span: Span::new(13, 14),
+                span: span(13, 14),
             }))
         );
     }
@@ -2368,14 +2782,11 @@ mod tests {
             panic!("expected a function declaration");
         };
 
-        assert_eq!(statement.span, Span::new(0, 12));
-        assert_eq!(function.name, Span::new(3, 7));
+        assert_eq!(statement.span, span(0, 12));
+        assert_eq!(function.name, span(3, 7));
         assert!(function.parameters.is_empty());
         assert_eq!(function.return_type, None);
-        assert_eq!(
-            function.body,
-            Block::new(Vec::new(), None, Span::new(10, 12))
-        );
+        assert_eq!(function.body, Block::new(Vec::new(), None, span(10, 12)));
     }
 
     #[test]
@@ -2386,43 +2797,51 @@ mod tests {
             panic!("expected a function declaration");
         };
 
-        assert_eq!(statement.span, Span::new(0, 58));
+        assert_eq!(statement.span, span(0, 58));
         assert_eq!(function.span, statement.span);
-        assert_eq!(function.name, Span::new(3, 6));
+        assert_eq!(function.name, span(3, 6));
         assert_eq!(function.parameters.len(), 2);
-        assert_eq!(function.parameters[0].span, Span::new(7, 16));
+        assert_eq!(function.parameters[0].span, span(7, 16));
         assert_eq!(function.parameters[0].mutability, BindingMutability::Const);
+        let FunctionParameterKind::Named {
+            name,
+            type_annotation,
+        } = &function.parameters[0].kind
+        else {
+            panic!("expected a named parameter");
+        };
+        assert_eq!(*name, span(7, 11));
         assert!(matches!(
-            &function.parameters[0].kind,
-            FunctionParameterKind::Named {
-                name: Span { start: 7, end: 11 },
-                type_annotation: TypeSyntax {
-                    kind: TypeKind::Primitive(PrimitiveType::Int),
-                    span: Span { start: 13, end: 16 },
-                },
+            &type_annotation.kind,
+            TypeKind::Primitive(PrimitiveType::Int)
+        ));
+        assert_eq!(type_annotation.span, span(13, 16));
+        assert_eq!(function.parameters[1].span, span(18, 32));
+        assert_eq!(function.parameters[1].mutability, BindingMutability::Mut);
+        let return_type = function
+            .return_type
+            .as_ref()
+            .expect("return type should be explicit");
+        assert!(matches!(
+            &return_type.kind,
+            TypeKind::Primitive(PrimitiveType::Int)
+        ));
+        assert_eq!(return_type.span, span(38, 41));
+        assert_eq!(function.body.span, span(42, 58));
+        assert!(function.body.statements.is_empty());
+        let value = function
+            .body
+            .value
+            .as_deref()
+            .expect("function body should have a value");
+        assert!(matches!(
+            &value.kind,
+            ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                ..
             }
         ));
-        assert_eq!(function.parameters[1].span, Span::new(18, 32));
-        assert_eq!(function.parameters[1].mutability, BindingMutability::Mut);
-        assert!(matches!(
-            &function.return_type,
-            Some(TypeSyntax {
-                kind: TypeKind::Primitive(PrimitiveType::Int),
-                span: Span { start: 38, end: 41 },
-            })
-        ));
-        assert_eq!(function.body.span, Span::new(42, 58));
-        assert!(function.body.statements.is_empty());
-        assert!(matches!(
-            function.body.value.as_deref(),
-            Some(Expression {
-                kind: ExpressionKind::Binary {
-                    operator: BinaryOperator::Add,
-                    ..
-                },
-                span: Span { start: 44, end: 56 },
-            })
-        ));
+        assert_eq!(value.span, span(44, 56));
     }
 
     #[test]
@@ -2435,26 +2854,24 @@ mod tests {
         };
 
         assert_eq!(function.parameters.len(), 2);
-        assert_eq!(function.parameters[0].span, Span::new(10, 18));
+        assert_eq!(function.parameters[0].span, span(10, 18));
         assert_eq!(function.parameters[0].mutability, BindingMutability::Mut);
-        assert!(matches!(
-            &function.parameters[0].kind,
-            FunctionParameterKind::Receiver {
-                name: Span { start: 14, end: 18 }
-            }
-        ));
+        let FunctionParameterKind::Receiver { name } = &function.parameters[0].kind else {
+            panic!("expected a receiver parameter");
+        };
+        assert_eq!(*name, span(14, 18));
         assert_eq!(
             function
                 .return_type
                 .as_ref()
                 .expect("return type should be explicit")
                 .span,
-            Span::new(37, 39)
+            span(37, 39)
         );
         assert_eq!(function.body.statements.len(), 1);
         assert_eq!(
             function.body.statements[0],
-            Statement::new(StatementKind::Return(None), Span::new(42, 49))
+            Statement::new(StatementKind::Return(None), span(42, 49))
         );
         assert!(function.body.value.is_none());
     }
@@ -2463,16 +2880,16 @@ mod tests {
     fn parses_value_bearing_return_statements() {
         assert_eq!(
             parse_statement_source("return;"),
-            Ok(Statement::new(StatementKind::Return(None), Span::new(0, 7),))
+            Ok(Statement::new(StatementKind::Return(None), span(0, 7),))
         );
 
         let statement =
             parse_statement_source("return value + 1;").expect("value return should parse");
-        assert_eq!(statement.span, Span::new(0, 17));
+        assert_eq!(statement.span, span(0, 17));
         let StatementKind::Return(Some(value)) = statement.kind else {
             panic!("expected a value-bearing return");
         };
-        assert_eq!(value.span, Span::new(7, 16));
+        assert_eq!(value.span, span(7, 16));
         assert!(matches!(
             value.kind,
             ExpressionKind::Binary {
@@ -2491,28 +2908,24 @@ mod tests {
         };
 
         assert_eq!(block.statements.len(), 1);
-        assert_eq!(block.statements[0].span, Span::new(2, 44));
-        assert!(matches!(
-            &block.statements[0].kind,
-            StatementKind::Function(Function {
-                name: Span { start: 5, end: 11 },
-                ..
-            })
-        ));
-        assert!(matches!(
-            block.value.as_deref(),
-            Some(Expression {
-                kind: ExpressionKind::Call { .. },
-                span: Span { start: 45, end: 58 },
-            })
-        ));
+        assert_eq!(block.statements[0].span, span(2, 44));
+        let StatementKind::Function(function) = &block.statements[0].kind else {
+            panic!("expected a nested function");
+        };
+        assert_eq!(function.name, span(5, 11));
+        let value = block
+            .value
+            .as_deref()
+            .expect("block should have a final value");
+        assert!(matches!(&value.kind, ExpressionKind::Call { .. }));
+        assert_eq!(value.span, span(45, 58));
     }
 
     #[test]
     fn parses_empty_lambdas_with_default_unit_returns() {
         let expression = parse("lambda() {}").expect("lambda should parse");
 
-        assert_eq!(expression.span, Span::new(0, 11));
+        assert_eq!(expression.span, span(0, 11));
         let ExpressionKind::Lambda {
             parameters,
             return_type,
@@ -2523,7 +2936,7 @@ mod tests {
         };
         assert!(parameters.is_empty());
         assert_eq!(return_type, None);
-        assert_eq!(body, Block::new(Vec::new(), None, Span::new(9, 11)));
+        assert_eq!(body, Block::new(Vec::new(), None, span(9, 11)));
     }
 
     #[test]
@@ -2539,52 +2952,52 @@ mod tests {
             panic!("expected a lambda expression");
         };
 
-        assert_eq!(expression.span, Span::new(0, 64));
+        assert_eq!(expression.span, span(0, 64));
         assert_eq!(parameters.len(), 2);
         assert_eq!(parameters[0].mutability, BindingMutability::Const);
-        assert_eq!(parameters[0].span, Span::new(7, 17));
+        assert_eq!(parameters[0].span, span(7, 17));
+        let FunctionParameterKind::Named {
+            name,
+            type_annotation,
+        } = &parameters[0].kind
+        else {
+            panic!("expected a named parameter");
+        };
+        assert_eq!(*name, span(7, 12));
         assert!(matches!(
-            &parameters[0].kind,
-            FunctionParameterKind::Named {
-                name: Span { start: 7, end: 12 },
-                type_annotation: TypeSyntax {
-                    kind: TypeKind::Primitive(PrimitiveType::Int),
-                    span: Span { start: 14, end: 17 },
-                },
-            }
+            &type_annotation.kind,
+            TypeKind::Primitive(PrimitiveType::Int)
         ));
+        assert_eq!(type_annotation.span, span(14, 17));
         assert_eq!(parameters[1].mutability, BindingMutability::Mut);
-        assert_eq!(parameters[1].span, Span::new(19, 37));
+        assert_eq!(parameters[1].span, span(19, 37));
+        let FunctionParameterKind::Named {
+            name,
+            type_annotation,
+        } = &parameters[1].kind
+        else {
+            panic!("expected a named parameter");
+        };
+        assert_eq!(*name, span(23, 29));
+        let TypeKind::Named { name, .. } = &type_annotation.kind else {
+            panic!("expected a named parameter type");
+        };
+        assert_eq!(*name, span(31, 37));
+        assert_eq!(type_annotation.span, span(31, 37));
+        let return_type = return_type.expect("return type should be explicit");
         assert!(matches!(
-            &parameters[1].kind,
-            FunctionParameterKind::Named {
-                name: Span { start: 23, end: 29 },
-                type_annotation: TypeSyntax {
-                    kind: TypeKind::Named {
-                        name: Span { start: 31, end: 37 },
-                        ..
-                    },
-                    span: Span { start: 31, end: 37 },
-                },
-            }
+            return_type.kind,
+            TypeKind::Primitive(PrimitiveType::Int)
         ));
-        assert!(matches!(
-            return_type,
-            Some(TypeSyntax {
-                kind: TypeKind::Primitive(PrimitiveType::Int),
-                span: Span { start: 43, end: 46 },
-            })
-        ));
-        assert_eq!(body.span, Span::new(47, 64));
+        assert_eq!(return_type.span, span(43, 46));
+        assert_eq!(body.span, span(47, 64));
         assert_eq!(body.statements.len(), 1);
-        assert_eq!(body.statements[0].span, Span::new(49, 62));
-        assert!(matches!(
-            &body.statements[0].kind,
-            StatementKind::Return(Some(Expression {
-                kind: ExpressionKind::Identifier,
-                span: Span { start: 56, end: 61 },
-            }))
-        ));
+        assert_eq!(body.statements[0].span, span(49, 62));
+        let StatementKind::Return(Some(value)) = &body.statements[0].kind else {
+            panic!("expected a value-bearing return");
+        };
+        assert!(matches!(&value.kind, ExpressionKind::Identifier));
+        assert_eq!(value.span, span(56, 61));
         assert!(body.value.is_none());
     }
 
@@ -2624,7 +3037,7 @@ mod tests {
             panic!("expected a binding statement");
         };
         assert!(matches!(initializer.kind, ExpressionKind::Lambda { .. }));
-        assert_eq!(initializer.span, Span::new(18, 57));
+        assert_eq!(initializer.span, span(18, 57));
     }
 
     #[test]
@@ -2638,7 +3051,7 @@ mod tests {
             panic!("expected a call before member access");
         };
         assert!(matches!(callee.kind, ExpressionKind::Lambda { .. }));
-        assert_eq!(callee.span, Span::new(0, 35));
+        assert_eq!(callee.span, span(0, 35));
 
         let expression = parse("1 + lambda() -> int { 2 }()").expect("infix lambda should parse");
         let ExpressionKind::Binary {
@@ -2663,8 +3076,8 @@ mod tests {
             panic!("expected an expression statement");
         };
         assert!(matches!(expression.kind, ExpressionKind::Lambda { .. }));
-        assert_eq!(expression.span, Span::new(0, 11));
-        assert_eq!(statement.span, Span::new(0, 12));
+        assert_eq!(expression.span, span(0, 11));
+        assert_eq!(statement.span, span(0, 12));
 
         assert_eq!(
             parse_statement_source("lambda() {}"),
@@ -2673,7 +3086,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::Eof,
                 },
-                span: Span::new(11, 11),
+                span: span(11, 11),
             }))
         );
 
@@ -2684,7 +3097,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::Identifier,
                 },
-                span: Span::new(14, 19),
+                span: span(14, 19),
             }))
         );
     }
@@ -2698,7 +3111,7 @@ mod tests {
                     expected: TokenKind::LeftParen,
                     found: TokenKind::Eof,
                 },
-                Span::new(6, 6),
+                span(6, 6),
             ),
             (
                 "lambda(value) {}",
@@ -2706,7 +3119,7 @@ mod tests {
                     expected: TokenKind::Colon,
                     found: TokenKind::RightParen,
                 },
-                Span::new(12, 13),
+                span(12, 13),
             ),
             (
                 "lambda(: int) {}",
@@ -2714,14 +3127,14 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Colon,
                 },
-                Span::new(7, 8),
+                span(7, 8),
             ),
             (
                 "lambda(value:) {}",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::RightParen,
                 },
-                Span::new(13, 14),
+                span(13, 14),
             ),
             (
                 "lambda(value: int {}",
@@ -2729,14 +3142,14 @@ mod tests {
                     expected: TokenKind::RightParen,
                     found: TokenKind::LeftBrace,
                 },
-                Span::new(18, 19),
+                span(18, 19),
             ),
             (
                 "lambda() -> {}",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::LeftBrace,
                 },
-                Span::new(12, 13),
+                span(12, 13),
             ),
             (
                 "lambda() -> int",
@@ -2744,7 +3157,7 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(15, 15),
+                span(15, 15),
             ),
             (
                 "lambda() {",
@@ -2752,7 +3165,7 @@ mod tests {
                     expected: TokenKind::RightBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(10, 10),
+                span(10, 10),
             ),
             (
                 "lambda(self) {}",
@@ -2760,7 +3173,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::SelfValue,
                 },
-                Span::new(7, 11),
+                span(7, 11),
             ),
             (
                 "lambda(mut self) {}",
@@ -2768,7 +3181,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::SelfValue,
                 },
-                Span::new(11, 15),
+                span(11, 15),
             ),
         ] {
             assert_eq!(
@@ -2791,7 +3204,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Eof,
                 },
-                Span::new(2, 2),
+                span(2, 2),
             ),
             (
                 "fn name",
@@ -2799,7 +3212,7 @@ mod tests {
                     expected: TokenKind::LeftParen,
                     found: TokenKind::Eof,
                 },
-                Span::new(7, 7),
+                span(7, 7),
             ),
             (
                 "fn f(value) -> () {}",
@@ -2807,14 +3220,14 @@ mod tests {
                     expected: TokenKind::Colon,
                     found: TokenKind::RightParen,
                 },
-                Span::new(10, 11),
+                span(10, 11),
             ),
             (
                 "fn f(value:) -> () {}",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::RightParen,
                 },
-                Span::new(11, 12),
+                span(11, 12),
             ),
             (
                 "fn f() () {}",
@@ -2822,14 +3235,14 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::LeftParen,
                 },
-                Span::new(7, 8),
+                span(7, 8),
             ),
             (
                 "fn f() -> {}",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::LeftBrace,
                 },
-                Span::new(10, 11),
+                span(10, 11),
             ),
             (
                 "fn f() -> ()",
@@ -2837,7 +3250,7 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(12, 12),
+                span(12, 12),
             ),
         ] {
             assert_eq!(
@@ -2854,8 +3267,8 @@ mod tests {
     #[test]
     fn return_statements_require_semicolons() {
         for (source, found, span) in [
-            ("return", TokenKind::Eof, Span::new(6, 6)),
-            ("return value", TokenKind::Eof, Span::new(12, 12)),
+            ("return", TokenKind::Eof, span(6, 6)),
+            ("return value", TokenKind::Eof, span(12, 12)),
         ] {
             assert_eq!(
                 parse_statement_source(source),
@@ -2877,7 +3290,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::RightBrace,
                 },
-                span: Span::new(9, 10),
+                span: span(9, 10),
             }))
         );
     }
@@ -2889,8 +3302,8 @@ mod tests {
         let StatementKind::Defer(call) = statement.kind else {
             panic!("expected a defer statement");
         };
-        assert_eq!(statement.span, Span::new(0, 16));
-        assert_eq!(call.span, Span::new(6, 15));
+        assert_eq!(statement.span, span(0, 16));
+        assert_eq!(call.span, span(6, 15));
         assert!(matches!(
             call.kind,
             ExpressionKind::Call {
@@ -2904,8 +3317,8 @@ mod tests {
         let StatementKind::Coroutine(call) = statement.kind else {
             panic!("expected a coroutine statement");
         };
-        assert_eq!(statement.span, Span::new(0, 28));
-        assert_eq!(call.span, Span::new(3, 27));
+        assert_eq!(statement.span, span(0, 28));
+        assert_eq!(call.span, span(3, 27));
         assert!(matches!(
             call.kind,
             ExpressionKind::Call {
@@ -2961,7 +3374,7 @@ mod tests {
                 parse_statement_source(source),
                 Err(FrontendError::Syntax(ParseError {
                     kind: expected_kind,
-                    span: Span::new(operand_start, operand_end),
+                    span: span(operand_start, operand_end),
                 })),
                 "incorrect diagnostic for {source}",
             );
@@ -2971,16 +3384,8 @@ mod tests {
     #[test]
     fn call_only_statements_require_an_operand_and_semicolon() {
         for (source, expected_kind, expected_span) in [
-            (
-                "defer;",
-                ParseErrorKind::ExpectedDeferredCall,
-                Span::new(5, 6),
-            ),
-            (
-                "co;",
-                ParseErrorKind::ExpectedCoroutineCall,
-                Span::new(2, 3),
-            ),
+            ("defer;", ParseErrorKind::ExpectedDeferredCall, span(5, 6)),
+            ("co;", ParseErrorKind::ExpectedCoroutineCall, span(2, 3)),
         ] {
             assert_eq!(
                 parse_statement_source(source),
@@ -2999,7 +3404,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::Eof,
                 },
-                span: Span::new(15, 15),
+                span: span(15, 15),
             }))
         );
         assert_eq!(
@@ -3009,7 +3414,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::RightBrace,
                 },
-                span: Span::new(11, 12),
+                span: span(11, 12),
             }))
         );
     }
@@ -3037,11 +3442,11 @@ mod tests {
             Ok(Statement::new(
                 StatementKind::Binding {
                     mutability: BindingMutability::Const,
-                    name: Span::new(6, 11),
+                    name: span(6, 11),
                     type_annotation: None,
-                    initializer: integer(Span::new(14, 16)),
+                    initializer: integer(span(14, 16)),
                 },
-                Span::new(0, 17),
+                span(0, 17),
             ))
         );
     }
@@ -3061,10 +3466,10 @@ mod tests {
         };
 
         assert_eq!(mutability, BindingMutability::Mut);
-        assert_eq!(name, Span::new(4, 9));
+        assert_eq!(name, span(4, 9));
         assert_eq!(
             type_annotation,
-            TypeSyntax::new(TypeKind::Primitive(PrimitiveType::Int), Span::new(11, 14),)
+            TypeSyntax::new(TypeKind::Primitive(PrimitiveType::Int), span(11, 14),)
         );
         assert!(matches!(
             initializer.kind,
@@ -3073,8 +3478,8 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(initializer.span, Span::new(17, 22));
-        assert_eq!(statement.span, Span::new(0, 23));
+        assert_eq!(initializer.span, span(17, 22));
+        assert_eq!(statement.span, span(0, 23));
     }
 
     #[test]
@@ -3116,8 +3521,8 @@ mod tests {
                 }
             )
         ));
-        assert_eq!(expression.span, Span::new(0, 19));
-        assert_eq!(statement.span, Span::new(0, 20));
+        assert_eq!(expression.span, span(0, 19));
+        assert_eq!(statement.span, span(0, 20));
     }
 
     #[test]
@@ -3129,7 +3534,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Assign,
                 },
-                Span::new(6, 7),
+                span(6, 7),
             ),
             (
                 "const value;",
@@ -3137,21 +3542,21 @@ mod tests {
                     expected: TokenKind::Assign,
                     found: TokenKind::Semicolon,
                 },
-                Span::new(11, 12),
+                span(11, 12),
             ),
             (
                 "const value = ;",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Semicolon,
                 },
-                Span::new(14, 15),
+                span(14, 15),
             ),
             (
                 "mut value: = 1;",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::Assign,
                 },
-                Span::new(11, 12),
+                span(11, 12),
             ),
         ] {
             assert_eq!(
@@ -3189,7 +3594,7 @@ mod tests {
                 kind: ParseErrorKind::UnexpectedToken {
                     found: TokenKind::Identifier,
                 },
-                span: Span::new(7, 13),
+                span: span(7, 13),
             }))
         );
     }
@@ -3207,14 +3612,11 @@ mod tests {
         };
 
         assert!(matches!(&condition.kind, ExpressionKind::Identifier));
-        assert_eq!(condition.span, Span::new(3, 8));
-        assert_eq!(then_branch.span, Span::new(9, 14));
-        assert_eq!(
-            then_branch.value.as_deref(),
-            Some(&integer(Span::new(11, 12)))
-        );
+        assert_eq!(condition.span, span(3, 8));
+        assert_eq!(then_branch.span, span(9, 14));
+        assert_eq!(then_branch.value.as_deref(), Some(&integer(span(11, 12))));
         assert_eq!(else_branch, None);
-        assert_eq!(expression.span, Span::new(0, 14));
+        assert_eq!(expression.span, span(0, 14));
     }
 
     #[test]
@@ -3229,9 +3631,9 @@ mod tests {
             panic!("expected a conditional with a braced else branch");
         };
 
-        assert_eq!(then_branch.span, Span::new(9, 14));
-        assert_eq!(else_branch.span, Span::new(20, 25));
-        assert_eq!(expression.span, Span::new(0, 25));
+        assert_eq!(then_branch.span, span(9, 14));
+        assert_eq!(else_branch.span, span(20, 25));
+        assert_eq!(expression.span, span(0, 25));
     }
 
     #[test]
@@ -3254,10 +3656,10 @@ mod tests {
             panic!("expected a nested conditional with a final else block");
         };
 
-        assert_eq!(expression.span, Span::new(0, source.len()));
-        assert_eq!(nested.span, Span::new(20, source.len()));
-        assert_eq!(condition.span, Span::new(23, 29));
-        assert_eq!(final_branch.span, Span::new(41, 46));
+        assert_eq!(expression.span, span(0, source.len()));
+        assert_eq!(nested.span, span(20, source.len()));
+        assert_eq!(condition.span, span(23, 29));
+        assert_eq!(final_branch.span, span(41, 46));
     }
 
     #[test]
@@ -3381,7 +3783,7 @@ mod tests {
 
         assert_eq!(block.statements.len(), 1);
         assert!(block.value.is_none());
-        assert_eq!(block.statements[0].span, Span::new(2, 13));
+        assert_eq!(block.statements[0].span, span(2, 13));
     }
 
     #[test]
@@ -3392,7 +3794,7 @@ mod tests {
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Eof,
                 },
-                Span::new(2, 2),
+                span(2, 2),
             ),
             (
                 "if true",
@@ -3400,7 +3802,7 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(7, 7),
+                span(7, 7),
             ),
             (
                 "if true value",
@@ -3408,28 +3810,28 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Identifier,
                 },
-                Span::new(8, 13),
+                span(8, 13),
             ),
             (
                 "if true {} else value",
                 ParseErrorKind::ExpectedElseBranch {
                     found: TokenKind::Identifier,
                 },
-                Span::new(16, 21),
+                span(16, 21),
             ),
             (
                 "if true {} else",
                 ParseErrorKind::ExpectedElseBranch {
                     found: TokenKind::Eof,
                 },
-                Span::new(15, 15),
+                span(15, 15),
             ),
             (
                 "else {}",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Else,
                 },
-                Span::new(0, 4),
+                span(0, 4),
             ),
         ] {
             assert_eq!(
@@ -3447,7 +3849,7 @@ mod tests {
     fn parses_bare_and_value_bearing_break_statements() {
         assert_eq!(
             parse_statement_source("break;"),
-            Ok(Statement::new(StatementKind::Break(None), Span::new(0, 6),))
+            Ok(Statement::new(StatementKind::Break(None), span(0, 6),))
         );
 
         let statement =
@@ -3462,15 +3864,15 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(value.span, Span::new(6, 15));
-        assert_eq!(statement.span, Span::new(0, 16));
+        assert_eq!(value.span, span(6, 15));
+        assert_eq!(statement.span, span(0, 16));
     }
 
     #[test]
     fn parses_continue_statements() {
         assert_eq!(
             parse_statement_source("continue;"),
-            Ok(Statement::new(StatementKind::Continue, Span::new(0, 9)))
+            Ok(Statement::new(StatementKind::Continue, span(0, 9)))
         );
     }
 
@@ -3481,15 +3883,15 @@ mod tests {
             panic!("expected an infinite loop");
         };
 
-        assert_eq!(body, Block::new(Vec::new(), None, Span::new(5, 7)));
-        assert_eq!(expression.span, Span::new(0, 7));
+        assert_eq!(body, Block::new(Vec::new(), None, span(5, 7)));
+        assert_eq!(expression.span, span(0, 7));
 
         let expression = parse("loop { break 42; }").expect("loop with break should parse");
         let ExpressionKind::Loop { body } = expression.kind else {
             panic!("expected an infinite loop");
         };
         assert_eq!(body.statements.len(), 1);
-        assert_eq!(body.statements[0].span, Span::new(7, 16));
+        assert_eq!(body.statements[0].span, span(7, 16));
         assert!(matches!(
             &body.statements[0].kind,
             StatementKind::Break(Some(Expression {
@@ -3498,7 +3900,7 @@ mod tests {
             }))
         ));
         assert!(body.value.is_none());
-        assert_eq!(expression.span, Span::new(0, 18));
+        assert_eq!(expression.span, span(0, 18));
     }
 
     #[test]
@@ -3514,11 +3916,11 @@ mod tests {
         };
 
         assert!(matches!(&condition.kind, ExpressionKind::Identifier));
-        assert_eq!(condition.span, Span::new(6, 11));
-        assert_eq!(body.span, Span::new(12, 25));
+        assert_eq!(condition.span, span(6, 11));
+        assert_eq!(body.span, span(12, 25));
         assert!(matches!(&body.statements[0].kind, StatementKind::Continue));
         assert_eq!(else_branch, None);
-        assert_eq!(expression.span, Span::new(0, 25));
+        assert_eq!(expression.span, span(0, 25));
 
         let source = "while ready {} else { 2 }";
         let expression = parse(source).expect("while-else should parse");
@@ -3530,9 +3932,9 @@ mod tests {
         else {
             panic!("expected a while loop with an else block");
         };
-        assert_eq!(body.span, Span::new(12, 14));
-        assert_eq!(else_branch.span, Span::new(20, 25));
-        assert_eq!(expression.span, Span::new(0, source.len()));
+        assert_eq!(body.span, span(12, 14));
+        assert_eq!(else_branch.span, span(20, 25));
+        assert_eq!(expression.span, span(0, source.len()));
     }
 
     #[test]
@@ -3573,12 +3975,12 @@ mod tests {
             panic!("expected a range for loop");
         };
 
-        assert_eq!(expression.span, Span::new(0, 17));
-        assert_eq!(binding, Span::new(4, 5));
-        assert_eq!(start.as_ref(), &integer(Span::new(9, 10)));
-        assert_eq!(end.as_ref(), &integer(Span::new(12, 14)));
+        assert_eq!(expression.span, span(0, 17));
+        assert_eq!(binding, span(4, 5));
+        assert_eq!(start.as_ref(), &integer(span(9, 10)));
+        assert_eq!(end.as_ref(), &integer(span(12, 14)));
         assert_eq!(inclusivity, RangeInclusivity::Exclusive);
-        assert_eq!(body, Block::new(Vec::new(), None, Span::new(15, 17)));
+        assert_eq!(body, Block::new(Vec::new(), None, span(15, 17)));
         assert_eq!(else_branch, None);
     }
 
@@ -3598,18 +4000,15 @@ mod tests {
             panic!("expected a range loop with an else block");
         };
 
-        assert_eq!(expression.span, Span::new(0, 52));
-        assert_eq!(binding, Span::new(4, 9));
-        assert_eq!(start.span, Span::new(13, 18));
-        assert_eq!(end.span, Span::new(21, 26));
+        assert_eq!(expression.span, span(0, 52));
+        assert_eq!(binding, span(4, 9));
+        assert_eq!(start.span, span(13, 18));
+        assert_eq!(end.span, span(21, 26));
         assert_eq!(inclusivity, RangeInclusivity::Inclusive);
-        assert_eq!(body.span, Span::new(27, 40));
+        assert_eq!(body.span, span(27, 40));
         assert!(matches!(&body.statements[0].kind, StatementKind::Continue));
-        assert_eq!(else_branch.span, Span::new(46, 52));
-        assert_eq!(
-            else_branch.value.as_deref(),
-            Some(&integer(Span::new(48, 50)))
-        );
+        assert_eq!(else_branch.span, span(46, 52));
+        assert_eq!(else_branch.value.as_deref(), Some(&integer(span(48, 50))));
     }
 
     #[test]
@@ -3620,7 +4019,7 @@ mod tests {
             panic!("expected a range loop");
         };
 
-        assert_eq!(start.span, Span::new(9, 17));
+        assert_eq!(start.span, span(9, 17));
         assert!(matches!(
             start.kind,
             ExpressionKind::Unary {
@@ -3628,7 +4027,7 @@ mod tests {
                 operand,
             } if matches!(operand.kind, ExpressionKind::Call { .. })
         ));
-        assert_eq!(end.span, Span::new(19, 30));
+        assert_eq!(end.span, span(19, 30));
         assert!(matches!(end.kind, ExpressionKind::MemberAccess { .. }));
     }
 
@@ -3708,10 +4107,7 @@ mod tests {
                     }
                 )
         ));
-        assert_eq!(
-            loop_else.value.as_deref(),
-            Some(&integer(Span::new(50, 51)))
-        );
+        assert_eq!(loop_else.value.as_deref(), Some(&integer(span(50, 51))));
     }
 
     #[test]
@@ -3744,7 +4140,7 @@ mod tests {
             panic!("expected a call before member access");
         };
         assert!(matches!(callee.kind, ExpressionKind::RangeFor { .. }));
-        assert_eq!(callee.span, Span::new(0, 16));
+        assert_eq!(callee.span, span(0, 16));
 
         let expression =
             parse("1 + for i in 0..1 { 2 } else { 3 }").expect("infix range loop should parse");
@@ -3809,7 +4205,7 @@ mod tests {
         };
         assert_eq!(block.statements.len(), 1);
         assert!(block.value.is_none());
-        assert_eq!(block.statements[0].span, Span::new(2, 19));
+        assert_eq!(block.statements[0].span, span(2, 19));
     }
 
     #[test]
@@ -3821,7 +4217,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Eof,
                 },
-                Span::new(3, 3),
+                span(3, 3),
             ),
             (
                 "for mut i in 0..1 {}",
@@ -3829,7 +4225,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Mut,
                 },
-                Span::new(4, 7),
+                span(4, 7),
             ),
             (
                 "for const i in 0..1 {}",
@@ -3837,7 +4233,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Const,
                 },
-                Span::new(4, 9),
+                span(4, 9),
             ),
             (
                 "for in 0..1 {}",
@@ -3845,7 +4241,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::In,
                 },
-                Span::new(4, 6),
+                span(4, 6),
             ),
             (
                 "for i 0..1 {}",
@@ -3853,60 +4249,60 @@ mod tests {
                     expected: TokenKind::In,
                     found: TokenKind::IntegerLiteral,
                 },
-                Span::new(6, 7),
+                span(6, 7),
             ),
             (
                 "for i in ..1 {}",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::DotDot,
                 },
-                Span::new(9, 11),
+                span(9, 11),
             ),
             (
                 "for i in {}..1 {}",
                 ParseErrorKind::RangeBoundRequiresGrouping,
-                Span::new(9, 11),
+                span(9, 11),
             ),
             (
                 "for i in start + 1..limit {}",
                 ParseErrorKind::RangeBoundRequiresGrouping,
-                Span::new(15, 16),
+                span(15, 16),
             ),
             (
                 "for i in 0 {}",
                 ParseErrorKind::ExpectedRangeOperator {
                     found: TokenKind::LeftBrace,
                 },
-                Span::new(11, 12),
+                span(11, 12),
             ),
             (
                 "for i in 0",
                 ParseErrorKind::ExpectedRangeOperator {
                     found: TokenKind::Eof,
                 },
-                Span::new(10, 10),
+                span(10, 10),
             ),
             (
                 "for i in 0.. {}",
                 ParseErrorKind::RangeBoundRequiresGrouping,
-                Span::new(13, 15),
+                span(13, 15),
             ),
             (
                 "for i in 0..limit + 1 {}",
                 ParseErrorKind::RangeBoundRequiresGrouping,
-                Span::new(18, 19),
+                span(18, 19),
             ),
             (
                 "for i in 0..if ready { 1 } else { 2 } {} else { 3 }",
                 ParseErrorKind::RangeBoundRequiresGrouping,
-                Span::new(12, 37),
+                span(12, 37),
             ),
             (
                 "for i in 0..",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Eof,
                 },
-                Span::new(12, 12),
+                span(12, 12),
             ),
             (
                 "for i in 0..1",
@@ -3914,7 +4310,7 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(13, 13),
+                span(13, 13),
             ),
             (
                 "for i in 0..1 {} else if true {}",
@@ -3922,7 +4318,7 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::If,
                 },
-                Span::new(22, 24),
+                span(22, 24),
             ),
         ] {
             assert_eq!(
@@ -3941,7 +4337,7 @@ mod tests {
                 kind: ParseErrorKind::UnexpectedToken {
                     found: TokenKind::Identifier,
                 },
-                span: Span::new(17, 25),
+                span: span(17, 25),
             }))
         );
 
@@ -3951,7 +4347,7 @@ mod tests {
                 kind: ParseErrorKind::UnexpectedToken {
                     found: TokenKind::DotDot,
                 },
-                span: Span::new(1, 3),
+                span: span(1, 3),
             }))
         );
     }
@@ -4043,7 +4439,7 @@ mod tests {
         };
         assert_eq!(block.statements.len(), 1);
         assert!(block.value.is_none());
-        assert_eq!(block.statements[0].span, Span::new(2, 10));
+        assert_eq!(block.statements[0].span, span(2, 10));
     }
 
     #[test]
@@ -4055,14 +4451,14 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(4, 4),
+                span(4, 4),
             ),
             (
                 "while",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Eof,
                 },
-                Span::new(5, 5),
+                span(5, 5),
             ),
             (
                 "while true",
@@ -4070,7 +4466,7 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(10, 10),
+                span(10, 10),
             ),
             (
                 "while true {} else value",
@@ -4078,7 +4474,7 @@ mod tests {
                     expected: TokenKind::LeftBrace,
                     found: TokenKind::Identifier,
                 },
-                Span::new(19, 24),
+                span(19, 24),
             ),
         ] {
             assert_eq!(
@@ -4098,7 +4494,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::Eof,
                 },
-                Span::new(5, 5),
+                span(5, 5),
             ),
             (
                 "continue",
@@ -4106,7 +4502,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::Eof,
                 },
-                Span::new(8, 8),
+                span(8, 8),
             ),
             (
                 "continue value;",
@@ -4114,7 +4510,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::Identifier,
                 },
-                Span::new(9, 14),
+                span(9, 14),
             ),
         ] {
             assert_eq!(
@@ -4133,7 +4529,7 @@ mod tests {
                 kind: ParseErrorKind::UnexpectedToken {
                     found: TokenKind::Else,
                 },
-                span: Span::new(8, 12),
+                span: span(8, 12),
             }))
         );
 
@@ -4144,14 +4540,14 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::RightBrace,
                 },
-                span: Span::new(8, 9),
+                span: span(8, 9),
             }))
         );
     }
 
     #[test]
     fn parses_empty_and_value_producing_blocks() {
-        let empty_span = Span::new(0, 2);
+        let empty_span = span(0, 2);
         assert_eq!(
             parse("{}"),
             Ok(Expression::new(
@@ -4160,13 +4556,13 @@ mod tests {
             ))
         );
 
-        let value_span = Span::new(0, 6);
+        let value_span = span(0, 6);
         assert_eq!(
             parse("{ 42 }"),
             Ok(Expression::new(
                 ExpressionKind::Block(Block::new(
                     Vec::new(),
-                    Some(Box::new(integer(Span::new(2, 4)))),
+                    Some(Box::new(integer(span(2, 4)))),
                     value_span,
                 )),
                 value_span,
@@ -4184,13 +4580,10 @@ mod tests {
         assert_eq!(block.statements.len(), 1);
         assert_eq!(
             block.statements[0],
-            Statement::new(
-                StatementKind::Expression(integer(Span::new(2, 4))),
-                Span::new(2, 5),
-            )
+            Statement::new(StatementKind::Expression(integer(span(2, 4))), span(2, 5),)
         );
         assert_eq!(block.value, None);
-        assert_eq!(block.span, Span::new(0, 7));
+        assert_eq!(block.span, span(0, 7));
         assert_eq!(expression.span, block.span);
     }
 
@@ -4203,8 +4596,8 @@ mod tests {
         };
 
         assert_eq!(block.statements.len(), 2);
-        assert_eq!(block.statements[0].span, Span::new(2, 14));
-        assert_eq!(block.statements[1].span, Span::new(15, 22));
+        assert_eq!(block.statements[0].span, span(2, 14));
+        assert_eq!(block.statements[1].span, span(15, 22));
         assert!(matches!(
             &block.statements[0].kind,
             StatementKind::Binding {
@@ -4238,9 +4631,9 @@ mod tests {
                 .as_ref()
                 .expect("block should have a value")
                 .span,
-            Span::new(23, 28),
+            span(23, 28),
         );
-        assert_eq!(block.span, Span::new(0, source.len()));
+        assert_eq!(block.span, span(0, source.len()));
         assert_eq!(expression.span, block.span);
     }
 
@@ -4298,7 +4691,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::Identifier,
                 },
-                span: Span::new(8, 14),
+                span: span(8, 14),
             }))
         );
 
@@ -4308,7 +4701,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Semicolon,
                 },
-                span: Span::new(2, 3),
+                span: span(2, 3),
             }))
         );
     }
@@ -4323,7 +4716,7 @@ mod tests {
                         expected: TokenKind::RightBrace,
                         found: TokenKind::Eof,
                     },
-                    span: Span::new(source.len(), source.len()),
+                    span: span(source.len(), source.len()),
                 })),
                 "incorrect diagnostic for {source}",
             );
@@ -4338,7 +4731,7 @@ mod tests {
                 kind: ParseErrorKind::UnexpectedToken {
                     found: TokenKind::Identifier,
                 },
-                span: Span::new(3, 8),
+                span: span(3, 8),
             }))
         );
     }
@@ -4360,7 +4753,7 @@ mod tests {
             panic!("expected named struct construction");
         };
 
-        assert_eq!(expression.span, Span::new(0, source.len()));
+        assert_eq!(expression.span, span(0, source.len()));
         assert_eq!(&source[name.start..name.end], "Position");
         assert_eq!(fields.len(), 2);
         assert_eq!(&source[fields[0].name.start..fields[0].name.end], "y");
@@ -4375,7 +4768,7 @@ mod tests {
         ));
         assert_eq!(
             fields[1].span,
-            Span::new(fields[1].name.start, fields[1].value.span.end)
+            span(fields[1].name.start, fields[1].value.span.end)
         );
 
         let empty = parse("Marker {}").expect("empty construction should parse");
@@ -4455,7 +4848,7 @@ mod tests {
             panic!("expected anonymous struct");
         };
 
-        assert_eq!(expression.span, Span::new(0, source.len()));
+        assert_eq!(expression.span, span(0, source.len()));
         assert_eq!(members.len(), 3);
         let AnonymousStructMember::Field(x) = &members[0] else {
             panic!("expected x field");
@@ -4502,7 +4895,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Eof,
                 },
-                Span::new(10, 10),
+                span(10, 10),
             ),
             (
                 "Position { x }",
@@ -4510,14 +4903,14 @@ mod tests {
                     expected: TokenKind::Colon,
                     found: TokenKind::RightBrace,
                 },
-                Span::new(13, 14),
+                span(13, 14),
             ),
             (
                 "Position { x: }",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::RightBrace,
                 },
-                Span::new(14, 15),
+                span(14, 15),
             ),
             (
                 "Position { x: 1 y: 2 }",
@@ -4525,7 +4918,7 @@ mod tests {
                     expected: TokenKind::RightBrace,
                     found: TokenKind::Identifier,
                 },
-                Span::new(16, 17),
+                span(16, 17),
             ),
             (
                 "Position { x: 1,",
@@ -4533,7 +4926,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Eof,
                 },
-                Span::new(16, 16),
+                span(16, 16),
             ),
             (
                 "Position { x: 1",
@@ -4541,7 +4934,7 @@ mod tests {
                     expected: TokenKind::RightBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(15, 15),
+                span(15, 15),
             ),
         ] {
             assert_eq!(
@@ -4564,21 +4957,21 @@ mod tests {
                     expected: TokenKind::RightBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(8, 8),
+                span(8, 8),
             ),
             (
                 "struct { const value = 1; }",
                 ParseErrorKind::ExpectedAnonymousStructMember {
                     found: TokenKind::Const,
                 },
-                Span::new(9, 14),
+                span(9, 14),
             ),
             (
                 "struct { value: = 1; }",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::Assign,
                 },
-                Span::new(16, 17),
+                span(16, 17),
             ),
             (
                 "struct { value: int 1; }",
@@ -4586,14 +4979,14 @@ mod tests {
                     expected: TokenKind::Assign,
                     found: TokenKind::IntegerLiteral,
                 },
-                Span::new(20, 21),
+                span(20, 21),
             ),
             (
                 "struct { value = ; }",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Semicolon,
                 },
-                Span::new(17, 18),
+                span(17, 18),
             ),
             (
                 "struct { value = 1 }",
@@ -4601,7 +4994,7 @@ mod tests {
                     expected: TokenKind::Semicolon,
                     found: TokenKind::RightBrace,
                 },
-                Span::new(19, 20),
+                span(19, 20),
             ),
             (
                 "struct { value = 1;",
@@ -4609,7 +5002,7 @@ mod tests {
                     expected: TokenKind::RightBrace,
                     found: TokenKind::Eof,
                 },
-                Span::new(19, 19),
+                span(19, 19),
             ),
         ] {
             assert_eq!(
@@ -4644,7 +5037,7 @@ mod tests {
             assert_eq!(builtin, expected_builtin);
             assert_eq!(type_arguments.len(), type_count);
             assert_eq!(arguments.len(), argument_count);
-            assert_eq!(expression.span, Span::new(0, source.len()));
+            assert_eq!(expression.span, span(0, source.len()));
         }
     }
 
@@ -4684,7 +5077,7 @@ mod tests {
                 parse_statement_source(source),
                 Err(FrontendError::Syntax(ParseError {
                     kind: expected_kind,
-                    span: Span::new(operand_start, source.len() - 1),
+                    span: span(operand_start, source.len() - 1),
                 }))
             );
         }
@@ -4699,7 +5092,7 @@ mod tests {
                     builtin: BuiltinType::Queue,
                     found: TokenKind::LeftParen,
                 },
-                Span::new(5, 6),
+                span(5, 6),
             ),
             (
                 "Vector<int>",
@@ -4707,7 +5100,7 @@ mod tests {
                     builtin: BuiltinType::Vector,
                     found: TokenKind::Eof,
                 },
-                Span::new(11, 11),
+                span(11, 11),
             ),
             (
                 "Map<int>()",
@@ -4716,7 +5109,7 @@ mod tests {
                     expected: 2,
                     found: 1,
                 },
-                Span::new(0, 8),
+                span(0, 8),
             ),
             (
                 "Queue<int, string>()",
@@ -4725,7 +5118,7 @@ mod tests {
                     expected: 1,
                     found: 2,
                 },
-                Span::new(0, 18),
+                span(0, 18),
             ),
             (
                 "Error()",
@@ -4734,7 +5127,7 @@ mod tests {
                     expected: 1,
                     found: 0,
                 },
-                Span::new(0, 7),
+                span(0, 7),
             ),
             (
                 "Error<int>()",
@@ -4743,7 +5136,7 @@ mod tests {
                     expected: 1,
                     found: 0,
                 },
-                Span::new(0, 12),
+                span(0, 12),
             ),
             (
                 "Queue<int>(value)",
@@ -4752,7 +5145,7 @@ mod tests {
                     expected: 0,
                     found: 1,
                 },
-                Span::new(0, 17),
+                span(0, 17),
             ),
             (
                 "Error<int, string>(value)",
@@ -4761,14 +5154,14 @@ mod tests {
                     expected: 1,
                     found: 2,
                 },
-                Span::new(0, 18),
+                span(0, 18),
             ),
             (
                 "Error<>(value)",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::Greater,
                 },
-                Span::new(6, 7),
+                span(6, 7),
             ),
             (
                 "Error value",
@@ -4776,7 +5169,7 @@ mod tests {
                     builtin: BuiltinType::Error,
                     found: TokenKind::Identifier,
                 },
-                Span::new(6, 11),
+                span(6, 11),
             ),
         ] {
             assert_eq!(
@@ -4806,8 +5199,8 @@ mod tests {
             let value_start = source.find("value").expect("source contains value");
 
             assert_eq!(target, expected_target);
-            assert_eq!(expression.span, Span::new(0, source.len()));
-            assert_eq!(value.span, Span::new(value_start, value_start + 5));
+            assert_eq!(expression.span, span(0, source.len()));
+            assert_eq!(value.span, span(value_start, value_start + 5));
             assert!(matches!(value.kind, ExpressionKind::Identifier));
         }
     }
@@ -4892,14 +5285,14 @@ mod tests {
                     expected: TokenKind::LeftParen,
                     found: TokenKind::Eof,
                 },
-                Span::new(3, 3),
+                span(3, 3),
             ),
             (
                 "float()",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::RightParen,
                 },
-                Span::new(6, 7),
+                span(6, 7),
             ),
             (
                 "bool(first, second)",
@@ -4907,7 +5300,7 @@ mod tests {
                     expected: TokenKind::RightParen,
                     found: TokenKind::Comma,
                 },
-                Span::new(10, 11),
+                span(10, 11),
             ),
             (
                 "char(value,)",
@@ -4915,7 +5308,7 @@ mod tests {
                     expected: TokenKind::RightParen,
                     found: TokenKind::Comma,
                 },
-                Span::new(10, 11),
+                span(10, 11),
             ),
             (
                 "string(value",
@@ -4923,14 +5316,14 @@ mod tests {
                     expected: TokenKind::RightParen,
                     found: TokenKind::Eof,
                 },
-                Span::new(12, 12),
+                span(12, 12),
             ),
             (
                 "bytes(value)",
                 ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Bytes,
                 },
-                Span::new(0, 5),
+                span(0, 5),
             ),
         ] {
             assert_eq!(
@@ -4952,15 +5345,15 @@ mod tests {
         assert_eq!(
             parse("1 + 2 * 3"),
             Ok(binary(
-                integer(Span::new(0, 1)),
+                integer(span(0, 1)),
                 BinaryOperator::Add,
                 binary(
-                    integer(Span::new(4, 5)),
+                    integer(span(4, 5)),
                     BinaryOperator::Multiply,
-                    integer(Span::new(8, 9)),
-                    Span::new(4, 9),
+                    integer(span(8, 9)),
+                    span(4, 9),
                 ),
-                Span::new(0, 9),
+                span(0, 9),
             ))
         );
     }
@@ -4971,14 +5364,14 @@ mod tests {
             parse("8 - 3 - 1"),
             Ok(binary(
                 binary(
-                    integer(Span::new(0, 1)),
+                    integer(span(0, 1)),
                     BinaryOperator::Subtract,
-                    integer(Span::new(4, 5)),
-                    Span::new(0, 5),
+                    integer(span(4, 5)),
+                    span(0, 5),
                 ),
                 BinaryOperator::Subtract,
-                integer(Span::new(8, 9)),
-                Span::new(0, 9),
+                integer(span(8, 9)),
+                span(0, 9),
             ))
         );
     }
@@ -4992,8 +5385,8 @@ mod tests {
 
         assert_eq!(operator, BinaryOperator::Multiply);
         assert!(matches!(left.kind, ExpressionKind::Group(_)));
-        assert_eq!(left.span, Span::new(0, 7));
-        assert_eq!(expression.span, Span::new(0, 11));
+        assert_eq!(left.span, span(0, 7));
+        assert_eq!(expression.span, span(0, 11));
     }
 
     #[test]
@@ -5020,7 +5413,7 @@ mod tests {
             panic!("expected a call expression");
         };
         assert!(arguments.is_empty());
-        assert_eq!(expression.span, Span::new(0, 5));
+        assert_eq!(expression.span, span(0, 5));
 
         let expression =
             parse("run(first, second + third,)").expect("call with a trailing comma should parse");
@@ -5043,7 +5436,7 @@ mod tests {
         let ExpressionKind::MemberAccess { object, member } = expression.kind else {
             panic!("expected member access at the root");
         };
-        assert_eq!(member, Span::new(13, 19));
+        assert_eq!(member, span(13, 19));
 
         let ExpressionKind::Index { index, .. } = object.kind else {
             panic!("expected indexing before member access");
@@ -5072,7 +5465,7 @@ mod tests {
             assert_eq!(start.is_some(), has_start);
             assert_eq!(end.is_some(), has_end);
             assert!(matches!(object.kind, ExpressionKind::Identifier));
-            assert_eq!(expression.span, Span::new(0, source.len()));
+            assert_eq!(expression.span, span(0, source.len()));
         }
     }
 
@@ -5200,7 +5593,7 @@ mod tests {
                     expected: TokenKind::Identifier,
                     found: TokenKind::Eof,
                 },
-                span: Span::new(6, 6),
+                span: span(6, 6),
             }))
         );
 
@@ -5210,7 +5603,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedExpression {
                     found: TokenKind::RightBracket,
                 },
-                span: Span::new(6, 7),
+                span: span(6, 7),
             }))
         );
 
@@ -5222,7 +5615,7 @@ mod tests {
                 parse(source),
                 Err(FrontendError::Syntax(ParseError {
                     kind: ParseErrorKind::InclusiveSliceNotSupported,
-                    span: Span::new(delimiter, delimiter + 3),
+                    span: span(delimiter, delimiter + 3),
                 }))
             );
         }
@@ -5235,7 +5628,7 @@ mod tests {
                         expected: TokenKind::RightBracket,
                         found: TokenKind::Eof,
                     },
-                    span: Span::new(source.len(), source.len()),
+                    span: span(source.len(), source.len()),
                 }))
             );
         }
@@ -5249,7 +5642,7 @@ mod tests {
                     expected: TokenKind::RightBracket,
                     found: TokenKind::DotDot,
                 },
-                span: Span::new(delimiter, delimiter + 2),
+                span: span(delimiter, delimiter + 2),
             }))
         );
     }
@@ -5274,15 +5667,15 @@ mod tests {
     fn parses_type_test_expressions() {
         let expression = parse("value is int").expect("type test should parse");
 
-        assert_eq!(expression.span, Span::new(0, 12));
+        assert_eq!(expression.span, span(0, 12));
         let ExpressionKind::TypeTest { value, type_syntax } = expression.kind else {
             panic!("expected a type test");
         };
-        assert_eq!(value.span, Span::new(0, 5));
+        assert_eq!(value.span, span(0, 5));
         assert!(matches!(value.kind, ExpressionKind::Identifier));
         assert_eq!(
             type_syntax,
-            TypeSyntax::new(TypeKind::Primitive(PrimitiveType::Int), Span::new(9, 12),)
+            TypeSyntax::new(TypeKind::Primitive(PrimitiveType::Int), span(9, 12),)
         );
 
         let expression =
@@ -5290,7 +5683,7 @@ mod tests {
         let ExpressionKind::TypeTest { type_syntax, .. } = expression.kind else {
             panic!("expected a type test");
         };
-        assert_eq!(type_syntax.span, Span::new(10, 30));
+        assert_eq!(type_syntax.span, span(10, 30));
         assert!(matches!(type_syntax.kind, TypeKind::Union { .. }));
     }
 
@@ -5320,14 +5713,14 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(type_syntax.span, Span::new(13, 16));
+        assert_eq!(type_syntax.span, span(13, 16));
 
         let expression = parse("service.read() is bytes").expect("postfix operand should parse");
         let ExpressionKind::TypeTest { value, .. } = expression.kind else {
             panic!("expected a type test");
         };
         assert!(matches!(value.kind, ExpressionKind::Call { .. }));
-        assert_eq!(value.span, Span::new(0, 14));
+        assert_eq!(value.span, span(0, 14));
     }
 
     #[test]
@@ -5337,7 +5730,7 @@ mod tests {
             panic!("expected a conditional");
         };
         assert!(matches!(condition.kind, ExpressionKind::TypeTest { .. }));
-        assert_eq!(condition.span, Span::new(3, 15));
+        assert_eq!(condition.span, span(3, 15));
     }
 
     #[test]
@@ -5348,28 +5741,28 @@ mod tests {
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::Eof,
                 },
-                Span::new(8, 8),
+                span(8, 8),
             ),
             (
                 "value is + 1",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::Plus,
                 },
-                Span::new(9, 10),
+                span(9, 10),
             ),
             (
                 "value is int |",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::Eof,
                 },
-                Span::new(14, 14),
+                span(14, 14),
             ),
             (
                 "value is int trailing",
                 ParseErrorKind::UnexpectedToken {
                     found: TokenKind::Identifier,
                 },
-                Span::new(13, 21),
+                span(13, 21),
             ),
         ] {
             assert_eq!(
@@ -5502,7 +5895,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedExpression {
                     found: TokenKind::Eof,
                 },
-                span: Span::new(3, 3),
+                span: span(3, 3),
             }))
         );
 
@@ -5513,7 +5906,7 @@ mod tests {
                     expected: TokenKind::RightParen,
                     found: TokenKind::Eof,
                 },
-                span: Span::new(6, 6),
+                span: span(6, 6),
             }))
         );
     }
@@ -5526,7 +5919,7 @@ mod tests {
                 kind: ParseErrorKind::UnexpectedToken {
                     found: TokenKind::IntegerLiteral,
                 },
-                span: Span::new(2, 3),
+                span: span(2, 3),
             }))
         );
     }
@@ -5537,7 +5930,7 @@ mod tests {
             parse("\"bad\\q\""),
             Err(FrontendError::Lexical(LexError {
                 kind: LexErrorKind::InvalidEscape,
-                span: Span::new(4, 6),
+                span: span(4, 6),
             }))
         );
     }
@@ -5555,10 +5948,10 @@ mod tests {
             parse_type_source("User"),
             Ok(TypeSyntax::new(
                 TypeKind::Named {
-                    name: Span::new(0, 4),
+                    name: span(0, 4),
                     arguments: Vec::new(),
                 },
-                Span::new(0, 4),
+                span(0, 4),
             ))
         );
     }
@@ -5569,7 +5962,7 @@ mod tests {
             parse_type_source("()"),
             Ok(TypeSyntax::new(
                 TypeKind::Primitive(PrimitiveType::Unit),
-                Span::new(0, 2),
+                span(0, 2),
             ))
         );
 
@@ -5578,7 +5971,7 @@ mod tests {
             panic!("expected a grouped type");
         };
         assert!(matches!(inner.kind, TypeKind::Union { .. }));
-        assert_eq!(type_syntax.span, Span::new(0, 12));
+        assert_eq!(type_syntax.span, span(0, 12));
     }
 
     #[test]
@@ -5622,7 +6015,7 @@ mod tests {
                     builtin: BuiltinType::Queue,
                     found: TokenKind::Eof,
                 },
-                Span::new(5, 5),
+                span(5, 5),
             ),
             (
                 "Vector<int, string>",
@@ -5631,7 +6024,7 @@ mod tests {
                     expected: 1,
                     found: 2,
                 },
-                Span::new(0, 19),
+                span(0, 19),
             ),
             (
                 "Map<int>",
@@ -5640,7 +6033,7 @@ mod tests {
                     expected: 2,
                     found: 1,
                 },
-                Span::new(0, 8),
+                span(0, 8),
             ),
             (
                 "Error<int, string>",
@@ -5649,7 +6042,7 @@ mod tests {
                     expected: 1,
                     found: 2,
                 },
-                Span::new(0, 18),
+                span(0, 18),
             ),
         ] {
             assert_eq!(
@@ -5736,7 +6129,7 @@ mod tests {
                 kind: ParseErrorKind::ExpectedType {
                     found: TokenKind::Eof,
                 },
-                span: Span::new(5, 5),
+                span: span(5, 5),
             }))
         );
 
@@ -5747,8 +6140,100 @@ mod tests {
                     expected: TokenKind::Greater,
                     found: TokenKind::Eof,
                 },
-                span: Span::new(9, 9),
+                span: span(9, 9),
             }))
         );
+    }
+
+    #[test]
+    fn assigns_unique_module_qualified_ids_to_every_parsed_ast_node() {
+        let mut registry = SourceModuleRegistry::new();
+        let module = registry.add(concat!(
+            "struct Item { value: int, }\n",
+            "interface Reader { fn read(self, fallback: Item) -> Item; }\n",
+            "fn main(item: Item) -> Item {\n",
+            "    const wrapped = struct { value: Item = item; };\n",
+            "    Item { value: wrapped.value }\n",
+            "}",
+        ));
+        let mut context = ParseContext::new(module.module_id());
+        let program = parse_program(&mut context, Lexer::new(&module))
+            .expect("representative program should parse");
+        let debug = format!("{program:?}");
+
+        assert!(!debug.contains(&format!("node_id: {}", u32::MAX)));
+        for node_id in 0..context.next_node_id {
+            assert!(
+                debug.contains(&format!(
+                    "NodeId {{ module_id: {:?}, node_id: {node_id} }}",
+                    module.module_id()
+                )),
+                "missing allocated node ID {node_id} from parsed AST",
+            );
+        }
+    }
+
+    #[test]
+    fn equal_numeric_node_ids_in_different_modules_are_distinct() {
+        let mut registry = SourceModuleRegistry::new();
+        let first = registry.add("value");
+        let second = registry.add("value");
+        let mut first_context = ParseContext::new(first.module_id());
+        let mut second_context = ParseContext::new(second.module_id());
+
+        let first_expression = parse_expression(&mut first_context, Lexer::new(&first))
+            .expect("first expression should parse");
+        let second_expression = parse_expression(&mut second_context, Lexer::new(&second))
+            .expect("second expression should parse");
+
+        assert_eq!(first_expression.id.node_id, second_expression.id.node_id);
+        assert_ne!(first_expression.id, second_expression.id);
+    }
+
+    #[test]
+    fn reusing_a_parse_context_keeps_fragment_node_ids_unique() {
+        let module = SourceModuleRegistry::new().add("value");
+        let mut context = ParseContext::new(module.module_id());
+
+        let first = parse_expression(&mut context, Lexer::new(&module))
+            .expect("first fragment should parse");
+        let second = parse_expression(&mut context, Lexer::new(&module))
+            .expect("second fragment should parse");
+
+        assert_eq!(first.id.node_id, 0);
+        assert_eq!(second.id.node_id, 1);
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn rejects_tokens_from_a_different_module() {
+        let mut registry = SourceModuleRegistry::new();
+        let token_module = registry.add("value");
+        let context_module = registry.add("value");
+        let mut context = ParseContext::new(context_module.module_id());
+
+        assert_eq!(
+            parse_expression(&mut context, Lexer::new(&token_module)),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::TokenModuleMismatch {
+                    expected: context_module.module_id(),
+                    found: token_module.module_id(),
+                },
+                span: Span::new      (token_module.module_id(), 0, 5),
+            }))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "node ID space exhausted")]
+    fn node_id_overflow_panics_clearly() {
+        let module = SourceModuleRegistry::new().add("value");
+        let mut context = ParseContext {
+            module_id: module.module_id(),
+            next_node_id: u32::MAX,
+            leave_ids_unassigned: false,
+        };
+
+        let _ = parse_expression(&mut context, Lexer::new(&module));
     }
 }

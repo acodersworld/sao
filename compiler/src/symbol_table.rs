@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt};
 
-use crate::lexer::Span;
+use crate::source::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolId(usize);
@@ -291,6 +291,7 @@ impl SymbolTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::ModuleId;
 
     fn expect_declared(result: Result<SymbolId, DeclareError>) -> SymbolId {
         match result {
@@ -310,7 +311,7 @@ mod tests {
     fn looks_up_a_value_in_the_root_scope() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let declaration = Span::new(0, 4);
+        let declaration = Span::new(ModuleId::PRELUDE, 0, 4);
 
         let main =
             expect_declared(symbols.declare(root, "main", SymbolKind::Function, declaration));
@@ -354,8 +355,12 @@ mod tests {
     fn looks_up_a_value_from_a_parent_scope() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let outer =
-            expect_declared(symbols.declare(root, "outer", SymbolKind::Binding, Span::new(0, 5)));
+        let outer = expect_declared(symbols.declare(
+            root,
+            "outer",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 0, 5),
+        ));
         let child = symbols
             .new_child_scope(root)
             .expect("root scope should exist");
@@ -367,8 +372,12 @@ mod tests {
     fn an_inner_declaration_shadows_its_parent() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let outer =
-            expect_declared(symbols.declare(root, "value", SymbolKind::Binding, Span::new(0, 5)));
+        let outer = expect_declared(symbols.declare(
+            root,
+            "value",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 0, 5),
+        ));
         let child = symbols
             .new_child_scope(root)
             .expect("root scope should exist");
@@ -376,7 +385,7 @@ mod tests {
             child,
             "value",
             SymbolKind::Binding,
-            Span::new(10, 15),
+            Span::new(ModuleId::PRELUDE, 10, 15),
         ));
 
         assert_ne!(inner, outer);
@@ -388,13 +397,21 @@ mod tests {
     fn a_function_in_a_child_scope_shadows_a_parent_function() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let outer =
-            expect_declared(symbols.declare(root, "run", SymbolKind::Function, Span::new(0, 3)));
+        let outer = expect_declared(symbols.declare(
+            root,
+            "run",
+            SymbolKind::Function,
+            Span::new(ModuleId::PRELUDE, 0, 3),
+        ));
         let child = symbols
             .new_child_scope(root)
             .expect("root scope should exist");
-        let inner =
-            expect_declared(symbols.declare(child, "run", SymbolKind::Function, Span::new(10, 13)));
+        let inner = expect_declared(symbols.declare(
+            child,
+            "run",
+            SymbolKind::Function,
+            Span::new(ModuleId::PRELUDE, 10, 13),
+        ));
 
         assert_ne!(inner, outer);
         assert_eq!(expect_found(symbols.lookup_value(child, "run")), inner);
@@ -405,17 +422,26 @@ mod tests {
     fn rejects_duplicate_functions_in_the_same_scope() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let original =
-            expect_declared(symbols.declare(root, "run", SymbolKind::Function, Span::new(0, 3)));
+        let original = expect_declared(symbols.declare(
+            root,
+            "run",
+            SymbolKind::Function,
+            Span::new(ModuleId::PRELUDE, 0, 3),
+        ));
 
-        let duplicate = symbols.declare(root, "run", SymbolKind::Function, Span::new(10, 13));
+        let duplicate = symbols.declare(
+            root,
+            "run",
+            SymbolKind::Function,
+            Span::new(ModuleId::PRELUDE, 10, 13),
+        );
 
         assert_eq!(
             duplicate,
             Err(DeclareError::DuplicateDeclaration {
                 name: "run".to_string(),
-                original: Span::new(0, 3),
-                duplicate: Span::new(10, 13),
+                original: Span::new(ModuleId::PRELUDE, 0, 3),
+                duplicate: Span::new(ModuleId::PRELUDE, 10, 13),
             })
         );
         assert_eq!(expect_found(symbols.lookup_value(root, "run")), original);
@@ -426,10 +452,19 @@ mod tests {
     fn rejects_a_binding_that_conflicts_with_a_same_scope_function() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let function =
-            expect_declared(symbols.declare(root, "run", SymbolKind::Function, Span::new(0, 3)));
+        let function = expect_declared(symbols.declare(
+            root,
+            "run",
+            SymbolKind::Function,
+            Span::new(ModuleId::PRELUDE, 0, 3),
+        ));
 
-        let binding = symbols.declare(root, "run", SymbolKind::Binding, Span::new(10, 13));
+        let binding = symbols.declare(
+            root,
+            "run",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 10, 13),
+        );
 
         assert!(matches!(
             binding,
@@ -443,10 +478,19 @@ mod tests {
     fn rejects_a_function_that_conflicts_with_a_same_scope_binding() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let binding =
-            expect_declared(symbols.declare(root, "run", SymbolKind::Binding, Span::new(0, 3)));
+        let binding = expect_declared(symbols.declare(
+            root,
+            "run",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 0, 3),
+        ));
 
-        let function = symbols.declare(root, "run", SymbolKind::Function, Span::new(10, 13));
+        let function = symbols.declare(
+            root,
+            "run",
+            SymbolKind::Function,
+            Span::new(ModuleId::PRELUDE, 10, 13),
+        );
 
         assert!(matches!(
             function,
@@ -460,13 +504,21 @@ mod tests {
     fn a_later_binding_shadows_an_earlier_binding_in_the_same_scope() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let earlier =
-            expect_declared(symbols.declare(root, "value", SymbolKind::Binding, Span::new(0, 5)));
+        let earlier = expect_declared(symbols.declare(
+            root,
+            "value",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 0, 5),
+        ));
 
         assert_eq!(expect_found(symbols.lookup_value(root, "value")), earlier);
 
-        let later =
-            expect_declared(symbols.declare(root, "value", SymbolKind::Binding, Span::new(10, 15)));
+        let later = expect_declared(symbols.declare(
+            root,
+            "value",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 10, 15),
+        ));
 
         assert_ne!(later, earlier);
         assert_eq!(expect_found(symbols.lookup_value(root, "value")), later);
@@ -477,13 +529,21 @@ mod tests {
     fn a_binding_shadows_a_parameter_in_the_same_scope() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let parameter =
-            expect_declared(symbols.declare(root, "value", SymbolKind::Parameter, Span::new(0, 5)));
+        let parameter = expect_declared(symbols.declare(
+            root,
+            "value",
+            SymbolKind::Parameter,
+            Span::new(ModuleId::PRELUDE, 0, 5),
+        ));
 
         assert_eq!(expect_found(symbols.lookup_value(root, "value")), parameter);
 
-        let binding =
-            expect_declared(symbols.declare(root, "value", SymbolKind::Binding, Span::new(10, 15)));
+        let binding = expect_declared(symbols.declare(
+            root,
+            "value",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 10, 15),
+        ));
 
         assert_ne!(binding, parameter);
         assert_eq!(expect_found(symbols.lookup_value(root, "value")), binding);
@@ -494,10 +554,19 @@ mod tests {
     fn rejects_duplicate_parameters_in_the_same_scope() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let original =
-            expect_declared(symbols.declare(root, "value", SymbolKind::Parameter, Span::new(0, 5)));
+        let original = expect_declared(symbols.declare(
+            root,
+            "value",
+            SymbolKind::Parameter,
+            Span::new(ModuleId::PRELUDE, 0, 5),
+        ));
 
-        let duplicate = symbols.declare(root, "value", SymbolKind::Parameter, Span::new(10, 15));
+        let duplicate = symbols.declare(
+            root,
+            "value",
+            SymbolKind::Parameter,
+            Span::new(ModuleId::PRELUDE, 10, 15),
+        );
 
         assert!(matches!(
             duplicate,
@@ -511,10 +580,18 @@ mod tests {
     fn permits_the_same_name_in_value_and_type_namespaces() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
-        let value =
-            expect_declared(symbols.declare(root, "item", SymbolKind::Binding, Span::new(0, 4)));
-        let ty =
-            expect_declared(symbols.declare(root, "item", SymbolKind::Struct, Span::new(10, 14)));
+        let value = expect_declared(symbols.declare(
+            root,
+            "item",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 0, 4),
+        ));
+        let ty = expect_declared(symbols.declare(
+            root,
+            "item",
+            SymbolKind::Struct,
+            Span::new(ModuleId::PRELUDE, 10, 14),
+        ));
 
         assert_eq!(expect_found(symbols.lookup_value(root, "item")), value);
         assert_eq!(expect_found(symbols.lookup_type(root, "item")), ty);

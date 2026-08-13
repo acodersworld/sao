@@ -8,7 +8,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-08-12
+Last reviewed: 2026-08-13
 
 ## Lexer status
 
@@ -57,6 +57,13 @@ Every parser entry point intentionally fails on the first lexical or syntax
 error. Whole-program parsing does not produce a partial AST or collect multiple
 diagnostics.
 
+Source files are registered as immutable, shared source modules. Module zero is
+reserved for compiler-provided prelude definitions, ordinary module allocation
+begins at one, and registration does not choose a compilation entry module.
+Lexer spans and all AST node identities are module-qualified. Parser entry
+points allocate node IDs through a caller-owned per-module parse context and
+reject token streams belonging to another module.
+
 Range bounds use a deliberately restricted grammar. An unparenthesized bound may
 be a primary expression, a postfix chain, or unary negation. Infix, assignment,
 lambda, struct construction, and block-like bounds must be parenthesized. For
@@ -89,8 +96,9 @@ Name and scope resolution is implemented. The resolver:
   resolving their uses, allowing documented forward references and recursion.
 - Resolves ordinary bindings only after their initializer, preserving
   sequential same-block shadowing semantics.
-- Records every lexical value and named-type reference against its resolved
-  symbol identity while leaving member names and `self` for later passes.
+- Records every lexical value and named-type reference by module-qualified AST
+  node identity against its resolved symbol identity, while leaving member
+  names and `self` for later passes.
 - Diagnoses unknown names, invalid duplicate declarations, and missing or
   non-unique top-level `main` functions.
 

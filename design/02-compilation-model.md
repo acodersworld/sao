@@ -49,6 +49,31 @@ selects an unoptimized build with debug information.
 
 The SAO compiler is implemented in Rust.
 
+## Source-module identity
+
+One source file is one SAO module. During a compilation session, the source
+registry assigns each source module a monotonically increasing `ModuleId` and
+shares its immutable text through `Arc<str>`. Module ID zero is reserved for
+compiler-provided prelude definitions; ordinary source modules begin at one.
+These IDs are session-local identities, not stable cross-build keys.
+
+AST identities and source locations are qualified by their module:
+
+```rust
+NodeId { module_id, node_id }
+Span { module_id, start, end }
+```
+
+The node portion is allocated sequentially within one module. Consequently,
+the same numeric node ID in two modules denotes two different AST nodes, while
+a span can always be routed back to the source module whose byte offsets it
+uses.
+
+Source registration does not select a root or entry module. A runnable build's
+future compilation/module-graph state records exactly one `entry_module_id`;
+registration order has no entry-point meaning. There is therefore no reserved
+root module ID.
+
 Every runnable program declares exactly one top-level entry function with this
 signature:
 

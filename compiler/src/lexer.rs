@@ -3,29 +3,9 @@ use std::iter::FusedIterator;
 
 use logos::{Lexer as LogosLexer, Logos, SpannedIter};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
+use crate::source::{ModuleId, SourceModule};
 
-impl Span {
-    #[must_use]
-    pub const fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
-    }
-
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.start == self.end
-    }
-}
-
-impl From<logos::Span> for Span {
-    fn from(span: logos::Span) -> Self {
-        Self::new(span.start, span.end)
-    }
-}
+pub use crate::source::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LexErrorKind {
@@ -61,7 +41,13 @@ impl fmt::Display for LexErrorKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RawLexError {
     kind: LexErrorKind,
-    relative_span: Option<Span>,
+    relative_span: Option<RelativeSpan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelativeSpan {
+    start: usize,
+    end: usize,
 }
 
 impl RawLexError {
@@ -75,7 +61,7 @@ impl RawLexError {
     const fn at(kind: LexErrorKind, start: usize, end: usize) -> Self {
         Self {
             kind,
-            relative_span: Some(Span::new(start, end)),
+            relative_span: Some(RelativeSpan { start, end }),
         }
     }
 }
@@ -306,8 +292,10 @@ impl Token {
     }
 
     #[must_use]
-    pub fn text(self, source: &str) -> &str {
-        &source[self.span.start..self.span.end]
+    pub fn text(self, module: &SourceModule) -> &str {
+        module
+            .text(self.span)
+            .expect("token span must belong to its source module")
     }
 }
 
@@ -319,7 +307,7 @@ pub struct LexError {
 
 pub type LexResult = Result<Vec<Token>, Vec<LexError>>;
 
-/// A lazy token iterator over one SAO source string.
+/// A lazy token iterator over one registered SAO source module.
 ///
 /// The iterator always yields one explicit `Eof` token before it is exhausted.
 /// Malformed source produces an error item, after which iteration continues at
@@ -327,15 +315,17 @@ pub type LexResult = Result<Vec<Token>, Vec<LexError>>;
 #[must_use = "a lexer does nothing unless it is iterated"]
 pub struct Lexer<'source> {
     inner: SpannedIter<'source, RawTokenKind>,
+    module_id: ModuleId,
     source_len: usize,
     emitted_eof: bool,
 }
 
 impl<'source> Lexer<'source> {
-    pub fn new(source: &'source str) -> Self {
+    pub fn new(module: &'source SourceModule) -> Self {
         Self {
-            inner: RawTokenKind::lexer(source).spanned(),
-            source_len: source.len(),
+            inner: RawTokenKind::lexer(module.source()).spanned(),
+            module_id: module.module_id(),
+            source_len: module.source().len(),
             emitted_eof: false,
         }
     }
@@ -346,13 +336,14 @@ impl Iterator for Lexer<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some((result, logos_span)) = self.inner.next() {
-            let token_span = Span::from(logos_span);
+            let token_span = Span::new(self.module_id, logos_span.start, logos_span.end);
 
             return Some(match result {
                 Ok(kind) => Ok(Token::new(kind.into(), token_span)),
                 Err(error) => {
                     let error_span = error.relative_span.map_or(token_span, |relative| {
                         Span::new(
+                            self.module_id,
                             token_span.start + relative.start,
                             token_span.start + relative.end,
                         )
@@ -373,23 +364,23 @@ impl Iterator for Lexer<'_> {
         self.emitted_eof = true;
         Some(Ok(Token::new(
             TokenKind::Eof,
-            Span::new(self.source_len, self.source_len),
+            Span::new(self.module_id, self.source_len, self.source_len),
         )))
     }
 }
 
 impl FusedIterator for Lexer<'_> {}
 
-/// Lexes an entire source string.
+/// Lexes an entire source module.
 ///
 /// Returns the complete token stream when the source is lexically valid. If
 /// any malformed regions are found, returns every lexical error instead. Use
 /// [`Lexer`] directly to handle tokens and errors incrementally.
-pub fn lex(source: &str) -> LexResult {
+pub fn lex(module: &SourceModule) -> LexResult {
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
 
-    for result in Lexer::new(source) {
+    for result in Lexer::new(module) {
         match result {
             Ok(token) => tokens.push(token),
             Err(error) => errors.push(error),
@@ -591,9 +582,22 @@ const fn hex_value(byte: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::SourceModuleRegistry;
+
+    fn module(source: &str) -> SourceModule {
+        SourceModuleRegistry::new().add(source)
+    }
+
+    const fn span(start: usize, end: usize) -> Span {
+        Span::new(ModuleId::TEST_SOURCE, start, end)
+    }
+
+    fn lex_source(source: &str) -> LexResult {
+        lex(&module(source))
+    }
 
     fn kinds(source: &str) -> Vec<TokenKind> {
-        lex(source)
+        lex_source(source)
             .expect("source should lex successfully")
             .into_iter()
             .map(|token| token.kind)
@@ -601,10 +605,11 @@ mod tests {
     }
 
     fn streamed(source: &str) -> (Vec<Token>, Vec<LexError>) {
+        let module = module(source);
         let mut tokens = Vec::new();
         let mut errors = Vec::new();
 
-        for result in Lexer::new(source) {
+        for result in Lexer::new(&module) {
             match result {
                 Ok(token) => tokens.push(token),
                 Err(error) => errors.push(error),
@@ -616,20 +621,20 @@ mod tests {
 
     #[test]
     fn streams_tokens_lazily_and_emits_eof_once() {
-        let source = "const value";
-        let mut lexer = Lexer::new(source);
+        let module = module("const value");
+        let mut lexer = Lexer::new(&module);
 
         assert_eq!(
             lexer.next(),
-            Some(Ok(Token::new(TokenKind::Const, Span::new(0, 5))))
+            Some(Ok(Token::new(TokenKind::Const, span(0, 5))))
         );
         assert_eq!(
             lexer.next(),
-            Some(Ok(Token::new(TokenKind::Identifier, Span::new(6, 11))))
+            Some(Ok(Token::new(TokenKind::Identifier, span(6, 11))))
         );
         assert_eq!(
             lexer.next(),
-            Some(Ok(Token::new(TokenKind::Eof, Span::new(11, 11))))
+            Some(Ok(Token::new(TokenKind::Eof, span(11, 11))))
         );
         assert_eq!(lexer.next(), None);
         assert_eq!(lexer.next(), None);
@@ -637,14 +642,14 @@ mod tests {
 
     #[test]
     fn streaming_error_is_returned_as_err() {
-        let source = "\"bad\\q\"";
-        let mut lexer = Lexer::new(source);
+        let module = module("\"bad\\q\"");
+        let mut lexer = Lexer::new(&module);
 
         assert_eq!(
             lexer.next(),
             Some(Err(LexError {
                 kind: LexErrorKind::InvalidEscape,
-                span: Span::new(4, 6),
+                span: span(4, 6),
             }))
         );
     }
@@ -809,7 +814,8 @@ mod tests {
     #[test]
     fn preserves_literal_text_and_accepts_ascii_escapes() {
         let source = "\"hello\\n\\x00\" '\\x7f' '\\''";
-        let tokens = lex(source).expect("valid literals should lex successfully");
+        let module = module(source);
+        let tokens = lex(&module).expect("valid literals should lex successfully");
 
         assert_eq!(
             tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
@@ -820,9 +826,9 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
-        assert_eq!(tokens[0].text(source), "\"hello\\n\\x00\"");
-        assert_eq!(tokens[1].text(source), "'\\x7f'");
-        assert_eq!(tokens[2].text(source), "'\\''");
+        assert_eq!(tokens[0].text(&module), "\"hello\\n\\x00\"");
+        assert_eq!(tokens[1].text(&module), "'\\x7f'");
+        assert_eq!(tokens[2].text(&module), "'\\''");
     }
 
     #[test]
@@ -832,7 +838,7 @@ mod tests {
             "// Unicode is permitted in comments: \u{03c0}\r\n",
             "= 1;",
         );
-        let tokens = lex(source).expect("comments should be skipped successfully");
+        let tokens = lex_source(source).expect("comments should be skipped successfully");
 
         assert_eq!(
             tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
@@ -858,7 +864,7 @@ mod tests {
         );
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, LexErrorKind::UnterminatedBlockComment);
-        assert_eq!(lex(source), Err(errors));
+        assert_eq!(lex_source(source), Err(errors));
     }
 
     #[test]
@@ -874,10 +880,10 @@ mod tests {
             errors,
             vec![LexError {
                 kind: LexErrorKind::InvalidEscape,
-                span: Span::new(4, 6),
+                span: span(4, 6),
             }]
         );
-        assert_eq!(lex(source), Err(errors));
+        assert_eq!(lex_source(source), Err(errors));
     }
 
     #[test]
@@ -890,12 +896,10 @@ mod tests {
             vec![TokenKind::Eof]
         );
         assert_eq!(errors.len(), 2);
-        assert!(
-            errors
-                .iter()
-                .all(|error| error.kind == LexErrorKind::NonAsciiLiteral)
-        );
-        assert_eq!(lex(source), Err(errors));
+        assert!(errors
+            .iter()
+            .all(|error| error.kind == LexErrorKind::NonAsciiLiteral));
+        assert_eq!(lex_source(source), Err(errors));
     }
 
     #[test]
@@ -909,7 +913,7 @@ mod tests {
         );
         assert_eq!(errors[0].kind, LexErrorKind::EmptyCharacterLiteral);
         assert_eq!(errors[1].kind, LexErrorKind::MultipleCharacterLiteral);
-        assert_eq!(lex(source), Err(errors));
+        assert_eq!(lex_source(source), Err(errors));
     }
 
     #[test]
@@ -922,7 +926,7 @@ mod tests {
             vec![TokenKind::Const, TokenKind::Eof]
         );
         assert_eq!(errors[0].kind, LexErrorKind::UnterminatedStringLiteral);
-        assert_eq!(lex(source), Err(errors));
+        assert_eq!(lex_source(source), Err(errors));
     }
 
     #[test]
@@ -935,25 +939,23 @@ mod tests {
             vec![TokenKind::Eof]
         );
         assert_eq!(errors.len(), 2);
-        assert!(
-            errors
-                .iter()
-                .all(|error| error.kind == LexErrorKind::UnexpectedCharacter)
-        );
-        assert_eq!(lex(source), Err(errors));
+        assert!(errors
+            .iter()
+            .all(|error| error.kind == LexErrorKind::UnexpectedCharacter));
+        assert_eq!(lex_source(source), Err(errors));
     }
 
     #[test]
     fn returns_byte_spans_and_an_explicit_eof_token() {
         let source = "const value = 10;";
-        let tokens = lex(source).expect("valid source should lex successfully");
+        let tokens = lex_source(source).expect("valid source should lex successfully");
 
-        assert_eq!(tokens[0].span, Span::new(0, 5));
-        assert_eq!(tokens[1].span, Span::new(6, 11));
-        assert_eq!(tokens[2].span, Span::new(12, 13));
-        assert_eq!(tokens[3].span, Span::new(14, 16));
-        assert_eq!(tokens[4].span, Span::new(16, 17));
-        assert_eq!(tokens[5].span, Span::new(17, 17));
+        assert_eq!(tokens[0].span, span(0, 5));
+        assert_eq!(tokens[1].span, span(6, 11));
+        assert_eq!(tokens[2].span, span(12, 13));
+        assert_eq!(tokens[3].span, span(14, 16));
+        assert_eq!(tokens[4].span, span(16, 17));
+        assert_eq!(tokens[5].span, span(17, 17));
         assert!(tokens[5].span.is_empty());
     }
 }

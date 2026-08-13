@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-12
+Last reviewed: 2026-08-13
 
 ## Current phase
 
@@ -34,6 +34,9 @@ Recommended implementation order:
      non-unique top-level `main` entry point. Permit sequential local bindings
      to shadow earlier bindings in the same block after their initializer has
      been resolved.
+   - Module-qualify AST node identities and source spans before later semantic
+     passes add more node-indexed results. Source registration remains separate
+     from future entry-module selection.
 2. Context validation (next)
    - Validate `self`, `return`, `break`, `continue`, `defer`, and `co` against
      their documented enclosing function, method, loop, and executable-block
