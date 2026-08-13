@@ -27,14 +27,14 @@ the rule rather than collected into one miscellaneous final pass.
 
 Recommended implementation order:
 
-1. Name and scope resolution
+1. Name and scope resolution (implemented)
    - Introduce semantic symbol identities and nested value/type scopes.
    - Collect top-level and nested named declarations, resolve every name, and
      diagnose unknown names, invalid duplicate declarations, and a missing or
      non-unique top-level `main` entry point. Permit sequential local bindings
      to shadow earlier bindings in the same block after their initializer has
      been resolved.
-2. Context validation
+2. Context validation (next)
    - Validate `self`, `return`, `break`, `continue`, `defer`, and `co` against
      their documented enclosing function, method, loop, and executable-block
      contexts.

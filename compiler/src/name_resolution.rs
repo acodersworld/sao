@@ -1,0 +1,825 @@
+use std::{collections::HashMap, fmt};
+
+use crate::{
+    ast::{
+        AnonymousStructMember, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
+        Function, FunctionParameter, FunctionParameterKind, InterfaceMethodRequirement, Program,
+        Statement, StatementKind, StructMember, TypeKind, TypeSyntax,
+    },
+    lexer::Span,
+    symbol_table::{
+        DeclareError, Namespace, ScopeCreationError, ScopeId, SymbolId, SymbolKind,
+        SymbolLookupError, SymbolTable,
+    },
+};
+
+const BUILTIN_VALUES: &[&str] = &["ascii", "panic", "print", "println", "yield"];
+
+#[derive(Debug)]
+pub struct NameResolution {
+    symbols: SymbolTable,
+    program_scope: ScopeId,
+    declarations: HashMap<Span, SymbolId>,
+    references: HashMap<Span, SymbolId>,
+}
+
+impl NameResolution {
+    #[must_use]
+    pub const fn program_scope(&self) -> ScopeId {
+        self.program_scope
+    }
+
+    #[must_use]
+    pub const fn symbols(&self) -> &SymbolTable {
+        &self.symbols
+    }
+
+    #[must_use]
+    pub fn symbol_for_declaration(&self, span: Span) -> Option<SymbolId> {
+        self.declarations.get(&span).copied()
+    }
+
+    #[must_use]
+    pub fn symbol_for_reference(&self, span: Span) -> Option<SymbolId> {
+        self.references.get(&span).copied()
+    }
+
+    #[must_use]
+    pub const fn declarations(&self) -> &HashMap<Span, SymbolId> {
+        &self.declarations
+    }
+
+    #[must_use]
+    pub const fn references(&self) -> &HashMap<Span, SymbolId> {
+        &self.references
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameResolutionError {
+    pub kind: NameResolutionErrorKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameResolutionErrorKind {
+    UnknownName { namespace: Namespace, name: String },
+    DuplicateDeclaration { name: String, other: Span },
+    MissingMain,
+}
+
+impl fmt::Display for NameResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            NameResolutionErrorKind::UnknownName { namespace, name } => write!(
+                formatter,
+                "unknown {namespace:?} name `{name}` at {}..{}",
+                self.span.start, self.span.end
+            ),
+            NameResolutionErrorKind::DuplicateDeclaration { name, other } => write!(
+                formatter,
+                "duplicate declaration of `{name}` at {}..{}; conflicting declaration at {}..{}",
+                self.span.start, self.span.end, other.start, other.end
+            ),
+            NameResolutionErrorKind::MissingMain => {
+                formatter.write_str("program does not declare a top-level `main` function")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NameResolutionError {}
+
+pub type NameResolutionResult = Result<NameResolution, Vec<NameResolutionError>>;
+
+/// Resolves every lexical value and type name in one parsed source program.
+///
+/// Member names and `self` are deliberately excluded: their validity depends
+/// on contextual or type information. Named-function capture restrictions are
+/// likewise checked by the later capture-analysis pass after ordinary lexical
+/// resolution has identified the nearest declaration.
+pub fn resolve_program(source: &str, program: &Program) -> NameResolutionResult {
+    Resolver::new(source).resolve(program)
+}
+
+struct Resolver<'source> {
+    source: &'source str,
+    symbols: SymbolTable,
+    program_scope: ScopeId,
+    declarations: HashMap<Span, SymbolId>,
+    references: HashMap<Span, SymbolId>,
+    errors: Vec<NameResolutionError>,
+    top_level_main_count: usize,
+}
+
+impl<'source> Resolver<'source> {
+    fn new(source: &'source str) -> Self {
+        let mut symbols = SymbolTable::new();
+        let prelude_scope = symbols.root_scope();
+
+        for name in BUILTIN_VALUES {
+            symbols
+                .declare(
+                    prelude_scope,
+                    name,
+                    SymbolKind::BuiltinValue,
+                    Span::new(0, 0),
+                )
+                .expect("built-in names are unique and the prelude scope exists");
+        }
+
+        let program_scope = symbols
+            .new_child_scope(prelude_scope)
+            .expect("the prelude scope exists");
+
+        Self {
+            source,
+            symbols,
+            program_scope,
+            declarations: HashMap::new(),
+            references: HashMap::new(),
+            errors: Vec::new(),
+            top_level_main_count: 0,
+        }
+    }
+
+    fn resolve(mut self, program: &Program) -> NameResolutionResult {
+        self.collect_top_level_declarations(program);
+
+        if self.top_level_main_count == 0 {
+            self.errors.push(NameResolutionError {
+                kind: NameResolutionErrorKind::MissingMain,
+                span: Span::new(program.span.end, program.span.end),
+            });
+        }
+
+        for declaration in &program.declarations {
+            self.resolve_declaration(declaration);
+        }
+
+        if self.errors.is_empty() {
+            Ok(NameResolution {
+                symbols: self.symbols,
+                program_scope: self.program_scope,
+                declarations: self.declarations,
+                references: self.references,
+            })
+        } else {
+            Err(self.errors)
+        }
+    }
+
+    fn collect_top_level_declarations(&mut self, program: &Program) {
+        for declaration in &program.declarations {
+            match declaration {
+                Declaration::Function(function) => {
+                    if self.text(function.name) == "main" {
+                        self.top_level_main_count += 1;
+                    }
+                    self.declare(self.program_scope, function.name, SymbolKind::Function);
+                }
+                Declaration::Struct(structure) => {
+                    self.declare(self.program_scope, structure.name, SymbolKind::Struct);
+                }
+                Declaration::Interface(interface) => {
+                    self.declare(self.program_scope, interface.name, SymbolKind::Interface);
+                }
+            }
+        }
+    }
+
+    fn resolve_declaration(&mut self, declaration: &Declaration) {
+        match declaration {
+            Declaration::Function(function) => {
+                self.resolve_function(function, self.program_scope);
+            }
+            Declaration::Struct(structure) => {
+                for member in &structure.members {
+                    match member {
+                        StructMember::Field(field) => {
+                            self.resolve_type(self.program_scope, &field.type_annotation);
+                        }
+                        StructMember::Method(method) => {
+                            self.resolve_function(method, self.program_scope);
+                        }
+                    }
+                }
+            }
+            Declaration::Interface(interface) => {
+                for requirement in &interface.requirements {
+                    self.resolve_interface_requirement(requirement, self.program_scope);
+                }
+            }
+        }
+    }
+
+    fn resolve_interface_requirement(
+        &mut self,
+        requirement: &InterfaceMethodRequirement,
+        enclosing_scope: ScopeId,
+    ) {
+        self.resolve_parameter_types(enclosing_scope, &requirement.parameters);
+        if let Some(return_type) = &requirement.return_type {
+            self.resolve_type(enclosing_scope, return_type);
+        }
+
+        let parameter_scope = self.new_child_scope(enclosing_scope);
+        self.declare_parameters(parameter_scope, &requirement.parameters);
+    }
+
+    fn resolve_function(&mut self, function: &Function, enclosing_scope: ScopeId) {
+        self.resolve_parameter_types(enclosing_scope, &function.parameters);
+        if let Some(return_type) = &function.return_type {
+            self.resolve_type(enclosing_scope, return_type);
+        }
+
+        let body_scope = self.new_child_scope(enclosing_scope);
+        self.declare_parameters(body_scope, &function.parameters);
+        self.resolve_block_contents(body_scope, &function.body);
+    }
+
+    fn resolve_parameter_types(&mut self, scope: ScopeId, parameters: &[FunctionParameter]) {
+        for parameter in parameters {
+            if let FunctionParameterKind::Named {
+                type_annotation, ..
+            } = &parameter.kind
+            {
+                self.resolve_type(scope, type_annotation);
+            }
+        }
+    }
+
+    fn declare_parameters(&mut self, scope: ScopeId, parameters: &[FunctionParameter]) {
+        for parameter in parameters {
+            if let FunctionParameterKind::Named { name, .. } = &parameter.kind {
+                self.declare(scope, *name, SymbolKind::Parameter);
+            }
+        }
+    }
+
+    fn resolve_block(&mut self, enclosing_scope: ScopeId, block: &Block) {
+        let scope = self.new_child_scope(enclosing_scope);
+        self.resolve_block_contents(scope, block);
+    }
+
+    fn resolve_block_contents(&mut self, scope: ScopeId, block: &Block) {
+        for statement in &block.statements {
+            if let StatementKind::Function(function) = &statement.kind {
+                self.declare(scope, function.name, SymbolKind::Function);
+            }
+        }
+
+        for statement in &block.statements {
+            self.resolve_statement(scope, statement);
+        }
+
+        if let Some(value) = &block.value {
+            self.resolve_expression(scope, value);
+        }
+    }
+
+    fn resolve_statement(&mut self, scope: ScopeId, statement: &Statement) {
+        match &statement.kind {
+            StatementKind::Binding {
+                name,
+                type_annotation,
+                initializer,
+                ..
+            } => {
+                if let Some(type_annotation) = type_annotation {
+                    self.resolve_type(scope, type_annotation);
+                }
+                self.resolve_expression(scope, initializer);
+                self.declare(scope, *name, SymbolKind::Binding);
+            }
+            StatementKind::Expression(expression)
+            | StatementKind::Defer(expression)
+            | StatementKind::Coroutine(expression) => {
+                self.resolve_expression(scope, expression);
+            }
+            StatementKind::Function(function) => self.resolve_function(function, scope),
+            StatementKind::Break(value) | StatementKind::Return(value) => {
+                if let Some(value) = value {
+                    self.resolve_expression(scope, value);
+                }
+            }
+            StatementKind::Continue => {}
+        }
+    }
+
+    fn resolve_expression(&mut self, scope: ScopeId, expression: &Expression) {
+        match &expression.kind {
+            ExpressionKind::Identifier => self.resolve_value_name(scope, expression.span),
+            ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {}
+            ExpressionKind::Group(inner) => self.resolve_expression(scope, inner),
+            ExpressionKind::Block(block) => self.resolve_block(scope, block),
+            ExpressionKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.resolve_expression(scope, condition);
+                self.resolve_block(scope, then_branch);
+                if let Some(else_branch) = else_branch {
+                    match else_branch {
+                        ConditionalElse::Block(block) => self.resolve_block(scope, block),
+                        ConditionalElse::If(expression) => {
+                            self.resolve_expression(scope, expression);
+                        }
+                    }
+                }
+            }
+            ExpressionKind::Loop { body } => self.resolve_block(scope, body),
+            ExpressionKind::While {
+                condition,
+                body,
+                else_branch,
+            } => {
+                self.resolve_expression(scope, condition);
+                self.resolve_block(scope, body);
+                if let Some(else_branch) = else_branch {
+                    self.resolve_block(scope, else_branch);
+                }
+            }
+            ExpressionKind::RangeFor {
+                binding,
+                start,
+                end,
+                body,
+                else_branch,
+                ..
+            } => {
+                self.resolve_expression(scope, start);
+                self.resolve_expression(scope, end);
+
+                let body_scope = self.new_child_scope(scope);
+                self.declare(body_scope, *binding, SymbolKind::RangeBinding);
+                self.resolve_block_contents(body_scope, body);
+
+                if let Some(else_branch) = else_branch {
+                    self.resolve_block(scope, else_branch);
+                }
+            }
+            ExpressionKind::Lambda {
+                parameters,
+                return_type,
+                body,
+            } => {
+                self.resolve_parameter_types(scope, parameters);
+                if let Some(return_type) = return_type {
+                    self.resolve_type(scope, return_type);
+                }
+
+                let body_scope = self.new_child_scope(scope);
+                self.declare_parameters(body_scope, parameters);
+                self.resolve_block_contents(body_scope, body);
+            }
+            ExpressionKind::PrimitiveConversion { value, .. } => {
+                self.resolve_expression(scope, value);
+            }
+            ExpressionKind::BuiltinConstruction {
+                type_arguments,
+                arguments,
+                ..
+            } => {
+                for argument in type_arguments {
+                    self.resolve_type(scope, argument);
+                }
+                for argument in arguments {
+                    self.resolve_expression(scope, argument);
+                }
+            }
+            ExpressionKind::StructConstruction { name, fields } => {
+                self.resolve_type_name(scope, *name);
+                for field in fields {
+                    self.resolve_expression(scope, &field.value);
+                }
+            }
+            ExpressionKind::AnonymousStruct { members } => {
+                for member in members {
+                    match member {
+                        AnonymousStructMember::Field(field) => {
+                            if let Some(type_annotation) = &field.type_annotation {
+                                self.resolve_type(scope, type_annotation);
+                            }
+                            self.resolve_expression(scope, &field.initializer);
+                        }
+                        AnonymousStructMember::Method(method) => {
+                            self.resolve_function(method, scope);
+                        }
+                    }
+                }
+            }
+            ExpressionKind::Call { callee, arguments } => {
+                self.resolve_expression(scope, callee);
+                for argument in arguments {
+                    self.resolve_expression(scope, argument);
+                }
+            }
+            ExpressionKind::MemberAccess { object, .. } => {
+                self.resolve_expression(scope, object);
+            }
+            ExpressionKind::Index { object, index } => {
+                self.resolve_expression(scope, object);
+                self.resolve_expression(scope, index);
+            }
+            ExpressionKind::Slice { object, start, end } => {
+                self.resolve_expression(scope, object);
+                if let Some(start) = start {
+                    self.resolve_expression(scope, start);
+                }
+                if let Some(end) = end {
+                    self.resolve_expression(scope, end);
+                }
+            }
+            ExpressionKind::Try { expression } => self.resolve_expression(scope, expression),
+            ExpressionKind::TypeTest { value, type_syntax } => {
+                self.resolve_expression(scope, value);
+                self.resolve_type(scope, type_syntax);
+            }
+            ExpressionKind::Unary { operand, .. } => self.resolve_expression(scope, operand),
+            ExpressionKind::Binary { left, right, .. } => {
+                self.resolve_expression(scope, left);
+                self.resolve_expression(scope, right);
+            }
+            ExpressionKind::Assignment { target, value, .. } => {
+                self.resolve_expression(scope, target);
+                self.resolve_expression(scope, value);
+            }
+        }
+    }
+
+    fn resolve_type(&mut self, scope: ScopeId, type_syntax: &TypeSyntax) {
+        match &type_syntax.kind {
+            TypeKind::Primitive(_) => {}
+            TypeKind::Builtin { arguments, .. } | TypeKind::Named { arguments, .. } => {
+                if let TypeKind::Named { name, .. } = &type_syntax.kind {
+                    self.resolve_type_name(scope, *name);
+                }
+                for argument in arguments {
+                    self.resolve_type(scope, argument);
+                }
+            }
+            TypeKind::Mutable(inner) | TypeKind::Group(inner) => self.resolve_type(scope, inner),
+            TypeKind::Callable {
+                parameters,
+                return_type,
+            } => {
+                for parameter in parameters {
+                    self.resolve_type(scope, parameter);
+                }
+                self.resolve_type(scope, return_type);
+            }
+            TypeKind::Intersection { members } | TypeKind::Union { members } => {
+                for member in members {
+                    self.resolve_type(scope, member);
+                }
+            }
+        }
+    }
+
+    fn declare(&mut self, scope: ScopeId, span: Span, kind: SymbolKind) -> Option<SymbolId> {
+        let name = self.text(span);
+        match self.symbols.declare(scope, name, kind, span) {
+            Ok(symbol) => {
+                self.declarations.insert(span, symbol);
+                Some(symbol)
+            }
+            Err(DeclareError::DuplicateDeclaration {
+                name,
+                original,
+                duplicate,
+            }) => {
+                self.errors.push(NameResolutionError {
+                    kind: NameResolutionErrorKind::DuplicateDeclaration {
+                        name,
+                        other: original,
+                    },
+                    span: duplicate,
+                });
+                None
+            }
+            Err(DeclareError::ScopeNotFound { scope }) => {
+                panic!("resolver attempted to declare in missing scope {scope:?}")
+            }
+        }
+    }
+
+    fn resolve_value_name(&mut self, scope: ScopeId, span: Span) {
+        let name = self.text(span);
+        match self.symbols.lookup_value(scope, name) {
+            Ok(symbol) => {
+                self.references.insert(span, symbol);
+            }
+            Err(SymbolLookupError::SymbolNotFound { namespace, name }) => {
+                self.errors.push(NameResolutionError {
+                    kind: NameResolutionErrorKind::UnknownName { namespace, name },
+                    span,
+                });
+            }
+            Err(SymbolLookupError::ScopeNotFound { scope }) => {
+                panic!("resolver attempted to look up a value in missing scope {scope:?}")
+            }
+        }
+    }
+
+    fn resolve_type_name(&mut self, scope: ScopeId, span: Span) {
+        let name = self.text(span);
+        match self.symbols.lookup_type(scope, name) {
+            Ok(symbol) => {
+                self.references.insert(span, symbol);
+            }
+            Err(SymbolLookupError::SymbolNotFound { namespace, name }) => {
+                self.errors.push(NameResolutionError {
+                    kind: NameResolutionErrorKind::UnknownName { namespace, name },
+                    span,
+                });
+            }
+            Err(SymbolLookupError::ScopeNotFound { scope }) => {
+                panic!("resolver attempted to look up a type in missing scope {scope:?}")
+            }
+        }
+    }
+
+    fn new_child_scope(&mut self, parent: ScopeId) -> ScopeId {
+        match self.symbols.new_child_scope(parent) {
+            Ok(scope) => scope,
+            Err(ScopeCreationError::ParentNotFound { parent }) => {
+                panic!("resolver attempted to create a child of missing scope {parent:?}")
+            }
+        }
+    }
+
+    fn text(&self, span: Span) -> &'source str {
+        self.source
+            .get(span.start..span.end)
+            .expect("AST name span must point into its source")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{lexer::Lexer, parser::parse_program};
+
+    fn parse(source: &str) -> Program {
+        parse_program(Lexer::new(source)).expect("test program should parse")
+    }
+
+    fn resolve(source: &str) -> NameResolution {
+        resolve_program(source, &parse(source)).expect("test program should resolve")
+    }
+
+    fn nth_span(source: &str, text: &str, occurrence: usize) -> Span {
+        let start = source
+            .match_indices(text)
+            .nth(occurrence)
+            .map(|(start, _)| start)
+            .expect("requested source occurrence should exist");
+        Span::new(start, start + text.len())
+    }
+
+    #[test]
+    fn resolves_forward_top_level_value_and_type_references() {
+        let source = concat!(
+            "struct Uses { value: Later, }\n",
+            "struct Later {}\n",
+            "fn main() { helper(); Later {} }\n",
+            "fn helper() {}",
+        );
+        let resolution = resolve(source);
+
+        let later_reference = nth_span(source, "Later", 0);
+        let later_declaration = nth_span(source, "Later", 1);
+        let construction_reference = nth_span(source, "Later", 2);
+        let helper_reference = nth_span(source, "helper", 0);
+        let helper_declaration = nth_span(source, "helper", 1);
+
+        let later = resolution
+            .symbol_for_declaration(later_declaration)
+            .expect("Later should be declared");
+        assert_eq!(
+            resolution.symbol_for_reference(later_reference),
+            Some(later)
+        );
+        assert_eq!(
+            resolution.symbol_for_reference(construction_reference),
+            Some(later)
+        );
+
+        let helper = resolution
+            .symbol_for_declaration(helper_declaration)
+            .expect("helper should be declared");
+        assert_eq!(
+            resolution.symbol_for_reference(helper_reference),
+            Some(helper)
+        );
+    }
+
+    #[test]
+    fn resolves_nested_functions_before_their_block_statements() {
+        let source = "fn main() { call(); fn call() {} }";
+        let resolution = resolve(source);
+        let reference = nth_span(source, "call", 0);
+        let declaration = nth_span(source, "call", 1);
+
+        assert_eq!(
+            resolution.symbol_for_reference(reference),
+            resolution.symbol_for_declaration(declaration)
+        );
+    }
+
+    #[test]
+    fn resolves_enclosing_locals_for_later_named_function_capture_validation() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const outer = 1;\n",
+            "    fn inner() { outer; }\n",
+            "}",
+        );
+        let resolution = resolve(source);
+        let declaration = nth_span(source, "outer", 0);
+        let reference = nth_span(source, "outer", 1);
+
+        assert_eq!(
+            resolution.symbol_for_reference(reference),
+            resolution.symbol_for_declaration(declaration)
+        );
+    }
+
+    #[test]
+    fn a_binding_initializer_sees_the_binding_being_shadowed() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const value = 1;\n",
+            "    const value = value;\n",
+            "    value\n",
+            "}",
+        );
+        let resolution = resolve(source);
+        let first_declaration = nth_span(source, "value", 0);
+        let second_declaration = nth_span(source, "value", 1);
+        let initializer_reference = nth_span(source, "value", 2);
+        let final_reference = nth_span(source, "value", 3);
+
+        let first = resolution
+            .symbol_for_declaration(first_declaration)
+            .expect("first binding should be declared");
+        let second = resolution
+            .symbol_for_declaration(second_declaration)
+            .expect("second binding should be declared");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            resolution.symbol_for_reference(initializer_reference),
+            Some(first)
+        );
+        assert_eq!(
+            resolution.symbol_for_reference(final_reference),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn resolves_range_bounds_before_introducing_the_induction_binding() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const index = 1;\n",
+            "    for index in index..10 { index; }\n",
+            "}",
+        );
+        let resolution = resolve(source);
+        let outer_declaration = nth_span(source, "index", 0);
+        let range_declaration = nth_span(source, "index", 1);
+        let bound_reference = nth_span(source, "index", 2);
+        let body_reference = nth_span(source, "index", 3);
+
+        let outer = resolution
+            .symbol_for_declaration(outer_declaration)
+            .expect("outer binding should be declared");
+        let range = resolution
+            .symbol_for_declaration(range_declaration)
+            .expect("range binding should be declared");
+
+        assert_eq!(
+            resolution.symbol_for_reference(bound_reference),
+            Some(outer)
+        );
+        assert_eq!(resolution.symbol_for_reference(body_reference), Some(range));
+    }
+
+    #[test]
+    fn resolves_builtin_values_through_the_prelude_scope() {
+        let source = "fn main() { print(\"hello\"); yield(); }";
+        let resolution = resolve(source);
+
+        for name in ["print", "yield"] {
+            let reference = nth_span(source, name, 0);
+            let symbol = resolution
+                .symbol_for_reference(reference)
+                .expect("built-in should resolve");
+            assert_eq!(
+                resolution
+                    .symbols()
+                    .symbol(symbol)
+                    .expect("built-in symbol should exist")
+                    .kind,
+                SymbolKind::BuiltinValue
+            );
+        }
+    }
+
+    #[test]
+    fn program_declarations_can_shadow_prelude_values() {
+        let source = "fn print() {} fn main() { print(); }";
+        let resolution = resolve(source);
+        let declaration = nth_span(source, "print", 0);
+        let reference = nth_span(source, "print", 1);
+
+        let symbol = resolution
+            .symbol_for_declaration(declaration)
+            .expect("print should be declared");
+        assert_eq!(resolution.symbol_for_reference(reference), Some(symbol));
+        assert_eq!(
+            resolution
+                .symbols()
+                .symbol(symbol)
+                .expect("declared symbol should exist")
+                .kind,
+            SymbolKind::Function
+        );
+    }
+
+    #[test]
+    fn reports_unknown_value_and_type_names() {
+        let source = "fn main(value: MissingType) { missing_value; }";
+        let errors = resolve_program(source, &parse(source)).expect_err("names are unknown");
+
+        assert_eq!(
+            errors,
+            vec![
+                NameResolutionError {
+                    kind: NameResolutionErrorKind::UnknownName {
+                        namespace: Namespace::Type,
+                        name: "MissingType".to_string(),
+                    },
+                    span: nth_span(source, "MissingType", 0),
+                },
+                NameResolutionError {
+                    kind: NameResolutionErrorKind::UnknownName {
+                        namespace: Namespace::Value,
+                        name: "missing_value".to_string(),
+                    },
+                    span: nth_span(source, "missing_value", 0),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn bindings_do_not_escape_their_lexical_block() {
+        let source = concat!(
+            "fn main() {\n",
+            "    if true { const hidden = 1; }\n",
+            "    hidden;\n",
+            "}",
+        );
+        let errors = resolve_program(source, &parse(source)).expect_err("hidden is out of scope");
+
+        assert!(errors.iter().any(|error| {
+            error
+                == &NameResolutionError {
+                    kind: NameResolutionErrorKind::UnknownName {
+                        namespace: Namespace::Value,
+                        name: "hidden".to_string(),
+                    },
+                    span: nth_span(source, "hidden", 1),
+                }
+        }));
+    }
+
+    #[test]
+    fn reports_a_missing_top_level_main() {
+        let source = "fn helper() {}";
+        let program = parse(source);
+        let errors = resolve_program(source, &program).expect_err("main is missing");
+
+        assert!(errors.iter().any(|error| {
+            error.kind == NameResolutionErrorKind::MissingMain
+                && error.span == Span::new(source.len(), source.len())
+        }));
+    }
+
+    #[test]
+    fn reports_duplicate_top_level_main_functions() {
+        let source = "fn main() {} fn main() {}";
+        let errors = resolve_program(source, &parse(source)).expect_err("main is not unique");
+
+        assert!(errors.iter().any(|error| {
+            matches!(
+                &error.kind,
+                NameResolutionErrorKind::DuplicateDeclaration { name, .. } if name == "main"
+            ) && error.span == nth_span(source, "main", 1)
+        }));
+    }
+}

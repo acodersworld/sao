@@ -83,6 +83,7 @@ impl std::error::Error for SymbolLookupError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
+    BuiltinValue,
     Function,
     Binding,
     Parameter,
@@ -200,7 +201,10 @@ impl SymbolTable {
             SymbolKind::Parameter => {
                 if let Some(id) = scope.values.get(name) {
                     let dup = self.symbols.get(&id).unwrap();
-                    if matches!(dup.kind, SymbolKind::Parameter | SymbolKind::Function) {
+                    if matches!(
+                        dup.kind,
+                        SymbolKind::Parameter | SymbolKind::Function | SymbolKind::BuiltinValue
+                    ) {
                         return Err(DeclareError::DuplicateDeclaration {
                             name: name.to_string(),
                             original: dup.span,
@@ -210,7 +214,7 @@ impl SymbolTable {
                 }
                 &mut scope.values
             }
-            SymbolKind::Function => {
+            SymbolKind::BuiltinValue | SymbolKind::Function => {
                 if let Some(existing) = scope.values.get(name) {
                     let original = self
                         .symbols
@@ -227,7 +231,7 @@ impl SymbolTable {
             SymbolKind::Binding | SymbolKind::RangeBinding => {
                 if let Some(id) = scope.values.get(name) {
                     let dup = self.symbols.get(&id).unwrap();
-                    if matches!(dup.kind, SymbolKind::Function) {
+                    if matches!(dup.kind, SymbolKind::Function | SymbolKind::BuiltinValue) {
                         return Err(DeclareError::DuplicateDeclaration {
                             name: name.to_string(),
                             original: dup.span,

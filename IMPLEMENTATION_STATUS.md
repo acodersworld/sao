@@ -77,6 +77,30 @@ an annotation, parameter, or return type may later convert its hidden concrete
 type to a satisfied interface during semantic analysis. `Writer { ... }` is not
 an interface implementation expression.
 
+## Semantic analysis status
+
+Name and scope resolution is implemented. The resolver:
+
+- Assigns stable symbol identities to top-level declarations, nested named
+  functions, parameters, local bindings, and range induction bindings.
+- Maintains separate nested value and type namespaces, with compiler-known
+  values supplied through a shadowable prelude scope.
+- Collects top-level declarations and immediate nested functions before
+  resolving their uses, allowing documented forward references and recursion.
+- Resolves ordinary bindings only after their initializer, preserving
+  sequential same-block shadowing semantics.
+- Records every lexical value and named-type reference against its resolved
+  symbol identity while leaving member names and `self` for later passes.
+- Diagnoses unknown names, invalid duplicate declarations, and missing or
+  non-unique top-level `main` functions.
+
+Nested named-function references still use ordinary lexical resolution. The
+later capture-analysis pass will use those resolutions to distinguish legal
+global and self references from forbidden enclosing-function captures.
+
+Context validation, type checking and inference, capture analysis, and typed IR
+production are not yet implemented.
+
 ## Runtime prototype status
 
 The C code under `runtime/` is an isolated runtime prototype; the compiler does
