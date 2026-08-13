@@ -4,7 +4,7 @@ SAO has call-only `defer` syntax with lexical block scope:
 
 ```text
 fn read_file(path: string) -> string {
-    mut file = File.open(path);
+    mut file = File::open(path);
     defer file.close();
 
     file.read_all()
@@ -59,7 +59,7 @@ iteration:
 ```text
 for index in 0..paths.length() {
     const path = paths[index];
-    mut file = File.open(path);
+    mut file = File::open(path);
     defer file.close();
 
     process(file);

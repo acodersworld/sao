@@ -160,8 +160,8 @@ fn format_struct_declaration_into(
             StructMember::Field(field) => {
                 format_struct_field_into(output, source, field, depth + 3);
             }
-            StructMember::Method(method) => {
-                format_function_into(output, source, method, depth + 3);
+            StructMember::Function(function) => {
+                format_function_into(output, source, function, depth + 3);
             }
         }
     }
@@ -449,19 +449,6 @@ fn format_expression_into(
             );
             child_expression(output, source, "value", value, depth);
         }
-        ExpressionKind::BuiltinConstruction {
-            builtin,
-            type_arguments,
-            arguments,
-        } => {
-            line(
-                output,
-                depth,
-                format_args!("BuiltinConstruction {builtin:?} {}", location(span)),
-            );
-            type_list(output, source, "type_arguments", type_arguments, depth);
-            expression_list(output, source, "arguments", arguments, depth);
-        }
         ExpressionKind::StructConstruction { name, fields } => {
             line(
                 output,
@@ -498,6 +485,18 @@ fn format_expression_into(
                 ),
             );
             child_expression(output, source, "object", object, depth);
+        }
+        ExpressionKind::AssociatedAccess { owner, member } => {
+            line(
+                output,
+                depth,
+                format_args!(
+                    "AssociatedAccess {:?} {}",
+                    text(source, *member),
+                    location(span)
+                ),
+            );
+            child_type(output, source, "owner", owner, depth);
         }
         ExpressionKind::Index { object, index } => {
             line(output, depth, format_args!("Index {}", location(span)));
@@ -977,29 +976,34 @@ mod tests {
     }
 
     #[test]
-    fn formats_parameterized_builtin_construction() {
+    fn formats_parameterized_builtin_associated_calls() {
         for (source, builtin) in [
-            ("Queue<int>()", "Queue"),
-            ("Vector<string>()", "Vector"),
-            ("Map<string, int>()", "Map"),
+            ("Queue<int>::new()", "Queue"),
+            ("Vector<string>::new()", "Vector"),
+            ("Map<string, int>::new()", "Map"),
         ] {
             let expression = parse_expression_source(source);
-            assert!(format_expression(&module(source), &expression)
-                .starts_with(&format!("BuiltinConstruction {builtin}")));
+            let output = format_expression(&module(source), &expression);
+            assert!(output.starts_with("Call"));
+            assert!(output.contains(&format!("Builtin {builtin}")));
+            assert!(output.contains("AssociatedAccess \"new\""));
         }
 
-        let source = "Error<string>(message)";
-        let expression = parse_expression_source(source);
-        assert_eq!(
-            format_expression(&module(source), &expression),
-            "BuiltinConstruction Error @ 0..22\n  type_arguments:\n    [0]:\n      Primitive String @ 6..12\n  arguments:\n    [0]:\n      Identifier \"message\" @ 14..21"
-        );
-
-        let source = "Error(message)";
+        let source = "Error<string>::new(message)";
         let expression = parse_expression_source(source);
         let output = format_expression(&module(source), &expression);
-        assert!(output.starts_with("BuiltinConstruction Error @ 0..14"));
-        assert!(output.contains("type_arguments:\n    (empty)"));
+        assert!(output.starts_with("Call @ 0..27"));
+        assert!(output.contains("AssociatedAccess \"new\" @ 0..18"));
+        assert!(output.contains("Builtin Error @ 0..13"));
+        assert!(output.contains("Primitive String @ 6..12"));
+        assert!(output.contains("Identifier \"message\" @ 19..26"));
+
+        let source = "Error::new(message)";
+        let expression = parse_expression_source(source);
+        let output = format_expression(&module(source), &expression);
+        assert!(output.starts_with("Call @ 0..19"));
+        assert!(output.contains("AssociatedAccess \"new\" @ 0..10"));
+        assert!(output.contains("Builtin Error @ 0..5"));
 
         for (source, builtin) in [
             ("Queue<int>", "Queue"),
@@ -1031,6 +1035,17 @@ mod tests {
         assert!(output.contains("Field \"value\" @ 9..24"));
         assert!(output.contains("Literal Integer \"1\" @ 22..23"));
         assert!(output.contains("Function \"get\" @ 25..52"));
+    }
+
+    #[test]
+    fn formats_associated_access() {
+        let source = "Point::origin";
+        let expression = parse_expression_source(source);
+
+        assert_eq!(
+            format_expression(&module(source), &expression),
+            "AssociatedAccess \"origin\" @ 0..13\n  owner:\n    Named \"Point\" @ 0..5"
+        );
     }
 
     #[test]

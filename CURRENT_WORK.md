@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-13
+Last reviewed: 2026-08-14
 
 ## Current phase
 
@@ -38,6 +38,9 @@ the rule rather than collected into one miscellaneous final pass.
 Recommended implementation order:
 
 1. Context validation (next)
+   - Classify named-struct functions without a receiver as associated functions.
+     Require a first-position receiver on named-struct methods, anonymous-struct
+     methods, and interface requirements, and forbid receivers elsewhere.
    - Validate `self`, `return`, `break`, `continue`, `defer`, and `co` against
      their documented enclosing function, method, loop, and executable-block
      contexts.
@@ -51,9 +54,10 @@ Recommended implementation order:
      intersections, structs, and structural interface satisfaction.
    - Validate the required `main` signature after its parameter and return types
      are known.
-   - Infer local binding types and `Error(value)` payloads within the documented
-     inference boundary. Settle `bool(value)` before implementing its primitive
-     conversion rules.
+   - Infer local binding types and `Error::new(value)` payloads within the
+     documented inference boundary. Validate the compiler-known `new` associated
+     functions and their call arities. Settle `bool(value)` before implementing
+     its primitive conversion rules.
 3. Post-type semantic analysis
    - Analyze lambda and anonymous-struct captures, shared mutable capture cells,
      and forbidden captures by nested named functions.

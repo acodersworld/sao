@@ -45,19 +45,19 @@ fn copy_once(mut stream: Reader & Writer) -> int {
 fn prefixed_writer(prefix: bytes, mut destination: Writer) -> mut Writer {
     struct {
         fn write(mut self, data: bytes) -> int {
-            destination.write(bytes.concat(prefix, data))
+            destination.write(bytes::concat(prefix, data))
         }
     }
 }
 
 fn make_prefixer(prefix: bytes) -> fn(bytes) -> bytes {
     lambda(data: bytes) -> bytes {
-        bytes.concat(prefix, data)
+        bytes::concat(prefix, data)
     }
 }
 
 fn write_file(path: string, data: bytes) -> int {
-    mut file = File.create(path);
+    mut file = File::create(path);
     defer file.close();
 
     file.write(data)

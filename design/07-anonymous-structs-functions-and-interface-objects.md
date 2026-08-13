@@ -219,9 +219,10 @@ captures together:
 +------------------+
 ```
 
-Every method receives that object as `self`, so all methods share the same
-captures. Contextually converted anonymous structs use this same representation
-behind their interface value.
+Every anonymous-struct function must receive that object as `self`, so all
+methods share the same captures. Receiverless associated functions are limited
+to named structs. Contextually converted anonymous structs use this same
+representation behind their interface value.
 
 SAO execution is single-threaded. Closure environments, shared capture cells,
 and collector state use no atomic operations, locks, or thread-safety marker

@@ -219,8 +219,8 @@ impl<'source> Resolver<'source> {
                         StructMember::Field(field) => {
                             self.resolve_type(self.program_scope, &field.type_annotation);
                         }
-                        StructMember::Method(method) => {
-                            self.resolve_function(method, self.program_scope);
+                        StructMember::Function(function) => {
+                            self.resolve_function(function, self.program_scope);
                         }
                     }
                 }
@@ -404,18 +404,6 @@ impl<'source> Resolver<'source> {
             ExpressionKind::PrimitiveConversion { value, .. } => {
                 self.resolve_expression(scope, value);
             }
-            ExpressionKind::BuiltinConstruction {
-                type_arguments,
-                arguments,
-                ..
-            } => {
-                for argument in type_arguments {
-                    self.resolve_type(scope, argument);
-                }
-                for argument in arguments {
-                    self.resolve_expression(scope, argument);
-                }
-            }
             ExpressionKind::StructConstruction { name, fields } => {
                 self.resolve_type_name(scope, expression.id, *name);
                 for field in fields {
@@ -445,6 +433,9 @@ impl<'source> Resolver<'source> {
             }
             ExpressionKind::MemberAccess { object, .. } => {
                 self.resolve_expression(scope, object);
+            }
+            ExpressionKind::AssociatedAccess { owner, .. } => {
+                self.resolve_type(scope, owner);
             }
             ExpressionKind::Index { object, index } => {
                 self.resolve_expression(scope, object);
@@ -692,6 +683,53 @@ mod tests {
         assert_eq!(
             resolution.symbol_for_reference(helper_reference),
             Some(helper)
+        );
+    }
+
+    #[test]
+    fn resolves_associated_access_through_the_type_namespace() {
+        let source = concat!(
+            "struct Point { fn origin() -> Point { Point {} } }\n",
+            "fn main() { Point::origin(); }",
+        );
+        let (_, program, resolution) = resolve(source);
+        let Declaration::Struct(point) = &program.declarations[0] else {
+            panic!("expected Point struct");
+        };
+        let main = function(&program.declarations[1]);
+        let callee = call_callee(expression(&main.body.statements[0]));
+        let ExpressionKind::AssociatedAccess { owner, .. } = &callee.kind else {
+            panic!("expected associated access");
+        };
+
+        assert_eq!(
+            resolution.symbol_for_reference(owner.id),
+            resolution.symbol_for_declaration(point.id)
+        );
+    }
+
+    #[test]
+    fn resolves_types_inside_builtin_associated_access() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn main() { Queue<Item>::new(); }",
+        );
+        let (_, program, resolution) = resolve(source);
+        let Declaration::Struct(item) = &program.declarations[0] else {
+            panic!("expected Item struct");
+        };
+        let main = function(&program.declarations[1]);
+        let callee = call_callee(expression(&main.body.statements[0]));
+        let ExpressionKind::AssociatedAccess { owner, .. } = &callee.kind else {
+            panic!("expected associated access");
+        };
+        let TypeKind::Builtin { arguments, .. } = &owner.kind else {
+            panic!("expected built-in owner");
+        };
+
+        assert_eq!(
+            resolution.symbol_for_reference(arguments[0].id),
+            resolution.symbol_for_declaration(item.id)
         );
     }
 

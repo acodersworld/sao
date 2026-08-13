@@ -157,7 +157,7 @@ fn syntax_error_message(error: ParseError) -> String {
             format!("expected a top-level declaration, found {found:?}")
         }
         ParseErrorKind::ExpectedStructMember { found } => {
-            format!("expected a struct field or method, found {found:?}")
+            format!("expected a struct field or function, found {found:?}")
         }
         ParseErrorKind::ExpectedAnonymousStructMember { found } => {
             format!("expected an anonymous struct field or method, found {found:?}")
@@ -182,17 +182,9 @@ fn syntax_error_message(error: ParseError) -> String {
             "{builtin:?} expects {expected} type {}, found {found}",
             argument_word(expected)
         ),
-        ParseErrorKind::ExpectedBuiltinConstructor { builtin, found } => {
-            format!("expected ( to construct {builtin:?}, found {found:?}")
+        ParseErrorKind::ExpectedBuiltinAssociatedAccess { builtin, found } => {
+            format!("expected :: after {builtin:?}, found {found:?}")
         }
-        ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
-            builtin,
-            expected,
-            found,
-        } => format!(
-            "{builtin:?} construction expects {expected} value {}, found {found}",
-            argument_word(expected)
-        ),
         ParseErrorKind::InclusiveSliceNotSupported => {
             "inclusive slice ends are not supported; use ..".to_owned()
         }
@@ -288,7 +280,7 @@ mod tests {
                 },
                 span: Span::new(ModuleId::PRELUDE, 0, 5),
             }),
-            "expected a struct field or method, found Const"
+            "expected a struct field or function, found Const"
         );
         assert_eq!(
             syntax_error_message(ParseError {
@@ -368,24 +360,13 @@ mod tests {
         );
         assert_eq!(
             syntax_error_message(ParseError {
-                kind: ParseErrorKind::ExpectedBuiltinConstructor {
+                kind: ParseErrorKind::ExpectedBuiltinAssociatedAccess {
                     builtin: BuiltinType::Vector,
                     found: sao_compiler::lexer::TokenKind::Eof,
                 },
                 span: Span::new(ModuleId::PRELUDE, 11, 11),
             }),
-            "expected ( to construct Vector, found Eof"
-        );
-        assert_eq!(
-            syntax_error_message(ParseError {
-                kind: ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
-                    builtin: BuiltinType::Error,
-                    expected: 1,
-                    found: 0,
-                },
-                span: Span::new(ModuleId::PRELUDE, 0, 7),
-            }),
-            "Error construction expects 1 value argument, found 0"
+            "expected :: after Vector, found Eof"
         );
     }
 

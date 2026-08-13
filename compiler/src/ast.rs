@@ -115,11 +115,12 @@ impl StructDeclaration {
     }
 }
 
-/// A field or method declared by a named struct.
+/// A field or function declared by a named struct. A function with a receiver
+/// is an instance method; a receiverless function is associated with the type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructMember {
     Field(StructField),
-    Method(Function),
+    Function(Function),
 }
 
 /// A field declared by a named struct.
@@ -484,12 +485,6 @@ pub enum ExpressionKind {
         target: PrimitiveType,
         value: Box<Expression>,
     },
-    BuiltinConstruction {
-        builtin: BuiltinType,
-        /// Empty only for `Error(value)`, whose payload type is inferred later.
-        type_arguments: Vec<TypeSyntax>,
-        arguments: Vec<Expression>,
-    },
     StructConstruction {
         name: Span,
         fields: Vec<StructFieldInitializer>,
@@ -503,6 +498,11 @@ pub enum ExpressionKind {
     },
     MemberAccess {
         object: Box<Expression>,
+        member: Span,
+    },
+    /// Selects a receiverless function from a type with `Type::function`.
+    AssociatedAccess {
+        owner: TypeSyntax,
         member: Span,
     },
     Index {

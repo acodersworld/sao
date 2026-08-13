@@ -8,7 +8,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-08-13
+Last reviewed: 2026-08-14
 
 ## Lexer status
 
@@ -37,17 +37,20 @@ The parser currently supports:
   intersection type syntax.
 - Literals, identifiers, `self`, grouping, and expression-oriented blocks.
 - Prefix, binary, assignment, type-test, and postfix operators.
-- Calls, member access, indexing, exclusive open or bounded slicing, and postfix
-  error propagation with `?`.
+- Calls, value-member access with `.`, type-associated access with `::`,
+  indexing, exclusive open or bounded slicing, and postfix error propagation
+  with `?`.
 - Dedicated `int`, `float`, `bool`, `char`, and `string` conversion expressions
   with exactly one argument.
 - Fixed-arity `Queue<T>`, `Vector<T>`, `Map<K, V>`, and `Error<T>` types, plus
-  their canonical construction expressions. Both inferred `Error(value)` and
-  explicit `Error<T>(value)` forms are supported.
+  associated access on those types. Their constructors use ordinary associated
+  calls such as `Queue<T>::new()`; both inferred `Error::new(value)` and explicit
+  `Error<T>::new(value)` forms are represented for later type checking.
 - Named struct construction and unconstrained anonymous `struct { ... }`
   expressions, including initialized fields and methods.
 - Immutable and mutable bindings.
-- Named and nested functions, method receivers, returns, and lambdas.
+- Named and nested functions, receiverless named-struct functions, method
+  receivers, returns, and lambdas.
 - Call-only `defer` and coroutine-start `co` statements.
 - `if`/`else if`/`else`, `loop`, `while`, and integer range `for` expressions.
 - `break`, `continue`, and value-producing loop syntax.
@@ -97,8 +100,9 @@ Name and scope resolution is implemented. The resolver:
 - Resolves ordinary bindings only after their initializer, preserving
   sequential same-block shadowing semantics.
 - Records every lexical value and named-type reference by module-qualified AST
-  node identity against its resolved symbol identity, while leaving member
-  names and `self` for later passes.
+  node identity against its resolved symbol identity. The type qualifier in an
+  associated access resolves in the type namespace, while member names and
+  `self` remain for later passes.
 - Diagnoses unknown names, invalid duplicate declarations, and missing or
   non-unique top-level `main` functions.
 

@@ -189,6 +189,8 @@ define_token_kinds! {
     #[token(",")] Comma,
     // Terminates a statement and discards an expression's value.
     #[token(";")] Semicolon,
+    // Selects an associated member from a type.
+    #[token("::")] DoubleColon,
     // Separates a name from its type or field initializer context.
     #[token(":")] Colon,
     // Separates the bounds of an exclusive range or sequence slice.
@@ -709,7 +711,7 @@ mod tests {
     #[test]
     fn lexes_punctuation_and_operators_with_longest_match() {
         let source = concat!(
-            "( ) { } [ ] , ; : . .. ..= -> ? ",
+            "( ) { } [ ] , ; :: : . .. ..= -> ? ",
             "= + - * / % ! & | ^ ~ && || << >> == != < <= > >= ",
             "+= -= *= /= %= &= |= ^= <<= >>=",
         );
@@ -725,6 +727,7 @@ mod tests {
                 TokenKind::RightBracket,
                 TokenKind::Comma,
                 TokenKind::Semicolon,
+                TokenKind::DoubleColon,
                 TokenKind::Colon,
                 TokenKind::Dot,
                 TokenKind::DotDot,

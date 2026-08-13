@@ -177,7 +177,7 @@ by structs or interfaces, and operands are never implicitly converted.
 type, as defined in Section 3.7. They do not perform numeric coercion or invoke
 user-defined operations. Strings support `+`, `==`, and `!=`, but not ordering.
 `bytes` values support neither equality nor `+`; binary concatenation uses the
-explicit built-in `bytes.concat(left, right)` operation, which creates a new
+explicit built-in `bytes::concat(left, right)` operation, which creates a new
 mutable byte sequence.
 
 All operator operands are evaluated from left to right. `&&` and `||`
@@ -319,7 +319,7 @@ values from 0 through 255. It is separate from `string`:
 - A `const bytes` reference is transitively read-only.
 - A `mut bytes` reference supports indexed mutation, append, extend, and resize.
 - `length()` returns the byte count in constant time.
-- `bytes.concat(left, right)` creates a new mutable byte sequence containing the
+- `bytes::concat(left, right)` creates a new mutable byte sequence containing the
   contents of `left` followed by `right`.
 - Files and other binary I/O use `bytes`.
 

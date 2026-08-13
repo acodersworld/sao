@@ -65,7 +65,7 @@ Coroutines communicate through the compiler-known built-in reference type
 enable user-defined generics. A fresh queue is constructed with:
 
 ```text
-mut messages = Queue<int>();
+mut messages = Queue<int>::new();
 ```
 
 Queues are unbounded and preserve first-in, first-out message order. Their

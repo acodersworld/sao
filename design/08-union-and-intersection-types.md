@@ -118,7 +118,7 @@ parameterized type `Error<T>`, whose value carries error information of type
 ```text
 fn myfunc() -> int | Error<string> {
     if operation_failed() {
-        Error("operation failed")
+        Error::new("operation failed")
     } else {
         42
     }
@@ -133,18 +133,19 @@ described in Section 17. They do not enable user-defined generics.
 
 Each `Error<T>` instantiation is distinct from its payload type, from every
 non-error member of a union, and from `Error<U>` when `T` and `U` differ.
-Both `Error(value)` and `Error<T>(value)` are construction syntax. In the first
-form, without an expected type, the payload type is the exact type of `value`:
+Both `Error::new(value)` and `Error<T>::new(value)` are construction syntax. In
+the first form, without an expected type, the payload type is the exact type of
+`value`:
 
 ```text
-const error = Error("operation failed"); // Error<string>
+const error = Error::new("operation failed"); // Error<string>
 ```
 
 The explicit form supplies the payload type directly and requires the value to
 be assignable to it:
 
 ```text
-const error = Error<string>("operation failed");
+const error = Error<string>::new("operation failed");
 ```
 
 An expected `Error<T>` type may instead guide construction when the value is
@@ -157,7 +158,7 @@ widening conversion `Error<A>` to `Error<B>` whenever `A` is assignable to `B`.
 This covariance is a specific rule for `Error`, not a general variance feature:
 
 ```text
-const specific: Error<IoError> = Error(IoError { /* ... */ });
+const specific: Error<IoError> = Error::new(IoError { /* ... */ });
 const combined: Error<IoError | ParseError> = specific;
 ```
 

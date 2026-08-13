@@ -39,11 +39,12 @@ forms may have an exponent introduced by `e` or `E`, followed by an optional
 sign and one or more digits. Therefore `1.0`, `1e3`, and `1.0e-3` are floats;
 `.5` and `1.` are not.
 
-The longest punctuation match distinguishes the `..` and `..=` range
-delimiters, and the `..` slice delimiter, from member-access `.`. Consequently,
-`0..10` is an integer, `..`, and another integer rather than a floating-point
-literal. The `..=` token is valid for inclusive range headers but is rejected
-as an inclusive slice delimiter.
+The longest punctuation match distinguishes associated access `::` from `:`,
+and distinguishes the `..` and `..=` range delimiters, and the `..` slice
+delimiter, from member-access `.`. Consequently, `0..10` is an integer, `..`,
+and another integer rather than a floating-point literal. The `..=` token is
+valid for inclusive range headers but is rejected as an inclusive slice
+delimiter.
 
 Digit separators and binary, octal, or hexadecimal integer literals are not
 initially supported. Range checking and numeric conversion belong to semantic

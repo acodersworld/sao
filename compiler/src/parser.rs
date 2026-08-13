@@ -48,14 +48,9 @@ pub enum ParseErrorKind {
         expected: usize,
         found: usize,
     },
-    ExpectedBuiltinConstructor {
+    ExpectedBuiltinAssociatedAccess {
         builtin: BuiltinType,
         found: TokenKind,
-    },
-    InvalidBuiltinConstructorArgumentCount {
-        builtin: BuiltinType,
-        expected: usize,
-        found: usize,
     },
     InclusiveSliceNotSupported,
     RangeBoundRequiresGrouping,
@@ -354,7 +349,7 @@ where
             match token.kind {
                 TokenKind::RightBrace => break self.advance()?,
                 TokenKind::Eof => break self.expect(TokenKind::RightBrace)?,
-                TokenKind::Fn => members.push(StructMember::Method(self.function()?)),
+                TokenKind::Fn => members.push(StructMember::Function(self.function()?)),
                 TokenKind::Identifier => members.push(StructMember::Field(self.struct_field()?)),
                 _ => {
                     return Err(ParseError {
@@ -889,6 +884,11 @@ where
             left = match self.current()?.kind {
                 TokenKind::LeftParen => self.call(left)?,
                 TokenKind::Dot => self.member_access(left)?,
+                TokenKind::DoubleColon
+                    if matches!(&left.kind, ExpressionKind::Identifier) =>
+                {
+                    self.named_associated_access(left)?
+                }
                 TokenKind::LeftBracket => self.index_or_slice(left)?,
                 TokenKind::Question => self.try_expression(left)?,
                 // A construction target is a nominal name, not an arbitrary
@@ -1006,6 +1006,35 @@ where
         Ok(Expression::new(
             ExpressionKind::MemberAccess {
                 object: Box::new(object),
+                member: member.span,
+            },
+            span,
+        ))
+    }
+
+    fn named_associated_access(&mut self, owner: Expression) -> ParseResult {
+        assert!(
+            matches!(&owner.kind, ExpressionKind::Identifier),
+            "associated-access owner must be a named type"
+        );
+        let owner = TypeSyntax::new(
+            TypeKind::Named {
+                name: owner.span,
+                arguments: Vec::new(),
+            },
+            owner.span,
+        );
+        self.associated_access(owner)
+    }
+
+    fn associated_access(&mut self, owner: TypeSyntax) -> ParseResult {
+        self.expect(TokenKind::DoubleColon)?;
+        let member = self.expect(TokenKind::Identifier)?;
+        let span = Span::new(self.module_id, owner.span.start, member.span.end);
+
+        Ok(Expression::new(
+            ExpressionKind::AssociatedAccess {
+                owner,
                 member: member.span,
             },
             span,
@@ -1149,10 +1178,11 @@ where
             TokenKind::Bool => self.primitive_conversion(PrimitiveType::Bool),
             TokenKind::Char => self.primitive_conversion(PrimitiveType::Char),
             TokenKind::String => self.primitive_conversion(PrimitiveType::String),
-            TokenKind::Queue => self.builtin_construction(BuiltinType::Queue),
-            TokenKind::Vector => self.builtin_construction(BuiltinType::Vector),
-            TokenKind::Map => self.builtin_construction(BuiltinType::Map),
-            TokenKind::Error => self.builtin_construction(BuiltinType::Error),
+            TokenKind::Bytes => self.primitive_associated_access(PrimitiveType::Bytes),
+            TokenKind::Queue => self.builtin_associated_access(BuiltinType::Queue),
+            TokenKind::Vector => self.builtin_associated_access(BuiltinType::Vector),
+            TokenKind::Map => self.builtin_associated_access(BuiltinType::Map),
+            TokenKind::Error => self.builtin_associated_access(BuiltinType::Error),
             TokenKind::Struct if allow_struct_construction => self.anonymous_struct_expression(),
             TokenKind::Identifier => self.primary(ExpressionKind::Identifier),
             TokenKind::SelfValue => self.primary(ExpressionKind::SelfValue),
@@ -1171,9 +1201,10 @@ where
         }
     }
 
-    fn builtin_construction(&mut self, builtin: BuiltinType) -> ParseResult {
+    fn builtin_associated_access(&mut self, builtin: BuiltinType) -> ParseResult {
         let name = self.advance()?;
         let mut type_arguments = Vec::new();
+        let mut end = name.span.end;
 
         if self.current()?.kind == TokenKind::Less {
             let (arguments, close) = self.type_arguments()?;
@@ -1183,6 +1214,7 @@ where
                 Span::new      (self.module_id, name.span.start, close.span.end),
             )?;
             type_arguments = arguments;
+            end = close.span.end;
         } else if builtin != BuiltinType::Error {
             let token = self.current()?;
             return Err(ParseError {
@@ -1196,9 +1228,9 @@ where
         }
 
         let token = self.current()?;
-        if token.kind != TokenKind::LeftParen {
+        if token.kind != TokenKind::DoubleColon {
             return Err(ParseError {
-                kind: ParseErrorKind::ExpectedBuiltinConstructor {
+                kind: ParseErrorKind::ExpectedBuiltinAssociatedAccess {
                     builtin,
                     found: token.kind,
                 },
@@ -1207,18 +1239,14 @@ where
             .into());
         }
 
-        let (arguments, right_parenthesis) = self.call_arguments()?;
-        let span = Span::new      (self.module_id, name.span.start, right_parenthesis.span.end);
-        validate_builtin_constructor_argument_count(builtin, arguments.len(), span)?;
-
-        Ok(Expression::new(
-            ExpressionKind::BuiltinConstruction {
+        let owner = TypeSyntax::new(
+            TypeKind::Builtin {
                 builtin,
-                type_arguments,
-                arguments,
+                arguments: type_arguments,
             },
-            span,
-        ))
+            Span::new      (self.module_id, name.span.start, end),
+        );
+        self.associated_access(owner)
     }
 
     fn lambda_expression(&mut self) -> ParseResult {
@@ -1240,6 +1268,10 @@ where
 
     fn primitive_conversion(&mut self, target: PrimitiveType) -> ParseResult {
         let keyword = self.advance()?;
+        if self.current()?.kind == TokenKind::DoubleColon {
+            let owner = TypeSyntax::new(TypeKind::Primitive(target), keyword.span);
+            return self.associated_access(owner);
+        }
         self.expect(TokenKind::LeftParen)?;
         let value = self.expression(LOWEST_BINDING_POWER, true)?;
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
@@ -1257,8 +1289,26 @@ where
         ))
     }
 
+    fn primitive_associated_access(&mut self, primitive: PrimitiveType) -> ParseResult {
+        let keyword = self.advance()?;
+        if self.current()?.kind != TokenKind::DoubleColon {
+            return Err(ParseError {
+                kind: ParseErrorKind::ExpectedExpression {
+                    found: keyword.kind,
+                },
+                span: keyword.span,
+            }
+            .into());
+        }
+        let owner = TypeSyntax::new(TypeKind::Primitive(primitive), keyword.span);
+        self.associated_access(owner)
+    }
+
     fn struct_construction(&mut self, name_expression: Expression) -> ParseResult {
-        debug_assert!(matches!(&name_expression.kind, ExpressionKind::Identifier));
+        assert!(
+            matches!(&name_expression.kind, ExpressionKind::Identifier),
+            "struct-construction target must be a nominal type name"
+        );
         let name = name_expression.span;
         self.expect(TokenKind::LeftBrace)?;
         let mut fields = Vec::new();
@@ -1720,7 +1770,7 @@ fn assign_declaration_ids(declaration: &mut Declaration, context: &mut ParseCont
                         field.id = context.next_node_id();
                         assign_type_ids(&mut field.type_annotation, context);
                     }
-                    StructMember::Method(method) => assign_function_ids(method, context),
+                    StructMember::Function(function) => assign_function_ids(function, context),
                 }
             }
         }
@@ -1859,18 +1909,6 @@ fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext
         ExpressionKind::PrimitiveConversion { value, .. } => {
             assign_expression_ids(value, context);
         }
-        ExpressionKind::BuiltinConstruction {
-            type_arguments,
-            arguments,
-            ..
-        } => {
-            for argument in type_arguments {
-                assign_type_ids(argument, context);
-            }
-            for argument in arguments {
-                assign_expression_ids(argument, context);
-            }
-        }
         ExpressionKind::StructConstruction { fields, .. } => {
             for field in fields {
                 field.id = context.next_node_id();
@@ -1900,6 +1938,7 @@ fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext
             }
         }
         ExpressionKind::MemberAccess { object, .. } => assign_expression_ids(object, context),
+        ExpressionKind::AssociatedAccess { owner, .. } => assign_type_ids(owner, context),
         ExpressionKind::Index { object, index } => {
             assign_expression_ids(object, context);
             assign_expression_ids(index, context);
@@ -1982,13 +2021,6 @@ const fn builtin_type_argument_count(builtin: BuiltinType) -> usize {
     }
 }
 
-const fn builtin_constructor_argument_count(builtin: BuiltinType) -> usize {
-    match builtin {
-        BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Map => 0,
-        BuiltinType::Error => 1,
-    }
-}
-
 fn validate_builtin_type_argument_count(
     builtin: BuiltinType,
     found: usize,
@@ -2010,27 +2042,6 @@ fn validate_builtin_type_argument_count(
     .into())
 }
 
-fn validate_builtin_constructor_argument_count(
-    builtin: BuiltinType,
-    found: usize,
-    span: Span,
-) -> ParseResult<()> {
-    let expected = builtin_constructor_argument_count(builtin);
-    if found == expected {
-        return Ok(());
-    }
-
-    Err(ParseError {
-        kind: ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
-            builtin,
-            expected,
-            found,
-        },
-        span,
-    }
-    .into())
-}
-
 fn range_bound_is_simple(expression: &Expression) -> bool {
     match &expression.kind {
         ExpressionKind::Identifier
@@ -2041,10 +2052,9 @@ fn range_bound_is_simple(expression: &Expression) -> bool {
         ExpressionKind::MemberAccess { object, .. }
         | ExpressionKind::Index { object, .. }
         | ExpressionKind::Slice { object, .. } => range_bound_is_simple(object),
+        ExpressionKind::AssociatedAccess { .. } => true,
         ExpressionKind::Try { expression } => range_bound_is_simple(expression),
-        ExpressionKind::PrimitiveConversion { .. } | ExpressionKind::BuiltinConstruction { .. } => {
-            true
-        }
+        ExpressionKind::PrimitiveConversion { .. } => true,
         ExpressionKind::Unary {
             operator: UnaryOperator::Negate,
             operand,
@@ -2360,7 +2370,7 @@ mod tests {
         let StructMember::Field(next) = &structure.members[1] else {
             panic!("expected next field");
         };
-        let StructMember::Method(method) = &structure.members[2] else {
+        let StructMember::Function(method) = &structure.members[2] else {
             panic!("expected method");
         };
         assert_eq!(&source[value.name.start..value.name.end], "value");
@@ -2394,6 +2404,21 @@ mod tests {
             panic!("expected recursive field");
         };
         assert!(matches!(&next.type_annotation.kind, TypeKind::Union { .. }));
+    }
+
+    #[test]
+    fn parses_receiverless_named_struct_functions() {
+        let source = "struct Point { fn origin() -> Point { Point {} } }";
+        let program = parse_program_source(source).expect("associated function should parse");
+        let Declaration::Struct(point) = &program.declarations[0] else {
+            panic!("expected Point struct");
+        };
+        let StructMember::Function(origin) = &point.members[0] else {
+            panic!("expected origin function");
+        };
+
+        assert_eq!(&source[origin.name.start..origin.name.end], "origin");
+        assert!(origin.parameters.is_empty());
     }
 
     #[test]
@@ -5017,34 +5042,61 @@ mod tests {
     }
 
     #[test]
-    fn parses_parameterized_builtin_construction() {
+    fn parses_parameterized_builtin_associated_calls() {
         for (source, expected_builtin, type_count, argument_count) in [
-            ("Queue<int>()", BuiltinType::Queue, 1, 0),
-            ("Vector<string>()", BuiltinType::Vector, 1, 0),
-            ("Map<string, Vector<int>>()", BuiltinType::Map, 2, 0),
-            ("Error(value)", BuiltinType::Error, 0, 1),
-            ("Error<string>(value)", BuiltinType::Error, 1, 1),
+            ("Queue<int>::new()", BuiltinType::Queue, 1, 0),
+            ("Vector<string>::new()", BuiltinType::Vector, 1, 0),
+            (
+                "Map<string, Vector<int>>::new()",
+                BuiltinType::Map,
+                2,
+                0,
+            ),
+            ("Error::new(value)", BuiltinType::Error, 0, 1),
+            ("Error<string>::new(value)", BuiltinType::Error, 1, 1),
         ] {
-            let expression = parse(source).expect("built-in construction should parse");
-            let ExpressionKind::BuiltinConstruction {
+            let expression = parse(source).expect("built-in associated call should parse");
+            let ExpressionKind::Call { callee, arguments } = expression.kind else {
+                panic!("expected an ordinary call for {source}");
+            };
+            let ExpressionKind::AssociatedAccess { owner, member } = callee.kind else {
+                panic!("expected built-in associated access for {source}");
+            };
+            let TypeKind::Builtin {
                 builtin,
-                type_arguments,
-                arguments,
-            } = expression.kind
+                arguments: type_arguments,
+            } = owner.kind
             else {
-                panic!("expected built-in construction for {source}");
+                panic!("expected a built-in owner for {source}");
             };
             assert_eq!(builtin, expected_builtin);
             assert_eq!(type_arguments.len(), type_count);
+            assert_eq!(&source[member.start..member.end], "new");
             assert_eq!(arguments.len(), argument_count);
             assert_eq!(expression.span, span(0, source.len()));
         }
+
+        let expression = parse("Queue<int>::new")
+            .expect("a built-in associated function value should parse");
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::AssociatedAccess {
+                owner: TypeSyntax {
+                    kind: TypeKind::Builtin {
+                        builtin: BuiltinType::Queue,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn builtin_construction_composes_with_expressions() {
-        let expression = parse("Vector<int>().length() + 1")
-            .expect("built-in construction should compose with postfix and infix syntax");
+    fn builtin_associated_calls_compose_with_expressions() {
+        let expression = parse("Vector<int>::new().length() + 1")
+            .expect("built-in associated call should compose with postfix and infix syntax");
         assert!(matches!(
             expression.kind,
             ExpressionKind::Binary {
@@ -5054,56 +5106,67 @@ mod tests {
             } if matches!(left.kind, ExpressionKind::Call { .. })
         ));
 
-        let expression = parse("Map<string, int>()[key]")
-            .expect("built-in construction should compose with indexing");
+        let expression = parse("Map<string, int>::new()[key]")
+            .expect("built-in associated call should compose with indexing");
         assert!(matches!(expression.kind, ExpressionKind::Index { .. }));
 
-        let expression = parse("Error<int>(value + 1)")
+        let expression = parse("Error<int>::new(value + 1)")
             .expect("Error should accept a complete payload expression");
-        let ExpressionKind::BuiltinConstruction { arguments, .. } = expression.kind else {
-            panic!("expected Error construction");
+        let ExpressionKind::Call { arguments, .. } = expression.kind else {
+            panic!("expected Error associated call");
         };
         assert!(matches!(&arguments[0].kind, ExpressionKind::Binary { .. }));
     }
 
     #[test]
-    fn builtin_construction_is_not_an_ordinary_call() {
-        for (source, expected_kind) in [
-            ("defer Queue<int>();", ParseErrorKind::ExpectedDeferredCall),
-            ("co Error(value);", ParseErrorKind::ExpectedCoroutineCall),
-        ] {
-            let operand_start = source.find(' ').expect("statement has an operand") + 1;
-            assert_eq!(
-                parse_statement_source(source),
-                Err(FrontendError::Syntax(ParseError {
-                    kind: expected_kind,
-                    span: span(operand_start, source.len() - 1),
-                }))
-            );
+    fn builtin_new_uses_ordinary_call_syntax() {
+        for source in ["defer Queue<int>::new();", "co Error::new(value);"] {
+            let statement = parse_statement_source(source)
+                .expect("built-in associated calls should be valid call-only statements");
+            assert!(matches!(
+                statement.kind,
+                StatementKind::Defer(Expression {
+                    kind: ExpressionKind::Call { .. },
+                    ..
+                }) | StatementKind::Coroutine(Expression {
+                    kind: ExpressionKind::Call { .. },
+                    ..
+                })
+            ));
         }
     }
 
     #[test]
-    fn reports_malformed_builtin_construction() {
+    fn builtin_associated_call_arities_are_left_to_type_checking() {
+        for source in ["Error::new()", "Queue<int>::new(value)"] {
+            assert!(matches!(
+                parse(source).expect("ordinary call syntax should parse").kind,
+                ExpressionKind::Call { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn reports_malformed_builtin_associated_access() {
         for (source, expected_kind, expected_span) in [
             (
-                "Queue()",
+                "Queue::new()",
                 ParseErrorKind::ExpectedBuiltinTypeArguments {
                     builtin: BuiltinType::Queue,
-                    found: TokenKind::LeftParen,
+                    found: TokenKind::DoubleColon,
                 },
-                span(5, 6),
+                span(5, 7),
             ),
             (
                 "Vector<int>",
-                ParseErrorKind::ExpectedBuiltinConstructor {
+                ParseErrorKind::ExpectedBuiltinAssociatedAccess {
                     builtin: BuiltinType::Vector,
                     found: TokenKind::Eof,
                 },
                 span(11, 11),
             ),
             (
-                "Map<int>()",
+                "Map<int>::new()",
                 ParseErrorKind::InvalidBuiltinTypeArgumentCount {
                     builtin: BuiltinType::Map,
                     expected: 2,
@@ -5112,7 +5175,7 @@ mod tests {
                 span(0, 8),
             ),
             (
-                "Queue<int, string>()",
+                "Queue<int, string>::new()",
                 ParseErrorKind::InvalidBuiltinTypeArgumentCount {
                     builtin: BuiltinType::Queue,
                     expected: 1,
@@ -5121,34 +5184,7 @@ mod tests {
                 span(0, 18),
             ),
             (
-                "Error()",
-                ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
-                    builtin: BuiltinType::Error,
-                    expected: 1,
-                    found: 0,
-                },
-                span(0, 7),
-            ),
-            (
-                "Error<int>()",
-                ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
-                    builtin: BuiltinType::Error,
-                    expected: 1,
-                    found: 0,
-                },
-                span(0, 12),
-            ),
-            (
-                "Queue<int>(value)",
-                ParseErrorKind::InvalidBuiltinConstructorArgumentCount {
-                    builtin: BuiltinType::Queue,
-                    expected: 0,
-                    found: 1,
-                },
-                span(0, 17),
-            ),
-            (
-                "Error<int, string>(value)",
+                "Error<int, string>::new(value)",
                 ParseErrorKind::InvalidBuiltinTypeArgumentCount {
                     builtin: BuiltinType::Error,
                     expected: 1,
@@ -5157,7 +5193,7 @@ mod tests {
                 span(0, 18),
             ),
             (
-                "Error<>(value)",
+                "Error<>::new(value)",
                 ParseErrorKind::ExpectedType {
                     found: TokenKind::Greater,
                 },
@@ -5165,11 +5201,27 @@ mod tests {
             ),
             (
                 "Error value",
-                ParseErrorKind::ExpectedBuiltinConstructor {
+                ParseErrorKind::ExpectedBuiltinAssociatedAccess {
                     builtin: BuiltinType::Error,
                     found: TokenKind::Identifier,
                 },
                 span(6, 11),
+            ),
+            (
+                "Queue<int>()",
+                ParseErrorKind::ExpectedBuiltinAssociatedAccess {
+                    builtin: BuiltinType::Queue,
+                    found: TokenKind::LeftParen,
+                },
+                span(10, 11),
+            ),
+            (
+                "Error(value)",
+                ParseErrorKind::ExpectedBuiltinAssociatedAccess {
+                    builtin: BuiltinType::Error,
+                    found: TokenKind::LeftParen,
+                },
+                span(5, 6),
             ),
         ] {
             assert_eq!(
@@ -5448,6 +5500,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_associated_access_and_calls() {
+        let expression = parse("Point::origin().x").expect("associated call should parse");
+        let ExpressionKind::MemberAccess { object, member } = expression.kind else {
+            panic!("expected instance member access after the associated call");
+        };
+        assert_eq!(member, span(16, 17));
+
+        let ExpressionKind::Call { callee, arguments } = object.kind else {
+            panic!("expected associated function call");
+        };
+        assert!(arguments.is_empty());
+        let ExpressionKind::AssociatedAccess { owner, member } = callee.kind else {
+            panic!("expected associated access as the callee");
+        };
+        assert_eq!(member, span(7, 13));
+        assert!(matches!(
+            owner.kind,
+            TypeKind::Named { name, ref arguments }
+                if name == span(0, 5) && arguments.is_empty()
+        ));
+
+        let expression = parse("bytes::concat").expect("primitive associated access should parse");
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::AssociatedAccess {
+                owner: TypeSyntax {
+                    kind: TypeKind::Primitive(PrimitiveType::Bytes),
+                    ..
+                },
+                member,
+            } if member == span(7, 13)
+        ));
+    }
+
+    #[test]
+    fn associated_access_requires_a_member_name() {
+        assert_eq!(
+            parse("Point::"),
+            Err(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: TokenKind::Eof,
+                },
+                span: span(7, 7),
+            }
+            .into())
+        );
     }
 
     #[test]

@@ -96,9 +96,45 @@ initializers, but that partially initialized storage is not observable by the
 source program. A field initializer that exits through `?` leaves the incomplete
 allocation unreachable and eligible for garbage collection.
 
-Methods are declared directly in the struct body alongside its fields. SAO has
-no separate `impl` block and does not attach methods to a struct after its
-definition. This keeps a type's complete method set local to its declaration.
+Functions are declared directly in the struct body alongside its fields. SAO
+has no separate `impl` block and does not attach functions to a struct after its
+definition. This keeps a type's complete function set local to its declaration.
+
+A struct function whose first parameter is `self` or `mut self` is an instance
+method. A receiverless struct function is instead associated with the named
+type. When present, the receiver must occur exactly once and must be the first
+parameter:
+
+```text
+struct Position {
+    x: float,
+    y: float,
+
+    fn origin() -> Position {
+        Position { x: 0.0, y: 0.0 }
+    }
+
+    fn magnitude(self) -> float {
+        sqrt(self.x * self.x + self.y * self.y)
+    }
+}
+
+const origin = Position::origin();
+const distance = origin.magnitude();
+```
+
+`Type::function` selects an associated function from a type and produces an
+ordinary function value, so it may be stored or called. `value.method` selects
+an instance method from a value. An associated function has no implicit object,
+cannot use `self`, and cannot be called through a value. Conversely, an
+instance method cannot be selected through its type as an unbound function.
+
+Associated functions are initially available only on named structs. An
+anonymous struct's generated type cannot be named, and each of its functions
+must receive `self`. Associated functions do not participate in structural
+interface satisfaction. All fields and functions declared by one struct share
+one member-name namespace, so an associated function and an instance method
+cannot reuse the same name.
 
 Anonymous structs use the same model. A `struct { ... }` expression declares a
 hidden nominal type and constructs a value of that type:
@@ -127,8 +163,8 @@ through a `const` reference. Reference-valued field initialization and
 assignment must not convert const access back to mut; a const reference cannot
 be placed where later mutable field access would recover mut capability.
 
-The method receiver `self` is a const reference to the original object by
-default. A method requiring mutable access declares `mut self`:
+An instance-method receiver `self` is a const reference to the original object
+by default. A method requiring mutable access declares `mut self`:
 
 ```text
 fn describe(self) -> string {
