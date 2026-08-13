@@ -19,6 +19,16 @@ analysis concepts, helps define each increment, reviews the resulting code, and
 supports diagnosis and testing. Do not implement an entire semantic pass on the
 owner's behalf unless explicitly asked.
 
+## Completed semantic analysis
+
+Name and scope resolution is implemented and its tests pass. It provides
+semantic symbol identities, nested value and type scopes, forward declaration
+collection, complete name resolution, sequential local-binding shadowing, and
+diagnostics for unknown names, invalid duplicate declarations, and a missing or
+non-unique top-level `main` entry point. AST node identities and source spans
+are module-qualified; source registration remains separate from future
+entry-module selection.
+
 ## Semantic analysis work queue
 
 Semantic analysis is one compiler subsystem with ordered internal passes.
@@ -27,23 +37,13 @@ the rule rather than collected into one miscellaneous final pass.
 
 Recommended implementation order:
 
-1. Name and scope resolution (implemented)
-   - Introduce semantic symbol identities and nested value/type scopes.
-   - Collect top-level and nested named declarations, resolve every name, and
-     diagnose unknown names, invalid duplicate declarations, and a missing or
-     non-unique top-level `main` entry point. Permit sequential local bindings
-     to shadow earlier bindings in the same block after their initializer has
-     been resolved.
-   - Module-qualify AST node identities and source spans before later semantic
-     passes add more node-indexed results. Source registration remains separate
-     from future entry-module selection.
-2. Context validation (next)
+1. Context validation (next)
    - Validate `self`, `return`, `break`, `continue`, `defer`, and `co` against
      their documented enclosing function, method, loop, and executable-block
      contexts.
    - Validate assignment-target shape and binding-controlled restrictions such
      as immutable range induction variables.
-3. Type checking and inference
+2. Type checking and inference
    - Define semantic types and produce type information for expressions,
      bindings, declarations, and callable signatures.
    - Check operators, calls, assignments and mutability, returns, blocks, loop
@@ -54,7 +54,7 @@ Recommended implementation order:
    - Infer local binding types and `Error(value)` payloads within the documented
      inference boundary. Settle `bool(value)` before implementing its primitive
      conversion rules.
-4. Post-type semantic analysis
+3. Post-type semantic analysis
    - Analyze lambda and anonymous-struct captures, shared mutable capture cells,
      and forbidden captures by nested named functions.
    - Record the Error-propagation, coroutine-call, and deferred-call metadata
