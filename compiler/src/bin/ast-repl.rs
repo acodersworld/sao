@@ -4,8 +4,8 @@ use std::io::{self, BufRead, Write};
 use sao_compiler::ast::BuiltinType;
 use sao_compiler::lexer::Lexer;
 use sao_compiler::parser::{
-    parse_expression, parse_statement, parse_type, FrontendError, ParseContext, ParseError,
-    ParseErrorKind,
+    FrontendError, ParseContext, ParseError, ParseErrorKind, parse_expression, parse_statement,
+    parse_type,
 };
 use sao_compiler::pretty::{format_expression, format_statement, format_type};
 #[cfg(test)]
@@ -202,11 +202,7 @@ fn syntax_error_message(error: ParseError) -> String {
 }
 
 const fn argument_word(count: usize) -> &'static str {
-    if count == 1 {
-        "argument"
-    } else {
-        "arguments"
-    }
+    if count == 1 { "argument" } else { "arguments" }
 }
 
 fn character_count(source: &str, span: Span) -> usize {

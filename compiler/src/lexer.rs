@@ -899,9 +899,11 @@ mod tests {
             vec![TokenKind::Eof]
         );
         assert_eq!(errors.len(), 2);
-        assert!(errors
-            .iter()
-            .all(|error| error.kind == LexErrorKind::NonAsciiLiteral));
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == LexErrorKind::NonAsciiLiteral)
+        );
         assert_eq!(lex_source(source), Err(errors));
     }
 
@@ -942,9 +944,11 @@ mod tests {
             vec![TokenKind::Eof]
         );
         assert_eq!(errors.len(), 2);
-        assert!(errors
-            .iter()
-            .all(|error| error.kind == LexErrorKind::UnexpectedCharacter));
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == LexErrorKind::UnexpectedCharacter)
+        );
         assert_eq!(lex_source(source), Err(errors));
     }
 

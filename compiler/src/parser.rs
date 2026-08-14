@@ -272,7 +272,7 @@ where
             if token.kind == TokenKind::Eof {
                 return Ok(Program::new(
                     declarations,
-                    Span::new      (self.module_id, 0, token.span.end),
+                    Span::new(self.module_id, 0, token.span.end),
                 ));
             }
 
@@ -319,7 +319,7 @@ where
         Ok(InterfaceDeclaration::new(
             name.span,
             requirements,
-            Span::new      (self.module_id, keyword.span.start, right_brace.span.end),
+            Span::new(self.module_id, keyword.span.start, right_brace.span.end),
         ))
     }
 
@@ -334,7 +334,7 @@ where
             name.span,
             parameters,
             return_type,
-            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
+            Span::new(self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -364,7 +364,7 @@ where
         Ok(StructDeclaration::new(
             name.span,
             members,
-            Span::new      (self.module_id, keyword.span.start, right_brace.span.end),
+            Span::new(self.module_id, keyword.span.start, right_brace.span.end),
         ))
     }
 
@@ -373,7 +373,7 @@ where
         self.expect(TokenKind::Colon)?;
         let type_annotation = self.type_expression()?;
         let comma = self.expect(TokenKind::Comma)?;
-        let span = Span::new      (self.module_id, name.span.start, comma.span.end);
+        let span = Span::new(self.module_id, name.span.start, comma.span.end);
         Ok(StructField::new(name.span, type_annotation, span))
     }
 
@@ -403,7 +403,7 @@ where
         let parameters = self.function_parameters(true)?;
         let return_type = self.optional_return_type()?;
         let body = self.block()?;
-        let span = Span::new      (self.module_id, keyword.span.start, body.span.end);
+        let span = Span::new(self.module_id, keyword.span.start, body.span.end);
 
         Ok(Function::new(
             name.span,
@@ -464,14 +464,14 @@ where
                 FunctionParameterKind::Receiver {
                     name: receiver.span,
                 },
-                Span::new      (self.module_id, start, receiver.span.end),
+                Span::new(self.module_id, start, receiver.span.end),
             ));
         }
 
         let name = self.expect(TokenKind::Identifier)?;
         self.expect(TokenKind::Colon)?;
         let type_annotation = self.type_expression()?;
-        let span = Span::new      (self.module_id, start, type_annotation.span.end);
+        let span = Span::new(self.module_id, start, type_annotation.span.end);
 
         Ok(FunctionParameter::new(
             mutability,
@@ -504,7 +504,7 @@ where
                 type_annotation,
                 initializer,
             },
-            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
+            Span::new(self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -512,14 +512,14 @@ where
         let expression = self.expression(LOWEST_BINDING_POWER, true)?;
         let span = if self.current()?.kind == TokenKind::Semicolon {
             let semicolon = self.advance()?;
-            Span::new      (self.module_id, expression.span.start, semicolon.span.end)
+            Span::new(self.module_id, expression.span.start, semicolon.span.end)
         } else if expression_may_omit_statement_semicolon(&expression)
             && self.current()?.kind == TokenKind::Eof
         {
             expression.span
         } else {
             let semicolon = self.expect(TokenKind::Semicolon)?;
-            Span::new      (self.module_id, expression.span.start, semicolon.span.end)
+            Span::new(self.module_id, expression.span.start, semicolon.span.end)
         };
         Ok(Statement::new(StatementKind::Expression(expression), span))
     }
@@ -561,7 +561,7 @@ where
 
         Ok(Statement::new(
             statement_kind,
-            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
+            Span::new(self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -586,7 +586,7 @@ where
 
         Ok(Statement::new(
             StatementKind::Break(value),
-            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
+            Span::new(self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -595,7 +595,7 @@ where
         let semicolon = self.expect(TokenKind::Semicolon)?;
         Ok(Statement::new(
             StatementKind::Continue,
-            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
+            Span::new(self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -620,7 +620,7 @@ where
 
         Ok(Statement::new(
             StatementKind::Return(value),
-            Span::new      (self.module_id, keyword.span.start, semicolon.span.end),
+            Span::new(self.module_id, keyword.span.start, semicolon.span.end),
         ))
     }
 
@@ -642,7 +642,7 @@ where
         let end = members.last().expect("a union has members").span.end;
         Ok(TypeSyntax::new(
             TypeKind::Union { members },
-            Span::new      (self.module_id, start, end),
+            Span::new(self.module_id, start, end),
         ))
     }
 
@@ -668,7 +668,7 @@ where
             .end;
         Ok(TypeSyntax::new(
             TypeKind::Intersection { members },
-            Span::new      (self.module_id, start, end),
+            Span::new(self.module_id, start, end),
         ))
     }
 
@@ -681,7 +681,7 @@ where
 
         self.advance()?;
         let inner = self.prefix_type()?;
-        let span = Span::new      (self.module_id, token.span.start, inner.span.end);
+        let span = Span::new(self.module_id, token.span.start, inner.span.end);
         Ok(TypeSyntax::new(TypeKind::Mutable(Box::new(inner)), span))
     }
 
@@ -730,7 +730,7 @@ where
                 name: name.span,
                 arguments,
             },
-            Span::new      (self.module_id, name.span.start, end),
+            Span::new(self.module_id, name.span.start, end),
         ))
     }
 
@@ -753,12 +753,12 @@ where
         validate_builtin_type_argument_count(
             builtin,
             arguments.len(),
-            Span::new      (self.module_id, name.span.start, close.span.end),
+            Span::new(self.module_id, name.span.start, close.span.end),
         )?;
 
         Ok(TypeSyntax::new(
             TypeKind::Builtin { builtin, arguments },
-            Span::new      (self.module_id, name.span.start, close.span.end),
+            Span::new(self.module_id, name.span.start, close.span.end),
         ))
     }
 
@@ -807,7 +807,7 @@ where
         self.expect(TokenKind::RightParen)?;
         self.expect(TokenKind::Arrow)?;
         let return_type = self.type_expression()?;
-        let span = Span::new      (self.module_id, function.span.start, return_type.span.end);
+        let span = Span::new(self.module_id, function.span.start, return_type.span.end);
 
         Ok(TypeSyntax::new(
             TypeKind::Callable {
@@ -825,7 +825,7 @@ where
             let right_parenthesis = self.advance()?;
             return Ok(TypeSyntax::new(
                 TypeKind::Primitive(PrimitiveType::Unit),
-                Span::new      (
+                Span::new(
                     self.module_id,
                     left_parenthesis.span.start,
                     right_parenthesis.span.end,
@@ -837,7 +837,7 @@ where
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
         Ok(TypeSyntax::new(
             TypeKind::Group(Box::new(inner)),
-            Span::new      (
+            Span::new(
                 self.module_id,
                 left_parenthesis.span.start,
                 right_parenthesis.span.end,
@@ -854,11 +854,11 @@ where
                 self.advance()?;
                 let first = Token::new(
                     TokenKind::Greater,
-                    Span::new      (self.module_id, token.span.start, token.span.start + 1),
+                    Span::new(self.module_id, token.span.start, token.span.start + 1),
                 );
                 self.pending = Some(Token::new(
                     TokenKind::Greater,
-                    Span::new      (self.module_id, token.span.start + 1, token.span.end),
+                    Span::new(self.module_id, token.span.start + 1, token.span.end),
                 ));
                 Ok(first)
             }
@@ -884,9 +884,7 @@ where
             left = match self.current()?.kind {
                 TokenKind::LeftParen => self.call(left)?,
                 TokenKind::Dot => self.member_access(left)?,
-                TokenKind::DoubleColon
-                    if matches!(&left.kind, ExpressionKind::Identifier) =>
-                {
+                TokenKind::DoubleColon if matches!(&left.kind, ExpressionKind::Identifier) => {
                     self.named_associated_access(left)?
                 }
                 TokenKind::LeftBracket => self.index_or_slice(left)?,
@@ -914,7 +912,7 @@ where
                 InfixOperator::Binary(operator) => {
                     let right = self
                         .expression(binding_power.right_binding_power, allow_struct_construction)?;
-                    let span = Span::new      (self.module_id, left.span.start, right.span.end);
+                    let span = Span::new(self.module_id, left.span.start, right.span.end);
                     (
                         ExpressionKind::Binary {
                             left: Box::new(left),
@@ -927,7 +925,7 @@ where
                 InfixOperator::Assignment(operator) => {
                     let right = self
                         .expression(binding_power.right_binding_power, allow_struct_construction)?;
-                    let span = Span::new      (self.module_id, left.span.start, right.span.end);
+                    let span = Span::new(self.module_id, left.span.start, right.span.end);
                     (
                         ExpressionKind::Assignment {
                             target: Box::new(left),
@@ -939,8 +937,7 @@ where
                 }
                 InfixOperator::TypeTest => {
                     let type_syntax = self.type_expression()?;
-                    let span =
-                        Span::new      (self.module_id, left.span.start, type_syntax.span.end);
+                    let span = Span::new(self.module_id, left.span.start, type_syntax.span.end);
                     (
                         ExpressionKind::TypeTest {
                             value: Box::new(left),
@@ -959,7 +956,7 @@ where
 
     fn call(&mut self, callee: Expression) -> ParseResult {
         let (arguments, right_parenthesis) = self.call_arguments()?;
-        let span = Span::new      (
+        let span = Span::new(
             self.module_id,
             callee.span.start,
             right_parenthesis.span.end,
@@ -1001,7 +998,7 @@ where
     fn member_access(&mut self, object: Expression) -> ParseResult {
         self.expect(TokenKind::Dot)?;
         let member = self.expect(TokenKind::Identifier)?;
-        let span = Span::new      (self.module_id, object.span.start, member.span.end);
+        let span = Span::new(self.module_id, object.span.start, member.span.end);
 
         Ok(Expression::new(
             ExpressionKind::MemberAccess {
@@ -1075,7 +1072,7 @@ where
         }
 
         let right_bracket = self.expect(TokenKind::RightBracket)?;
-        let span = Span::new      (self.module_id, object.span.start, right_bracket.span.end);
+        let span = Span::new(self.module_id, object.span.start, right_bracket.span.end);
 
         Ok(Expression::new(
             ExpressionKind::Index {
@@ -1105,7 +1102,7 @@ where
             Some(self.expression(LOWEST_BINDING_POWER, true)?)
         };
         let right_bracket = self.expect(TokenKind::RightBracket)?;
-        let span = Span::new      (self.module_id, object.span.start, right_bracket.span.end);
+        let span = Span::new(self.module_id, object.span.start, right_bracket.span.end);
 
         Ok(Expression::new(
             ExpressionKind::Slice {
@@ -1119,7 +1116,7 @@ where
 
     fn try_expression(&mut self, expression: Expression) -> ParseResult {
         let question = self.expect(TokenKind::Question)?;
-        let span = Span::new      (self.module_id, expression.span.start, question.span.end);
+        let span = Span::new(self.module_id, expression.span.start, question.span.end);
 
         Ok(Expression::new(
             ExpressionKind::Try {
@@ -1137,7 +1134,7 @@ where
                 self.advance()?;
                 let operand =
                     self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
-                let span = Span::new      (self.module_id, token.span.start, operand.span.end);
+                let span = Span::new(self.module_id, token.span.start, operand.span.end);
 
                 Ok(Expression::new(
                     ExpressionKind::Unary {
@@ -1151,7 +1148,7 @@ where
                 self.advance()?;
                 let operand =
                     self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
-                let span = Span::new      (self.module_id, token.span.start, operand.span.end);
+                let span = Span::new(self.module_id, token.span.start, operand.span.end);
                 let operator = match token.kind {
                     TokenKind::Bang => UnaryOperator::LogicalNot,
                     TokenKind::Tilde => UnaryOperator::BitwiseNot,
@@ -1211,7 +1208,7 @@ where
             validate_builtin_type_argument_count(
                 builtin,
                 arguments.len(),
-                Span::new      (self.module_id, name.span.start, close.span.end),
+                Span::new(self.module_id, name.span.start, close.span.end),
             )?;
             type_arguments = arguments;
             end = close.span.end;
@@ -1244,7 +1241,7 @@ where
                 builtin,
                 arguments: type_arguments,
             },
-            Span::new      (self.module_id, name.span.start, end),
+            Span::new(self.module_id, name.span.start, end),
         );
         self.associated_access(owner)
     }
@@ -1254,7 +1251,7 @@ where
         let parameters = self.function_parameters(false)?;
         let return_type = self.optional_return_type()?;
         let body = self.block()?;
-        let span = Span::new      (self.module_id, keyword.span.start, body.span.end);
+        let span = Span::new(self.module_id, keyword.span.start, body.span.end);
 
         Ok(Expression::new(
             ExpressionKind::Lambda {
@@ -1281,7 +1278,7 @@ where
                 target,
                 value: Box::new(value),
             },
-            Span::new      (
+            Span::new(
                 self.module_id,
                 keyword.span.start,
                 right_parenthesis.span.end,
@@ -1318,7 +1315,7 @@ where
                 let field_name = self.expect(TokenKind::Identifier)?;
                 self.expect(TokenKind::Colon)?;
                 let value = self.expression(LOWEST_BINDING_POWER, true)?;
-                let span = Span::new      (self.module_id, field_name.span.start, value.span.end);
+                let span = Span::new(self.module_id, field_name.span.start, value.span.end);
                 fields.push(StructFieldInitializer::new(field_name.span, value, span));
 
                 if self.current()?.kind != TokenKind::Comma {
@@ -1335,7 +1332,7 @@ where
         let right_brace = self.expect(TokenKind::RightBrace)?;
         Ok(Expression::new(
             ExpressionKind::StructConstruction { name, fields },
-            Span::new      (self.module_id, name.start, right_brace.span.end),
+            Span::new(self.module_id, name.start, right_brace.span.end),
         ))
     }
 
@@ -1367,7 +1364,7 @@ where
 
         Ok(Expression::new(
             ExpressionKind::AnonymousStruct { members },
-            Span::new      (self.module_id, keyword.span.start, right_brace.span.end),
+            Span::new(self.module_id, keyword.span.start, right_brace.span.end),
         ))
     }
 
@@ -1382,7 +1379,7 @@ where
         self.expect(TokenKind::Assign)?;
         let initializer = self.expression(LOWEST_BINDING_POWER, true)?;
         let semicolon = self.expect(TokenKind::Semicolon)?;
-        let span = Span::new      (self.module_id, name.span.start, semicolon.span.end);
+        let span = Span::new(self.module_id, name.span.start, semicolon.span.end);
 
         Ok(AnonymousStructField::new(
             name.span,
@@ -1399,7 +1396,7 @@ where
             let right_parenthesis = self.advance()?;
             return Ok(Expression::new(
                 ExpressionKind::Literal(LiteralKind::Unit),
-                Span::new      (
+                Span::new(
                     self.module_id,
                     left_parenthesis.span.start,
                     right_parenthesis.span.end,
@@ -1415,7 +1412,7 @@ where
 
         Ok(Expression::new(
             ExpressionKind::Group(Box::new(expression)),
-            Span::new      (
+            Span::new(
                 self.module_id,
                 left_parenthesis.span.start,
                 right_parenthesis.span.end,
@@ -1471,7 +1468,7 @@ where
                     match following.kind {
                         TokenKind::Semicolon => {
                             let semicolon = self.advance()?;
-                            let span = Span::new      (
+                            let span = Span::new(
                                 self.module_id,
                                 expression.span.start,
                                 semicolon.span.end,
@@ -1507,7 +1504,7 @@ where
             }
         };
 
-        let span = Span::new      (self.module_id, left_brace.span.start, right_brace.span.end);
+        let span = Span::new(self.module_id, left_brace.span.start, right_brace.span.end);
         Ok(Block::new(statements, value, span))
     }
 
@@ -1546,14 +1543,14 @@ where
                 then_branch,
                 else_branch,
             },
-            Span::new      (self.module_id, if_keyword.span.start, end),
+            Span::new(self.module_id, if_keyword.span.start, end),
         ))
     }
 
     fn loop_expression(&mut self) -> ParseResult {
         let keyword = self.expect(TokenKind::Loop)?;
         let body = self.block()?;
-        let span = Span::new      (self.module_id, keyword.span.start, body.span.end);
+        let span = Span::new(self.module_id, keyword.span.start, body.span.end);
         Ok(Expression::new(ExpressionKind::Loop { body }, span))
     }
 
@@ -1579,7 +1576,7 @@ where
                 body,
                 else_branch,
             },
-            Span::new      (self.module_id, keyword.span.start, end),
+            Span::new(self.module_id, keyword.span.start, end),
         ))
     }
 
@@ -1643,7 +1640,7 @@ where
                 body,
                 else_branch,
             },
-            Span::new      (self.module_id, keyword.span.start, end_span),
+            Span::new(self.module_id, keyword.span.start, end_span),
         ))
     }
 
@@ -1727,7 +1724,7 @@ where
     fn synthetic_eof(&self) -> Token {
         Token::new(
             TokenKind::Eof,
-            Span::new      (self.module_id, self.last_end, self.last_end),
+            Span::new(self.module_id, self.last_end, self.last_end),
         )
     }
 
@@ -2262,7 +2259,7 @@ mod tests {
     }
 
     fn span(start: usize, end: usize) -> Span {
-        Span::new      (ModuleId::TEST_SOURCE, start, end)
+        Span::new(ModuleId::TEST_SOURCE, start, end)
     }
 
     fn parse_program_source(source: &str) -> ParseResult<Program> {
@@ -5046,12 +5043,7 @@ mod tests {
         for (source, expected_builtin, type_count, argument_count) in [
             ("Queue<int>::new()", BuiltinType::Queue, 1, 0),
             ("Vector<string>::new()", BuiltinType::Vector, 1, 0),
-            (
-                "Map<string, Vector<int>>::new()",
-                BuiltinType::Map,
-                2,
-                0,
-            ),
+            ("Map<string, Vector<int>>::new()", BuiltinType::Map, 2, 0),
             ("Error::new(value)", BuiltinType::Error, 0, 1),
             ("Error<string>::new(value)", BuiltinType::Error, 1, 1),
         ] {
@@ -5076,8 +5068,8 @@ mod tests {
             assert_eq!(expression.span, span(0, source.len()));
         }
 
-        let expression = parse("Queue<int>::new")
-            .expect("a built-in associated function value should parse");
+        let expression =
+            parse("Queue<int>::new").expect("a built-in associated function value should parse");
         assert!(matches!(
             expression.kind,
             ExpressionKind::AssociatedAccess {
@@ -5140,7 +5132,9 @@ mod tests {
     fn builtin_associated_call_arities_are_left_to_type_checking() {
         for source in ["Error::new()", "Queue<int>::new(value)"] {
             assert!(matches!(
-                parse(source).expect("ordinary call syntax should parse").kind,
+                parse(source)
+                    .expect("ordinary call syntax should parse")
+                    .kind,
                 ExpressionKind::Call { .. }
             ));
         }
@@ -6319,7 +6313,7 @@ mod tests {
                     expected: context_module.module_id(),
                     found: token_module.module_id(),
                 },
-                span: Span::new      (token_module.module_id(), 0, 5),
+                span: Span::new(token_module.module_id(), 0, 5),
             }))
         );
     }

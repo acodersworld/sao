@@ -160,8 +160,7 @@ impl fmt::Display for ContextResolutionError {
 
 impl std::error::Error for ContextResolutionError {}
 
-pub type ContextResolutionResult =
-    Result<ContextResolution, Vec<ContextResolutionError>>;
+pub type ContextResolutionResult = Result<ContextResolution, Vec<ContextResolutionError>>;
 
 /// Resolves structural context and validates its rules for one parsed program.
 ///
@@ -367,8 +366,9 @@ impl ContextResolver {
 
     fn visit_statement(&mut self, statement: &Statement) {
         match &statement.kind {
-            StatementKind::Binding { initializer, .. }
-            | StatementKind::Expression(initializer) => self.visit_expression(initializer),
+            StatementKind::Binding { initializer, .. } | StatementKind::Expression(initializer) => {
+                self.visit_expression(initializer)
+            }
             StatementKind::Function(function) => {
                 self.validate_receivers(
                     function.name,
@@ -578,7 +578,7 @@ mod tests {
     use super::*;
     use crate::{
         lexer::Lexer,
-        parser::{parse_program, ParseContext},
+        parser::{ParseContext, parse_program},
         source::SourceModuleRegistry,
     };
 
@@ -721,14 +721,8 @@ mod tests {
             &errors[2].kind,
             ContextResolutionErrorKind::DuplicateReceiver { .. }
         ));
-        assert_eq!(
-            errors[3].kind,
-            ContextResolutionErrorKind::ReceiverRequired
-        );
-        assert_eq!(
-            errors[4].kind,
-            ContextResolutionErrorKind::ReceiverRequired
-        );
+        assert_eq!(errors[3].kind, ContextResolutionErrorKind::ReceiverRequired);
+        assert_eq!(errors[4].kind, ContextResolutionErrorKind::ReceiverRequired);
     }
 
     #[test]
@@ -796,9 +790,11 @@ mod tests {
         let errors = resolve_program_context(&program).expect_err("self is unavailable");
 
         assert_eq!(errors.len(), 2);
-        assert!(errors
-            .iter()
-            .all(|error| error.kind == ContextResolutionErrorKind::SelfOutsideMethod));
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == ContextResolutionErrorKind::SelfOutsideMethod)
+        );
     }
 
     #[test]
@@ -935,9 +931,11 @@ mod tests {
             resolve_program_context(&invalid).expect_err("assignment roots should be invalid");
 
         assert_eq!(errors.len(), 5);
-        assert!(errors
-            .iter()
-            .all(|error| error.kind == ContextResolutionErrorKind::InvalidAssignmentTarget));
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == ContextResolutionErrorKind::InvalidAssignmentTarget)
+        );
     }
 
     #[test]

@@ -838,7 +838,7 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::{
-        parse_expression, parse_program, parse_statement, parse_type, ParseContext,
+        ParseContext, parse_expression, parse_program, parse_statement, parse_type,
     };
     use crate::source::SourceModuleRegistry;
 
@@ -1012,8 +1012,10 @@ mod tests {
             ("Error<int>", "Error"),
         ] {
             let type_syntax = parse_type_source(source);
-            assert!(format_type(&module(source), &type_syntax)
-                .starts_with(&format!("Builtin {builtin}")));
+            assert!(
+                format_type(&module(source), &type_syntax)
+                    .starts_with(&format!("Builtin {builtin}"))
+            );
         }
     }
 

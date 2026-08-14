@@ -586,7 +586,7 @@ mod tests {
     use super::*;
     use crate::{
         lexer::Lexer,
-        parser::{parse_program, ParseContext},
+        parser::{ParseContext, parse_program},
         source::SourceModuleRegistry,
     };
 
@@ -710,10 +710,7 @@ mod tests {
 
     #[test]
     fn resolves_types_inside_builtin_associated_access() {
-        let source = concat!(
-            "struct Item {}\n",
-            "fn main() { Queue<Item>::new(); }",
-        );
+        let source = concat!("struct Item {}\n", "fn main() { Queue<Item>::new(); }",);
         let (_, program, resolution) = resolve(source);
         let Declaration::Struct(item) = &program.declarations[0] else {
             panic!("expected Item struct");
