@@ -41,47 +41,43 @@ the rule rather than collected into one miscellaneous final pass.
 Implement type checking and inference in the following independently
 reviewable phases:
 
-1. Prerequisite cleanup (next)
-   - Remove `bool(value)` expression parsing and its parser tests before
-     beginning the type checker.
-   - Retain `bool` type syntax and the `true` and `false` literals.
-2. Semantic type foundation
+1. Semantic type foundation (next)
    - Define capability-qualified semantic types, retaining `const` and `mut`
      information for copied and reference values.
    - Represent primitives, callables, named and anonymous structs, interfaces,
      compiler-known built-ins, unions, intersections, and internal recovery and
      divergence types.
    - Establish normalization, identity, equality, and type-metadata APIs.
-3. Declarations and signatures
+2. Declarations and signatures
    - Resolve type syntax and collect struct fields, methods, interface
      requirements, callable signatures, and built-in signatures before checking
      bodies.
    - Support recursive and forward-referenced declarations.
    - Validate type arguments, member namespaces, and the required `main`
      signature.
-4. Core expression checking
+3. Core expression checking
    - Add expected-type-driven checking and local inference.
    - Cover literals, identifiers, `self`, functions, lambdas, calls, operators,
      conversions, blocks, conditionals, returns, and ordinary bindings.
    - Do not synthesize unions when result paths disagree.
-5. Places and mutability
+4. Places and mutability
    - Model writable locations separately from ordinary values while retaining
      capability in semantic types.
    - Check binding, parameter, receiver, field, index, assignment,
      compound-assignment, and range-binding mutability.
    - Permit copied values to acquire independent mutable storage without
      allowing reference capabilities to increase.
-6. Aggregates and structural typing
+5. Aggregates and structural typing
    - Check named and anonymous struct construction, fields, methods, associated
      functions, member selection, and structural interface satisfaction.
    - Record resolved member and call targets and implicit conversions required
      by typed IR.
    - Implement exact interface method-signature matching.
-7. Type algebra and flow
+6. Type algebra and flow
    - Implement union and intersection assignability, contextual conversions,
      branch and loop result typing, type tests, and flow-sensitive narrowing.
    - Cover value-producing loops and explicitly expected union types.
-8. Built-ins and completion
+7. Built-ins and completion
    - Check strings, bytes, indexing, slicing, primitive conversions, `Queue`,
      `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`, `yield`, `co`, and
      `defer`.

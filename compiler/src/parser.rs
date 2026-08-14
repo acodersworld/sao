@@ -1175,7 +1175,7 @@ where
             TokenKind::Lambda => self.lambda_expression(),
             TokenKind::Int => self.primitive_conversion(PrimitiveType::Int),
             TokenKind::Float => self.primitive_conversion(PrimitiveType::Float),
-            TokenKind::Bool => self.primitive_conversion(PrimitiveType::Bool),
+            TokenKind::Bool => self.primitive_associated_access(PrimitiveType::Bool),
             TokenKind::Char => self.primitive_conversion(PrimitiveType::Char),
             TokenKind::String => self.primitive_conversion(PrimitiveType::String),
             TokenKind::Bytes => self.primitive_associated_access(PrimitiveType::Bytes),
@@ -5240,7 +5240,6 @@ mod tests {
         for (source, expected_target) in [
             ("int(value)", PrimitiveType::Int),
             ("float(value)", PrimitiveType::Float),
-            ("bool(value)", PrimitiveType::Bool),
             ("char(value)", PrimitiveType::Char),
             ("string(value)", PrimitiveType::String),
         ] {
@@ -5347,14 +5346,6 @@ mod tests {
                 span(6, 7),
             ),
             (
-                "bool(first, second)",
-                ParseErrorKind::ExpectedToken {
-                    expected: TokenKind::RightParen,
-                    found: TokenKind::Comma,
-                },
-                span(10, 11),
-            ),
-            (
                 "char(value,)",
                 ParseErrorKind::ExpectedToken {
                     expected: TokenKind::RightParen,
@@ -5369,6 +5360,13 @@ mod tests {
                     found: TokenKind::Eof,
                 },
                 span(12, 12),
+            ),
+            (
+                "bool(value)",
+                ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::Bool,
+                },
+                span(0, 4),
             ),
             (
                 "bytes(value)",
