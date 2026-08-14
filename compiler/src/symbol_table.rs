@@ -114,6 +114,12 @@ pub struct SymbolTable {
     next_symbol_id: usize,
 }
 
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SymbolTable {
     pub fn new() -> Self {
         Self {
@@ -200,7 +206,7 @@ impl SymbolTable {
             }
             SymbolKind::Parameter => {
                 if let Some(id) = scope.values.get(name) {
-                    let dup = self.symbols.get(&id).unwrap();
+                    let dup = self.symbols.get(id).unwrap();
                     if matches!(
                         dup.kind,
                         SymbolKind::Parameter | SymbolKind::Function | SymbolKind::BuiltinValue
@@ -230,7 +236,7 @@ impl SymbolTable {
             }
             SymbolKind::Binding | SymbolKind::RangeBinding => {
                 if let Some(id) = scope.values.get(name) {
-                    let dup = self.symbols.get(&id).unwrap();
+                    let dup = self.symbols.get(id).unwrap();
                     if matches!(dup.kind, SymbolKind::Function | SymbolKind::BuiltinValue) {
                         return Err(DeclareError::DuplicateDeclaration {
                             name: name.to_string(),
