@@ -116,6 +116,27 @@ capability qualifier is unnecessary for copied value types such as `int`.
 Within a union, `mut` qualifies the immediately following reference member, so
 `-> mut User | none` returns either mutable access to a `User` or `none`.
 
+Callable types also carry a capability, but it describes mutation of captured
+callable state rather than general side effects. A callable written
+`fn(Parameters) -> Return` does not mutate its captured environment when
+invoked. A callable written `mut fn(Parameters) -> Return` may do so. Calling a
+mutable callable requires mutable access to the callable, and a mutable callable
+cannot initialize a `const` binding or be passed where a const callable is
+required.
+
+A const callable may be used where a mutable callable is expected because
+allowing a non-mutating implementation in a context that permits mutation is
+safe. Callable capability is not a purity annotation: a const callable may
+perform I/O, mutate values supplied through `mut` parameters, or call other
+functions with externally visible effects. It only guarantees that invocation
+does not mutate state captured by that callable value. Named functions cannot
+capture lexical state and therefore produce const callable values.
+
+Lambda capability is determined conservatively from its captures. A lambda
+that captures any `mut` binding has a mutable callable type, regardless of
+whether its body actually mutates or only reads that binding. A lambda whose
+captures are all const has a const callable type.
+
 ## 3.1 Primitive types
 
 SAO has a deliberately small, fixed primitive set:

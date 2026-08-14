@@ -128,9 +128,9 @@ and locals, and its own name for recursion. Referencing an enclosing local is a
 compile-time error; a lambda must be used when capture is required.
 
 A nested function's name may be used as a first-class function value. Named
-functions and lambdas share the same callable `fn(...) -> ...` types. A nested
-function has no capture environment and is lowered like any other named
-function.
+functions and lambdas share callable `fn(...) -> ...` and
+`mut fn(...) -> ...` types. A nested function has no capture environment, so
+its function value is const and is lowered like any other named function.
 
 ## 7.4 Lambdas
 
@@ -153,12 +153,19 @@ The inferred callable type of `scale` is the single type
 `fn(float) -> float`. A function value contains both callable code and any
 captured environment.
 
-Mutable captures are shared:
+Callable capability is determined solely from capture capabilities. A lambda
+that captures any `mut` binding has a `mut fn(...) -> ...` type, regardless of
+whether its body mutates or only reads that binding. A lambda whose captures are
+all const has a const `fn(...) -> ...` type. This conservative rule avoids
+classifying callable capability from the operations performed by the body.
+
+Mutable captures are shared, and a lambda that changes one must be held with
+mutable access:
 
 ```text
 mut count = 0;
 
-const next = lambda() -> int {
+mut next = lambda() -> int {
     count += 1;
     count
 };
@@ -168,11 +175,17 @@ next(); // 2
 // count is now 2
 ```
 
+The inferred type of `next` is `mut fn() -> int`. Binding that lambda with
+`const` instead is a type error because invoking it changes captured state.
+Calling a mutable callable likewise requires mutable access to its binding or
+other containing place.
+
 If several lambdas capture the same mutable binding, they observe
 the same storage. SAO has no ownership-transfer or `move` capture modifier.
 
-A `const` binding containing a lambda does not make that function pure. Calling
-it may still mutate a `mut` binding captured by the lambda.
+A const callable is not otherwise pure. It may perform I/O, mutate values
+received through `mut` parameters, and have other effects that do not mutate
+its captured environment.
 
 ## 7.5 Closure and environment representation
 
