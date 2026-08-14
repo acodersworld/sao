@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod context_resolution;
 pub mod lexer;
 pub mod name_resolution;
 pub mod parser;

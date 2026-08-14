@@ -110,8 +110,24 @@ Nested named-function references still use ordinary lexical resolution. The
 later capture-analysis pass will use those resolutions to distinguish legal
 global and self references from forbidden enclosing-function captures.
 
-Context validation, type checking and inference, capture analysis, and typed IR
-production are not yet implemented.
+Context resolution is implemented as an AST-only pass. It:
+
+- Classifies top-level and nested functions, named-struct methods and associated
+  functions, anonymous-struct methods, lambdas, and interface requirements.
+- Requires first-position receivers where appropriate and diagnoses forbidden,
+  missing, misplaced, and duplicate receivers.
+- Validates `self`, `return`, `break`, `continue`, `defer`, and `co` against
+  their lexical method, callable, loop, and executable-block contexts.
+- Records owning methods for `self`, target callables for `return`, and target
+  loops for `break` and `continue`, all keyed by module-qualified AST node ID.
+- Rejects assignment targets other than ungrouped identifiers, member accesses,
+  and index expressions. Direct assignment to `self` is invalid, while mutation
+  through `self.member` remains subject to later type checking.
+- Leaves every `const` and `mut` restriction, including range induction-binding
+  immutability, to the type checker.
+
+Type checking and inference, capture analysis, and typed IR production are not
+yet implemented.
 
 ## Runtime prototype status
 
