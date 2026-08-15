@@ -8,7 +8,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-08-14
+Last reviewed: 2026-08-15
 
 ## Lexer status
 
@@ -126,8 +126,19 @@ Context resolution is implemented as an AST-only pass. It:
 - Leaves every `const` and `mut` restriction, including range induction-binding
   immutability, to the type checker.
 
-Type checking and inference, capture analysis, and typed IR production are not
-yet implemented.
+The semantic type foundation is implemented. It provides a program-local
+canonical type store for capability-qualified primitives, callables, nominal
+named and anonymous structs, interfaces, compiler-known parameterized types,
+unions, intersections, and internal recovery and divergence types. Union and
+intersection construction is associative, commutative, and idempotent, with an
+outer capability distinct from member capabilities. The store exposes exact
+identity, equality that ignores only the outer capability, safe structural
+lookup, and shallow-copied/reference value semantics directly on the canonical
+type representation.
+
+Source type resolution, declaration and signature collection, expression type
+checking and inference, assignability, capture analysis, and typed IR production
+are not yet implemented.
 
 ## Runtime prototype status
 

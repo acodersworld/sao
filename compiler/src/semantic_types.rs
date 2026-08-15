@@ -116,6 +116,91 @@ impl SemanticType {
             Self::Recovery | Self::Divergence => None,
         }
     }
+
+    fn has_same_shape(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Primitive {
+                    primitive: left, ..
+                },
+                Self::Primitive {
+                    primitive: right, ..
+                },
+            ) => left == right,
+            (
+                Self::Callable {
+                    parameters: left_parameters,
+                    return_type: left_return,
+                    ..
+                },
+                Self::Callable {
+                    parameters: right_parameters,
+                    return_type: right_return,
+                    ..
+                },
+            ) => left_parameters == right_parameters && left_return == right_return,
+            (
+                Self::NamedStruct {
+                    declaration: left,
+                    ..
+                },
+                Self::NamedStruct {
+                    declaration: right,
+                    ..
+                },
+            )
+            | (
+                Self::Interface {
+                    declaration: left,
+                    ..
+                },
+                Self::Interface {
+                    declaration: right,
+                    ..
+                },
+            ) => left == right,
+            (
+                Self::AnonymousStruct {
+                    expression: left,
+                    ..
+                },
+                Self::AnonymousStruct {
+                    expression: right,
+                    ..
+                },
+            ) => left == right,
+            (
+                Self::Builtin {
+                    builtin: left_builtin,
+                    arguments: left_arguments,
+                    ..
+                },
+                Self::Builtin {
+                    builtin: right_builtin,
+                    arguments: right_arguments,
+                    ..
+                },
+            ) => left_builtin == right_builtin && left_arguments == right_arguments,
+            (
+                Self::Union {
+                    members: left, ..
+                },
+                Self::Union {
+                    members: right, ..
+                },
+            )
+            | (
+                Self::Intersection {
+                    members: left, ..
+                },
+                Self::Intersection {
+                    members: right, ..
+                },
+            ) => left == right,
+            (Self::Recovery, Self::Recovery) | (Self::Divergence, Self::Divergence) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Owns and canonically interns the semantic types for one program.
@@ -285,6 +370,38 @@ impl TypeStore {
     #[must_use]
     pub fn get(&self, id: TypeId) -> Option<&SemanticType> {
         self.types.get(id.0)
+    }
+
+    /// Returns whether an ID resolves to a type in this store.
+    ///
+    /// Like every [`TypeId`] operation, this assumes the ID originated from
+    /// this store. IDs from different stores are not interchangeable.
+    #[must_use]
+    pub fn contains(&self, id: TypeId) -> bool {
+        self.get(id).is_some()
+    }
+
+    /// Tests exact canonical type identity.
+    ///
+    /// Capability is part of identity. `None` is returned if either ID is
+    /// unknown to this store.
+    #[must_use]
+    pub fn is_identical(&self, left: TypeId, right: TypeId) -> Option<bool> {
+        self.get(left)?;
+        self.get(right)?;
+        Some(left == right)
+    }
+
+    /// Tests equality while ignoring only the types' outer capabilities.
+    ///
+    /// Capabilities on nested callable parameters, return types, built-in type
+    /// arguments, and union or intersection members remain significant. This
+    /// is structural comparison of canonical representations, not
+    /// assignability or an implicit-conversion check. `None` is returned if
+    /// either ID is unknown to this store.
+    #[must_use]
+    pub fn has_same_shape(&self, left: TypeId, right: TypeId) -> Option<bool> {
+        Some(self.get(left)?.has_same_shape(self.get(right)?))
     }
 
     /// Returns the canonical form of a type with the requested capability.
@@ -962,11 +1079,141 @@ mod tests {
     }
 
     #[test]
+    fn exact_identity_is_store_validated_and_capability_sensitive() {
+        let mut types = TypeStore::new();
+        let const_int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let same_const_int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let mut_int = types.primitive(PrimitiveType::Int, AccessCapability::Mut);
+        let string = types.primitive(PrimitiveType::String, AccessCapability::Const);
+        let unknown = TypeId(usize::MAX);
+
+        assert_eq!(types.is_identical(const_int, same_const_int), Some(true));
+        assert_eq!(types.is_identical(const_int, mut_int), Some(false));
+        assert_eq!(types.is_identical(const_int, string), Some(false));
+        assert_eq!(types.is_identical(const_int, unknown), None);
+        assert_eq!(types.is_identical(unknown, const_int), None);
+    }
+
+    #[test]
+    fn same_shape_ignores_the_outer_capability_of_every_value_type() {
+        let mut types = TypeStore::new();
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let unit = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
+        let first_interface = types.interface(node(3), AccessCapability::Const);
+        let second_interface = types.interface(node(4), AccessCapability::Const);
+
+        let const_callable =
+            types.callable(vec![int], unit, AccessCapability::Const);
+        let mut_callable = types.callable(vec![int], unit, AccessCapability::Mut);
+        let const_named = types.named_struct(node(1), AccessCapability::Const);
+        let mut_named = types.named_struct(node(1), AccessCapability::Mut);
+        let const_anonymous = types.anonymous_struct(node(2), AccessCapability::Const);
+        let mut_anonymous = types.anonymous_struct(node(2), AccessCapability::Mut);
+        let const_interface = types.interface(node(3), AccessCapability::Const);
+        let mut_interface = types.interface(node(3), AccessCapability::Mut);
+        let const_builtin = types.builtin(
+            BuiltinType::Queue,
+            vec![int],
+            AccessCapability::Const,
+        );
+        let mut_builtin =
+            types.builtin(BuiltinType::Queue, vec![int], AccessCapability::Mut);
+        let const_union = types.union(
+            vec![int, first_interface],
+            AccessCapability::Const,
+        );
+        let mut_union =
+            types.union(vec![int, first_interface], AccessCapability::Mut);
+        let const_intersection = types.intersection(
+            vec![first_interface, second_interface],
+            AccessCapability::Const,
+        );
+        let mut_intersection = types.intersection(
+            vec![first_interface, second_interface],
+            AccessCapability::Mut,
+        );
+        let mut_int = types.primitive(PrimitiveType::Int, AccessCapability::Mut);
+
+        for (const_type, mut_type) in [
+            (int, mut_int),
+            (const_callable, mut_callable),
+            (const_named, mut_named),
+            (const_anonymous, mut_anonymous),
+            (const_interface, mut_interface),
+            (const_builtin, mut_builtin),
+            (const_union, mut_union),
+            (const_intersection, mut_intersection),
+        ] {
+            assert_eq!(types.has_same_shape(const_type, mut_type), Some(true));
+        }
+
+        assert_eq!(
+            types.has_same_shape(types.recovery(), types.recovery()),
+            Some(true)
+        );
+        assert_eq!(
+            types.has_same_shape(types.divergence(), types.divergence()),
+            Some(true)
+        );
+        assert_eq!(
+            types.has_same_shape(types.recovery(), types.divergence()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn same_shape_preserves_nested_capabilities_and_nominal_identity() {
+        let mut types = TypeStore::new();
+        let const_int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let mut_int = types.primitive(PrimitiveType::Int, AccessCapability::Mut);
+        let unit = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
+
+        let const_parameter =
+            types.callable(vec![const_int], unit, AccessCapability::Const);
+        let mut_parameter =
+            types.callable(vec![mut_int], unit, AccessCapability::Const);
+        assert_eq!(
+            types.has_same_shape(const_parameter, mut_parameter),
+            Some(false)
+        );
+
+        let const_argument = types.builtin(
+            BuiltinType::Queue,
+            vec![const_int],
+            AccessCapability::Const,
+        );
+        let mut_argument = types.builtin(
+            BuiltinType::Queue,
+            vec![mut_int],
+            AccessCapability::Const,
+        );
+        assert_eq!(
+            types.has_same_shape(const_argument, mut_argument),
+            Some(false)
+        );
+
+        let first_named = types.named_struct(node(1), AccessCapability::Const);
+        let second_named = types.named_struct(node(2), AccessCapability::Const);
+        assert_eq!(types.has_same_shape(first_named, second_named), Some(false));
+
+        let const_member_union =
+            types.union(vec![const_int, first_named], AccessCapability::Const);
+        let mut_member_union =
+            types.union(vec![mut_int, first_named], AccessCapability::Const);
+        assert_eq!(
+            types.has_same_shape(const_member_union, mut_member_union),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn unknown_type_ids_are_rejected_without_panicking() {
         let mut types = TypeStore::new();
         let unknown = TypeId(usize::MAX);
 
         assert_eq!(types.get(unknown), None);
+        assert!(!types.contains(unknown));
+        assert_eq!(types.has_same_shape(types.recovery(), unknown), None);
         assert_eq!(
             types.with_capability(unknown, AccessCapability::Mut),
             None

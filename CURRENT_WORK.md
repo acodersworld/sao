@@ -21,14 +21,19 @@ owner's behalf unless explicitly asked.
 
 ## Completed semantic analysis
 
-Name, scope, and context resolution are implemented. Together they
-provide semantic symbol identities, nested value and type scopes, forward
-declaration collection, complete name resolution, sequential local-binding
-shadowing, callable classification, structural control targets, and diagnostics
-for invalid names, declarations, receivers, contextual control flow, `self`, and
+Name, scope, and context resolution are implemented. Together they provide
+semantic symbol identities, nested value and type scopes, forward declaration
+collection, complete name resolution, sequential local-binding shadowing,
+callable classification, structural control targets, and diagnostics for
+invalid names, declarations, receivers, contextual control flow, `self`, and
 assignment-target shapes. AST node identities and source spans are
 module-qualified; source registration remains separate from future entry-module
 selection.
+
+The semantic type foundation is also complete: program-local canonical type
+identities, capability-qualified value types, normalized unions and
+intersections, recovery and divergence types, exact identity, outer-capability-
+insensitive shape equality, and value-semantics metadata are implemented.
 
 ## Semantic analysis work queue
 
@@ -41,7 +46,7 @@ the rule rather than collected into one miscellaneous final pass.
 Implement type checking and inference in the following independently
 reviewable phases:
 
-1. Semantic type foundation (in progress)
+1. Semantic type foundation (complete)
    - Complete: a program-local canonical type interner with opaque type
      identities; capability-qualified primitives and callables; nominal named
      and anonymous structs; declared structural interfaces; compiler-known
@@ -50,9 +55,14 @@ reviewable phases:
    - Complete: capability-qualified canonical union and intersection identities
      with associative flattening, exact-member deduplication,
      order-independent identity, and capability-preserving singleton collapse.
-   - Next: complete the foundation's identity, equality, and type-metadata
-     APIs.
-2. Declarations and signatures
+   - Complete: store-validated exact identity, equality that ignores only the
+     outer capability, safe structural lookup, and capability and value-
+     semantics metadata on the canonical type representation.
+2. Declarations and signatures (next)
+   - Next increment: resolve source `TypeSyntax` into canonical `TypeId`s and
+     record the resolved type for each type-syntax node. Diagnose unknown named
+     types and invalid compiler-known type arguments while preserving recovery
+     types so independent errors can still be collected.
    - Resolve type syntax and collect struct fields, methods, interface
      requirements, callable signatures, and built-in signatures before checking
      bodies.
