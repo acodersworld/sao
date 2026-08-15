@@ -2,11 +2,11 @@ use std::iter::Peekable;
 
 use crate::ast::{
     AnonymousStructField, AnonymousStructMember, AssignmentOperator, BinaryOperator,
-    BindingMutability, Block, BuiltinType, ConditionalElse, Declaration, Expression,
-    ExpressionKind, Function, FunctionParameter, FunctionParameterKind, InterfaceDeclaration,
-    InterfaceMethodRequirement, LiteralKind, NodeId, PrimitiveType, Program, RangeInclusivity,
-    Statement, StatementKind, StructDeclaration, StructField, StructFieldInitializer, StructMember,
-    TypeKind, TypeSyntax, UnaryOperator,
+    BindingMutability, BindingQualifiers, Block, BuiltinType, ConditionalElse, Declaration,
+    Expression, ExpressionKind, Function, FunctionParameter, FunctionParameterKind,
+    InterfaceDeclaration, InterfaceMethodRequirement, LiteralKind, NodeId, PrimitiveType, Program,
+    RangeInclusivity, Statement, StatementKind, StructDeclaration, StructField,
+    StructFieldInitializer, StructMember, TypeKind, TypeSyntax, UnaryOperator, ValueCapability,
 };
 use crate::lexer::{LexError, Token, TokenKind};
 use crate::source::{ModuleId, Span};
@@ -54,6 +54,15 @@ pub enum ParseErrorKind {
     },
     InclusiveSliceNotSupported,
     RangeBoundRequiresGrouping,
+    InvalidBindingQualifiers {
+        binding: TokenKind,
+        value: TokenKind,
+    },
+    ValueCapabilityWithoutBinding {
+        found: TokenKind,
+    },
+    InvalidReceiverQualifiers,
+    BindingValueCapabilityMustPrecedeName,
     ExpectedToken {
         expected: TokenKind,
         found: TokenKind,
@@ -251,6 +260,13 @@ enum CallStatementKind {
     Coroutine,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedBindingQualifiers {
+    qualifiers: BindingQualifiers,
+    binding_token: Token,
+    value_token: Option<Token>,
+}
+
 impl<I> Parser<I>
 where
     I: Iterator<Item = Result<Token, LexError>>,
@@ -378,10 +394,13 @@ where
     }
 
     fn statement(&mut self) -> ParseResult<Statement> {
-        match self.current()?.kind {
+        let token = self.current()?;
+        match token.kind {
             TokenKind::Fn => self.function_statement(),
-            TokenKind::Const => self.binding_statement(BindingMutability::Const),
-            TokenKind::Mut => self.binding_statement(BindingMutability::Mut),
+            TokenKind::Const | TokenKind::Mut => self.binding_statement(),
+            TokenKind::VConst | TokenKind::VMut => {
+                Err(self.value_capability_without_binding_error(token).into())
+            }
             TokenKind::Defer => self.call_statement(CallStatementKind::Defer),
             TokenKind::Co => self.call_statement(CallStatementKind::Coroutine),
             TokenKind::Break => self.break_statement(),
@@ -449,32 +468,61 @@ where
 
     fn function_parameter(&mut self, allow_receiver: bool) -> ParseResult<FunctionParameter> {
         let first = self.current()?;
-        let (mutability, start) = if first.kind == TokenKind::Mut {
-            self.advance()?;
-            (BindingMutability::Mut, first.span.start)
-        } else {
-            (BindingMutability::Const, first.span.start)
-        };
-        let parameter = self.current()?;
-
-        if allow_receiver && parameter.kind == TokenKind::SelfValue {
+        if allow_receiver && first.kind == TokenKind::SelfValue {
             let receiver = self.advance()?;
             return Ok(FunctionParameter::new(
-                mutability,
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
                 FunctionParameterKind::Receiver {
                     name: receiver.span,
                 },
-                Span::new(self.module_id, start, receiver.span.end),
+                receiver.span,
             ));
         }
 
+        let parsed_qualifiers = self.optional_binding_qualifiers()?;
+        let parameter = self.current()?;
+
+        if allow_receiver && parameter.kind == TokenKind::SelfValue {
+            let parsed = parsed_qualifiers.expect("a qualified receiver has a qualifier");
+            if parsed.binding_token.kind != TokenKind::Mut || parsed.value_token.is_some() {
+                let span = parsed
+                    .value_token
+                    .map_or(parsed.binding_token.span, |token| token.span);
+                return Err(ParseError {
+                    kind: ParseErrorKind::InvalidReceiverQualifiers,
+                    span,
+                }
+                .into());
+            }
+
+            let receiver = self.advance()?;
+            return Ok(FunctionParameter::new(
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut),
+                FunctionParameterKind::Receiver {
+                    name: receiver.span,
+                },
+                Span::new(
+                    self.module_id,
+                    parsed.binding_token.span.start,
+                    receiver.span.end,
+                ),
+            ));
+        }
+
+        let qualifiers = parsed_qualifiers.map_or(
+            BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
+            |parsed| parsed.qualifiers,
+        );
+        let start = parsed_qualifiers.map_or(first.span.start, |parsed| {
+            parsed.binding_token.span.start
+        });
         let name = self.expect(TokenKind::Identifier)?;
         self.expect(TokenKind::Colon)?;
-        let type_annotation = self.type_expression()?;
+        let type_annotation = self.binding_type_annotation()?;
         let span = Span::new(self.module_id, start, type_annotation.span.end);
 
         Ok(FunctionParameter::new(
-            mutability,
+            qualifiers,
             FunctionParameterKind::Named {
                 name: name.span,
                 type_annotation,
@@ -483,12 +531,14 @@ where
         ))
     }
 
-    fn binding_statement(&mut self, mutability: BindingMutability) -> ParseResult<Statement> {
-        let keyword = self.advance()?;
+    fn binding_statement(&mut self) -> ParseResult<Statement> {
+        let parsed = self
+            .optional_binding_qualifiers()?
+            .expect("a binding statement starts with const or mut");
         let name = self.expect(TokenKind::Identifier)?;
         let type_annotation = if self.current()?.kind == TokenKind::Colon {
             self.advance()?;
-            Some(self.type_expression()?)
+            Some(self.binding_type_annotation()?)
         } else {
             None
         };
@@ -499,13 +549,88 @@ where
 
         Ok(Statement::new(
             StatementKind::Binding {
-                mutability,
+                qualifiers: parsed.qualifiers,
                 name: name.span,
                 type_annotation,
                 initializer,
             },
-            Span::new(self.module_id, keyword.span.start, semicolon.span.end),
+            Span::new(
+                self.module_id,
+                parsed.binding_token.span.start,
+                semicolon.span.end,
+            ),
         ))
+    }
+
+    fn optional_binding_qualifiers(&mut self) -> ParseResult<Option<ParsedBindingQualifiers>> {
+        let binding_token = self.current()?;
+        let (binding, default_value, allowed_override) = match binding_token.kind {
+            TokenKind::Const => (
+                BindingMutability::Const,
+                ValueCapability::Const,
+                TokenKind::VMut,
+            ),
+            TokenKind::Mut => (
+                BindingMutability::Mut,
+                ValueCapability::Mut,
+                TokenKind::VConst,
+            ),
+            TokenKind::VConst | TokenKind::VMut => {
+                return Err(self.value_capability_without_binding_error(binding_token).into());
+            }
+            _ => return Ok(None),
+        };
+
+        self.advance()?;
+        let token = self.current()?;
+        let (value, value_token) = match token.kind {
+            TokenKind::VConst | TokenKind::VMut if token.kind == allowed_override => {
+                self.advance()?;
+                let value = if token.kind == TokenKind::VMut {
+                    ValueCapability::Mut
+                } else {
+                    ValueCapability::Const
+                };
+                (value, Some(token))
+            }
+            TokenKind::VConst | TokenKind::VMut => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::InvalidBindingQualifiers {
+                        binding: binding_token.kind,
+                        value: token.kind,
+                    },
+                    span: token.span,
+                }
+                .into());
+            }
+            _ => (default_value, None),
+        };
+
+        Ok(Some(ParsedBindingQualifiers {
+            qualifiers: BindingQualifiers::new(binding, value),
+            binding_token,
+            value_token,
+        }))
+    }
+
+    fn binding_type_annotation(&mut self) -> ParseResult<TypeSyntax> {
+        let type_annotation = self.type_expression()?;
+        if outer_mutable_type(&type_annotation) {
+            return Err(ParseError {
+                kind: ParseErrorKind::BindingValueCapabilityMustPrecedeName,
+                span: type_annotation.span,
+            }
+            .into());
+        }
+
+        Ok(type_annotation)
+    }
+
+    fn value_capability_without_binding_error(&self, token: Token) -> ParseError {
+        ParseError {
+            kind: ParseErrorKind::ValueCapabilityWithoutBinding { found: token.kind },
+            span: token.span,
+        }
     }
 
     fn expression_statement(&mut self) -> ParseResult<Statement> {
@@ -1440,11 +1565,11 @@ where
                 TokenKind::Fn => {
                     statements.push(self.function_statement()?);
                 }
-                TokenKind::Const => {
-                    statements.push(self.binding_statement(BindingMutability::Const)?);
+                TokenKind::Const | TokenKind::Mut => {
+                    statements.push(self.binding_statement()?);
                 }
-                TokenKind::Mut => {
-                    statements.push(self.binding_statement(BindingMutability::Mut)?);
+                TokenKind::VConst | TokenKind::VMut => {
+                    return Err(self.value_capability_without_binding_error(token).into());
                 }
                 TokenKind::Defer => {
                     statements.push(self.call_statement(CallStatementKind::Defer)?);
@@ -2011,6 +2136,14 @@ const fn expected_call_error(kind: CallStatementKind) -> ParseErrorKind {
     }
 }
 
+fn outer_mutable_type(type_syntax: &TypeSyntax) -> bool {
+    match &type_syntax.kind {
+        TypeKind::Mutable(_) => true,
+        TypeKind::Group(inner) => outer_mutable_type(inner),
+        _ => false,
+    }
+}
+
 const fn builtin_type_argument_count(builtin: BuiltinType) -> usize {
     match builtin {
         BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Error => 1,
@@ -2523,7 +2656,10 @@ mod tests {
         let read = &stream.requirements[0];
         assert_eq!(&source[read.name.start..read.name.end], "read");
         assert_eq!(read.parameters.len(), 2);
-        assert_eq!(read.parameters[0].mutability, BindingMutability::Mut);
+        assert_eq!(
+            read.parameters[0].qualifiers,
+            BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut)
+        );
         assert!(matches!(
             &read.parameters[0].kind,
             FunctionParameterKind::Receiver { .. }
@@ -2824,7 +2960,10 @@ mod tests {
         assert_eq!(function.name, span(3, 6));
         assert_eq!(function.parameters.len(), 2);
         assert_eq!(function.parameters[0].span, span(7, 16));
-        assert_eq!(function.parameters[0].mutability, BindingMutability::Const);
+        assert_eq!(
+            function.parameters[0].qualifiers,
+            BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const)
+        );
         let FunctionParameterKind::Named {
             name,
             type_annotation,
@@ -2839,7 +2978,10 @@ mod tests {
         ));
         assert_eq!(type_annotation.span, span(13, 16));
         assert_eq!(function.parameters[1].span, span(18, 32));
-        assert_eq!(function.parameters[1].mutability, BindingMutability::Mut);
+        assert_eq!(
+            function.parameters[1].qualifiers,
+            BindingQualifiers::new(BindingMutability::Mut, ValueCapability::Mut)
+        );
         let return_type = function
             .return_type
             .as_ref()
@@ -2877,7 +3019,10 @@ mod tests {
 
         assert_eq!(function.parameters.len(), 2);
         assert_eq!(function.parameters[0].span, span(10, 18));
-        assert_eq!(function.parameters[0].mutability, BindingMutability::Mut);
+        assert_eq!(
+            function.parameters[0].qualifiers,
+            BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut)
+        );
         let FunctionParameterKind::Receiver { name } = &function.parameters[0].kind else {
             panic!("expected a receiver parameter");
         };
@@ -2976,7 +3121,10 @@ mod tests {
 
         assert_eq!(expression.span, span(0, 64));
         assert_eq!(parameters.len(), 2);
-        assert_eq!(parameters[0].mutability, BindingMutability::Const);
+        assert_eq!(
+            parameters[0].qualifiers,
+            BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const)
+        );
         assert_eq!(parameters[0].span, span(7, 17));
         let FunctionParameterKind::Named {
             name,
@@ -2991,7 +3139,10 @@ mod tests {
             TypeKind::Primitive(PrimitiveType::Int)
         ));
         assert_eq!(type_annotation.span, span(14, 17));
-        assert_eq!(parameters[1].mutability, BindingMutability::Mut);
+        assert_eq!(
+            parameters[1].qualifiers,
+            BindingQualifiers::new(BindingMutability::Mut, ValueCapability::Mut)
+        );
         assert_eq!(parameters[1].span, span(19, 37));
         let FunctionParameterKind::Named {
             name,
@@ -3463,7 +3614,10 @@ mod tests {
             parse_statement_source("const count = 10;"),
             Ok(Statement::new(
                 StatementKind::Binding {
-                    mutability: BindingMutability::Const,
+                    qualifiers: BindingQualifiers::new(
+                        BindingMutability::Const,
+                        ValueCapability::Const,
+                    ),
                     name: span(6, 11),
                     type_annotation: None,
                     initializer: integer(span(14, 16)),
@@ -3478,7 +3632,7 @@ mod tests {
         let statement = parse_statement_source("mut value: int = 1 + 2;")
             .expect("annotated mutable binding should parse");
         let StatementKind::Binding {
-            mutability,
+            qualifiers,
             name,
             type_annotation: Some(type_annotation),
             initializer,
@@ -3487,7 +3641,10 @@ mod tests {
             panic!("expected an annotated binding statement");
         };
 
-        assert_eq!(mutability, BindingMutability::Mut);
+        assert_eq!(
+            qualifiers,
+            BindingQualifiers::new(BindingMutability::Mut, ValueCapability::Mut)
+        );
         assert_eq!(name, span(4, 9));
         assert_eq!(
             type_annotation,
@@ -3502,6 +3659,168 @@ mod tests {
         ));
         assert_eq!(initializer.span, span(17, 22));
         assert_eq!(statement.span, span(0, 23));
+    }
+
+    #[test]
+    fn parses_all_binding_and_value_qualifier_combinations() {
+        for (source, expected) in [
+            (
+                "const value = 1;",
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
+            ),
+            (
+                "mut value = 1;",
+                BindingQualifiers::new(BindingMutability::Mut, ValueCapability::Mut),
+            ),
+            (
+                "const vmut value = 1;",
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut),
+            ),
+            (
+                "mut vconst value = 1;",
+                BindingQualifiers::new(BindingMutability::Mut, ValueCapability::Const),
+            ),
+        ] {
+            let statement = parse_statement_source(source).expect("binding should parse");
+            let StatementKind::Binding { qualifiers, .. } = statement.kind else {
+                panic!("expected a binding statement");
+            };
+
+            assert_eq!(qualifiers, expected, "incorrect qualifiers for {source}");
+        }
+    }
+
+    #[test]
+    fn value_capability_precedes_an_annotated_binding_name() {
+        for (source, expected) in [
+            (
+                "const vmut user: User = other;",
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut),
+            ),
+            (
+                "mut vconst user: User = other;",
+                BindingQualifiers::new(BindingMutability::Mut, ValueCapability::Const),
+            ),
+        ] {
+            let statement = parse_statement_source(source).expect("binding should parse");
+            let StatementKind::Binding {
+                qualifiers,
+                type_annotation: Some(type_annotation),
+                ..
+            } = statement.kind
+            else {
+                panic!("expected an annotated binding statement");
+            };
+
+            assert_eq!(qualifiers, expected, "incorrect qualifiers for {source}");
+            assert!(matches!(type_annotation.kind, TypeKind::Named { .. }));
+        }
+
+        parse_statement_source("const value: Queue<mut User> = other;")
+            .expect("nested mutable type arguments should remain valid");
+    }
+
+    #[test]
+    fn parses_binding_qualifiers_on_named_parameters() {
+        let source = concat!(
+            "fn use(",
+            "plain: User, ",
+            "const explicit: User, ",
+            "mut both: User, ",
+            "const vmut fixed_mut: User, ",
+            "mut vconst moving_const: User",
+            ") {}",
+        );
+        let statement = parse_statement_source(source).expect("parameters should parse");
+        let StatementKind::Function(function) = statement.kind else {
+            panic!("expected a function");
+        };
+
+        assert_eq!(
+            function
+                .parameters
+                .iter()
+                .map(|parameter| parameter.qualifiers)
+                .collect::<Vec<_>>(),
+            vec![
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
+                BindingQualifiers::new(BindingMutability::Mut, ValueCapability::Mut),
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut),
+                BindingQualifiers::new(BindingMutability::Mut, ValueCapability::Const),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_misplaced_value_capabilities() {
+        for (source, expected_kind, needle) in [
+            (
+                "const vconst value = 1;",
+                ParseErrorKind::InvalidBindingQualifiers {
+                    binding: TokenKind::Const,
+                    value: TokenKind::VConst,
+                },
+                "vconst",
+            ),
+            (
+                "mut vmut value = 1;",
+                ParseErrorKind::InvalidBindingQualifiers {
+                    binding: TokenKind::Mut,
+                    value: TokenKind::VMut,
+                },
+                "vmut",
+            ),
+            (
+                "vmut value = 1;",
+                ParseErrorKind::ValueCapabilityWithoutBinding {
+                    found: TokenKind::VMut,
+                },
+                "vmut",
+            ),
+            (
+                "const value: mut User = other;",
+                ParseErrorKind::BindingValueCapabilityMustPrecedeName,
+                "mut User",
+            ),
+            (
+                "fn use(value: mut User) {}",
+                ParseErrorKind::BindingValueCapabilityMustPrecedeName,
+                "mut User",
+            ),
+            (
+                "fn use(const vmut self) {}",
+                ParseErrorKind::InvalidReceiverQualifiers,
+                "vmut",
+            ),
+            (
+                "fn use(mut vconst self) {}",
+                ParseErrorKind::InvalidReceiverQualifiers,
+                "vconst",
+            ),
+            (
+                "fn use(const self) {}",
+                ParseErrorKind::InvalidReceiverQualifiers,
+                "const",
+            ),
+            (
+                "fn use(vmut self) {}",
+                ParseErrorKind::ValueCapabilityWithoutBinding {
+                    found: TokenKind::VMut,
+                },
+                "vmut",
+            ),
+        ] {
+            let start = source.find(needle).expect("diagnostic text should exist");
+            assert_eq!(
+                parse_statement_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: expected_kind,
+                    span: span(start, start + needle.len()),
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
     }
 
     #[test]
@@ -4623,7 +4942,10 @@ mod tests {
         assert!(matches!(
             &block.statements[0].kind,
             StatementKind::Binding {
-                mutability: BindingMutability::Const,
+                qualifiers: BindingQualifiers {
+                    binding: BindingMutability::Const,
+                    value: ValueCapability::Const,
+                },
                 ..
             }
         ));
@@ -6164,6 +6486,22 @@ mod tests {
             &members[1].kind,
             TypeKind::Primitive(PrimitiveType::None)
         ));
+    }
+
+    #[test]
+    fn value_capability_keywords_are_not_type_qualifiers() {
+        for (source, found) in [
+            ("vconst User", TokenKind::VConst),
+            ("vmut User", TokenKind::VMut),
+        ] {
+            assert_eq!(
+                parse_type_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::ExpectedType { found },
+                    span: span(0, source.find(' ').expect("type has a space")),
+                }))
+            );
+        }
     }
 
     #[test]

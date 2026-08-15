@@ -191,6 +191,18 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::RangeBoundRequiresGrouping => {
             "complex range bounds must be parenthesized".to_owned()
         }
+        ParseErrorKind::InvalidBindingQualifiers { binding, value } => {
+            format!("{value:?} cannot follow {binding:?} in a binding")
+        }
+        ParseErrorKind::ValueCapabilityWithoutBinding { found } => {
+            format!("{found:?} must follow const or mut in a binding")
+        }
+        ParseErrorKind::InvalidReceiverQualifiers => {
+            "a receiver must be written as self or mut self".to_owned()
+        }
+        ParseErrorKind::BindingValueCapabilityMustPrecedeName => {
+            "a binding's value capability must be written before its name".to_owned()
+        }
         ParseErrorKind::ExpectedToken { expected, found } => {
             format!("expected {expected:?}, found {found:?}")
         }
@@ -374,6 +386,34 @@ mod tests {
                 span: Span::new(ModuleId::PRELUDE, 0, 1),
             }),
             "complex range bounds must be parenthesized"
+        );
+    }
+
+    #[test]
+    fn describes_invalid_binding_and_value_qualifiers() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::InvalidBindingQualifiers {
+                    binding: sao_compiler::lexer::TokenKind::Const,
+                    value: sao_compiler::lexer::TokenKind::VConst,
+                },
+                span: Span::new(ModuleId::PRELUDE, 6, 12),
+            }),
+            "VConst cannot follow Const in a binding"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::InvalidReceiverQualifiers,
+                span: Span::new(ModuleId::PRELUDE, 9, 13),
+            }),
+            "a receiver must be written as self or mut self"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::BindingValueCapabilityMustPrecedeName,
+                span: Span::new(ModuleId::PRELUDE, 12, 20),
+            }),
+            "a binding's value capability must be written before its name"
         );
     }
 }

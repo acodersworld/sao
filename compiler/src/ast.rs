@@ -318,7 +318,9 @@ impl Function {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionParameter {
     pub id: NodeId,
-    pub mutability: BindingMutability,
+    /// The independent mutability of the parameter binding and access through
+    /// the value held by that binding.
+    pub qualifiers: BindingQualifiers,
     pub kind: FunctionParameterKind,
     pub span: Span,
 }
@@ -326,13 +328,13 @@ pub struct FunctionParameter {
 impl FunctionParameter {
     #[must_use]
     pub const fn new(
-        mutability: BindingMutability,
+        qualifiers: BindingQualifiers,
         kind: FunctionParameterKind,
         span: Span,
     ) -> Self {
         Self {
             id: NodeId::UNASSIGNED,
-            mutability,
+            qualifiers,
             kind,
             span,
         }
@@ -363,7 +365,7 @@ pub enum ConditionalElse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementKind {
     Binding {
-        mutability: BindingMutability,
+        qualifiers: BindingQualifiers,
         name: Span,
         type_annotation: Option<TypeSyntax>,
         initializer: Expression,
@@ -381,11 +383,32 @@ pub enum StatementKind {
     Return(Option<Expression>),
 }
 
-/// Whether a binding or parameter has const/default or mutable access.
+/// Whether a binding's storage is fixed or may be reassigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingMutability {
     Const,
     Mut,
+}
+
+/// Whether access through a value is const or mutable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueCapability {
+    Const,
+    Mut,
+}
+
+/// The two independent qualifiers carried by a local or parameter binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindingQualifiers {
+    pub binding: BindingMutability,
+    pub value: ValueCapability,
+}
+
+impl BindingQualifiers {
+    #[must_use]
+    pub const fn new(binding: BindingMutability, value: ValueCapability) -> Self {
+        Self { binding, value }
+    }
 }
 
 /// Whether a range loop includes its end bound.

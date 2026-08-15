@@ -195,7 +195,7 @@ fn format_statement_into(
 
     match &statement.kind {
         StatementKind::Binding {
-            mutability,
+            qualifiers,
             name,
             type_annotation,
             initializer,
@@ -204,7 +204,9 @@ fn format_statement_into(
                 output,
                 depth,
                 format_args!(
-                    "Binding {mutability:?} {:?} {}",
+                    "Binding binding={:?} value={:?} {:?} {}",
+                    qualifiers.binding,
+                    qualifiers.value,
                     text(source, *name),
                     location(span)
                 ),
@@ -301,8 +303,9 @@ fn format_parameter_into(
                 output,
                 depth,
                 format_args!(
-                    "Parameter {:?} {:?} {}",
-                    parameter.mutability,
+                    "Parameter binding={:?} value={:?} {:?} {}",
+                    parameter.qualifiers.binding,
+                    parameter.qualifiers.value,
                     text(source, *name),
                     location(parameter.span)
                 ),
@@ -314,8 +317,9 @@ fn format_parameter_into(
                 output,
                 depth,
                 format_args!(
-                    "Parameter {:?} Self {}",
-                    parameter.mutability,
+                    "Parameter binding={:?} value={:?} Self {}",
+                    parameter.qualifiers.binding,
+                    parameter.qualifiers.value,
                     location(parameter.span)
                 ),
             );
@@ -902,7 +906,7 @@ mod tests {
         assert!(output.contains("Field \"x\" @ 15..24"));
         assert!(output.contains("Primitive Float @ 18..23"));
         assert!(output.contains("Function \"get_x\" @ 25..59"));
-        assert!(output.contains("Parameter Const Self"));
+        assert!(output.contains("Parameter binding=Const value=Const Self"));
     }
 
     #[test]
@@ -919,8 +923,8 @@ mod tests {
         assert!(output.contains(&format!("Interface \"Writer\" @ 0..{}", source.len())));
         assert!(output.contains("requirements:"));
         assert!(output.contains("MethodRequirement \"write\""));
-        assert!(output.contains("Parameter Mut Self"));
-        assert!(output.contains("Parameter Const \"data\""));
+        assert!(output.contains("Parameter binding=Const value=Mut Self"));
+        assert!(output.contains("Parameter binding=Const value=Const \"data\""));
         assert!(output.contains("Primitive Bytes"));
         assert!(output.contains("Primitive Int"));
         assert!(output.contains("MethodRequirement \"close\""));
@@ -1080,8 +1084,18 @@ mod tests {
 
         assert_eq!(
             format_statement(&module(source), &statement),
-            "Binding Mut \"total\" @ 0..32\n  type:\n    Primitive Int @ 11..14\n  initializer:\n    Binary Add @ 17..31\n      left:\n        Identifier \"first\" @ 17..22\n      right:\n        Identifier \"second\" @ 25..31"
+            "Binding binding=Mut value=Mut \"total\" @ 0..32\n  type:\n    Primitive Int @ 11..14\n  initializer:\n    Binary Add @ 17..31\n      left:\n        Identifier \"first\" @ 17..22\n      right:\n        Identifier \"second\" @ 25..31"
         );
+
+        let source = "const vmut user = other;";
+        let statement = parse_statement_source(source);
+        assert!(format_statement(&module(source), &statement)
+            .starts_with("Binding binding=Const value=Mut \"user\""));
+
+        let source = "mut vconst view = other;";
+        let statement = parse_statement_source(source);
+        assert!(format_statement(&module(source), &statement)
+            .starts_with("Binding binding=Mut value=Const \"view\""));
     }
 
     #[test]
@@ -1130,7 +1144,7 @@ mod tests {
 
         assert_eq!(
             format_expression(&module(source), &expression),
-            "Block @ 0..22\n  statements:\n    [0]:\n      Binding Const \"x\" @ 2..14\n        initializer:\n          Literal Integer \"1\" @ 12..13\n  value:\n    Binary Add @ 15..20\n      left:\n        Identifier \"x\" @ 15..16\n      right:\n        Literal Integer \"2\" @ 19..20"
+            "Block @ 0..22\n  statements:\n    [0]:\n      Binding binding=Const value=Const \"x\" @ 2..14\n        initializer:\n          Literal Integer \"1\" @ 12..13\n  value:\n    Binary Add @ 15..20\n      left:\n        Identifier \"x\" @ 15..16\n      right:\n        Literal Integer \"2\" @ 19..20"
         );
     }
 
@@ -1246,7 +1260,7 @@ mod tests {
 
         assert_eq!(
             format_expression(&module(source), &expression),
-            "Lambda @ 0..35\n  parameters:\n    [0]:\n      Parameter Const \"value\" @ 7..17\n        type:\n          Primitive Int @ 14..17\n  return_type:\n    Primitive Int @ 22..25\n  body:\n    Block @ 26..35\n      statements:\n        (empty)\n      value:\n        Identifier \"value\" @ 28..33"
+            "Lambda @ 0..35\n  parameters:\n    [0]:\n      Parameter binding=Const value=Const \"value\" @ 7..17\n        type:\n          Primitive Int @ 14..17\n  return_type:\n    Primitive Int @ 22..25\n  body:\n    Block @ 26..35\n      statements:\n        (empty)\n      value:\n        Identifier \"value\" @ 28..33"
         );
     }
 
@@ -1257,7 +1271,7 @@ mod tests {
 
         assert_eq!(
             format_statement(&module(source), &statement),
-            "Function \"add\" @ 0..65\n  parameters:\n    [0]:\n      Parameter Const \"left\" @ 7..16\n        type:\n          Primitive Int @ 13..16\n    [1]:\n      Parameter Mut \"right\" @ 18..32\n        type:\n          Primitive Int @ 29..32\n  return_type:\n    Primitive Int @ 37..40\n  body:\n    Block @ 41..65\n      statements:\n        [0]:\n          Return @ 43..63\n            value:\n              Binary Add @ 50..62\n                left:\n                  Identifier \"left\" @ 50..54\n                right:\n                  Identifier \"right\" @ 57..62\n      value:\n        (none)"
+            "Function \"add\" @ 0..65\n  parameters:\n    [0]:\n      Parameter binding=Const value=Const \"left\" @ 7..16\n        type:\n          Primitive Int @ 13..16\n    [1]:\n      Parameter binding=Mut value=Mut \"right\" @ 18..32\n        type:\n          Primitive Int @ 29..32\n  return_type:\n    Primitive Int @ 37..40\n  body:\n    Block @ 41..65\n      statements:\n        [0]:\n          Return @ 43..63\n            value:\n              Binary Add @ 50..62\n                left:\n                  Identifier \"left\" @ 50..54\n                right:\n                  Identifier \"right\" @ 57..62\n      value:\n        (none)"
         );
     }
 
@@ -1267,7 +1281,7 @@ mod tests {
         let statement = parse_statement_source(source);
         let output = format_statement(&module(source), &statement);
 
-        assert!(output.contains("Parameter Mut Self @ 8..16"));
+        assert!(output.contains("Parameter binding=Const value=Mut Self @ 8..16"));
         assert!(output.contains("return_type:\n    (default ())"));
         assert!(output.contains("Return @ 20..27\n            value:\n              (none)"));
     }

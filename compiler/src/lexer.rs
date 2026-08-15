@@ -114,10 +114,14 @@ define_token_kinds! {
     #[token("struct")] Struct,
     // Begins a named structural interface declaration.
     #[token("interface")] Interface,
-    // Declares an immutable local binding.
+    // Declares a fixed binding with const value access by default.
     #[token("const")] Const,
-    // Declares mutable access or a mutable binding.
+    // Declares a reassignable binding with mutable value access by default.
     #[token("mut")] Mut,
+    // Selects const value access when it differs from binding mutability.
+    #[token("vconst")] VConst,
+    // Selects mutable value access when it differs from binding mutability.
+    #[token("vmut")] VMut,
     // Refers to the receiver of the current method.
     #[token("self")] SelfValue,
     // Begins a conditional expression.
@@ -659,10 +663,10 @@ mod tests {
     #[test]
     fn lexes_keywords_and_identifiers() {
         let source = concat!(
-            "fn lambda struct interface const mut self if else loop while for in break continue ",
+            "fn lambda struct interface const mut vconst vmut self if else loop while for in break continue ",
             "return is co defer true false none int float bool char string bytes ",
             "Queue Vector Map Error ",
-            "name _private fnord",
+            "name _private fnord vconstant vmutable",
         );
 
         assert_eq!(
@@ -674,6 +678,8 @@ mod tests {
                 TokenKind::Interface,
                 TokenKind::Const,
                 TokenKind::Mut,
+                TokenKind::VConst,
+                TokenKind::VMut,
                 TokenKind::SelfValue,
                 TokenKind::If,
                 TokenKind::Else,
@@ -700,6 +706,8 @@ mod tests {
                 TokenKind::Vector,
                 TokenKind::Map,
                 TokenKind::Error,
+                TokenKind::Identifier,
+                TokenKind::Identifier,
                 TokenKind::Identifier,
                 TokenKind::Identifier,
                 TokenKind::Identifier,

@@ -17,7 +17,7 @@ const count: int = 10;
 const ratio: float = 0.5;
 ```
 
-Binding mutability is explicit:
+Binding mutability and value access are explicit:
 
 ```text
 mut position: int = 0;
@@ -28,9 +28,36 @@ origin = 1; // Type error: a const binding cannot be reassigned.
 ```
 
 `const` and `mut` declare local bindings; SAO has no `let` keyword and no
-unqualified local declaration. A `const` binding cannot be reassigned or used
-to mutate a referenced object. A `mut` binding can be reassigned and permits
-mutation through its reference.
+unqualified local declaration. A single qualifier applies to both the binding
+and access through its value. A `const` binding cannot be reassigned and has
+const value access. A `mut` binding can be reassigned and has mutable value
+access.
+
+The `vmut` and `vconst` binding modifiers express the two mixed cases:
+
+| Declaration | Binding | Value access |
+| --- | --- | --- |
+| `const value` | const | const |
+| `mut value` | mut | mut |
+| `const vmut value` | const | mut |
+| `mut vconst value` | mut | const |
+
+The first qualifier always controls whether the binding may be reassigned. An
+optional `vmut` or `vconst` overrides only access through its value. These value
+modifiers occur only on bindings; standalone type syntax continues to use
+`mut Type`, with an unqualified type defaulting to const access. For an
+annotated binding the value modifier must precede the name:
+
+```text
+const vmut fixed: User = User { name: "Ben" };
+mut vconst view: User = fixed;
+
+fixed.name = "Benjamin"; // Allowed through mutable value access.
+fixed = another_user;    // Type error: the binding is const.
+
+view = another_user;     // Allowed: the binding is mutable.
+view.name = "Robert";    // Type error: the value access is const.
+```
 
 Local bindings may shadow earlier local bindings and parameters, including in
 the same lexical block. The initializer is resolved and evaluated before the
@@ -47,8 +74,8 @@ references remain resolved to the earlier declaration. This permission applies
 to local binding shadowing, not to duplicate parameters or duplicate named
 function, struct, or interface declarations, which are compile-time errors.
 
-For reference types, `const` is a transitive read-only access capability rather
-than a deep-immutability guarantee:
+For reference types, const value access is a transitive read-only capability
+rather than a deep-immutability guarantee:
 
 ```text
 mut user = User { name: "Ben" };
@@ -75,21 +102,25 @@ mut copy = original; // Allowed: int is copied by value.
 copy += 1;
 ```
 
-Function parameters are const by default and omit the `const` keyword. A
-parameter that requires mutable access is marked `mut`:
+Function parameters are bindings and use the same qualifier combinations. They
+are const by default and may omit the `const` keyword:
 
 ```text
 fn display(user: User) -> () {
     print(user.name);
 }
 
-fn rename(mut user: User, name: string) -> () {
+fn rename(const vmut user: User, name: string) -> () {
     user.name = name;
 }
 ```
 
-A `mut` argument may be passed to either parameter form. A `const` argument may
-only be passed to the default const form.
+A parameter written `mut user: User` permits both rebinding the parameter and
+mutable access through it. `const vmut` permits mutable access without allowing
+the parameter itself to be reassigned, while `mut vconst` permits reassignment
+between const values. An argument with mutable value access may be passed where
+either const or mutable value access is accepted. An argument with only const
+value access cannot satisfy a mutable-access parameter.
 
 The induction binding of a range `for` loop is always immutable and is controlled
 by the loop. It is written without `const`; `mut` is not permitted for this
@@ -120,9 +151,12 @@ Callable types also carry a capability, but it describes mutation of captured
 callable state rather than general side effects. A callable written
 `fn(Parameters) -> Return` does not mutate its captured environment when
 invoked. A callable written `mut fn(Parameters) -> Return` may do so. Calling a
-mutable callable requires mutable access to the callable, and a mutable callable
-cannot initialize a `const` binding or be passed where a const callable is
-required.
+mutable callable requires mutable value access to the callable. Its containing
+binding may still be fixed:
+
+```text
+const vmut next: fn() -> int = make_counter();
+```
 
 A const callable may be used where a mutable callable is expected because
 allowing a non-mutating implementation in a context that permits mutation is
@@ -132,10 +166,12 @@ functions with externally visible effects. It only guarantees that invocation
 does not mutate state captured by that callable value. Named functions cannot
 capture lexical state and therefore produce const callable values.
 
-Lambda capability is determined conservatively from its captures. A lambda
-that captures any `mut` binding has a mutable callable type, regardless of
-whether its body actually mutates or only reads that binding. A lambda whose
-captures are all const has a const callable type.
+Lambda capability is determined conservatively from its captures. A lambda has
+a mutable callable type when any captured binding has mutable binding storage
+or mutable value access, regardless of whether its body actually uses that
+mutability. A lambda whose captures are const on both axes has a const callable
+type. The qualifiers of the binding receiving a lambda constrain how that
+callable may be used; they do not determine the lambda's inferred capability.
 
 ## 3.1 Primitive types
 

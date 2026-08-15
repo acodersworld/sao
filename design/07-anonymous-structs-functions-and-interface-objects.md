@@ -154,18 +154,19 @@ The inferred callable type of `scale` is the single type
 captured environment.
 
 Callable capability is determined solely from capture capabilities. A lambda
-that captures any `mut` binding has a `mut fn(...) -> ...` type, regardless of
-whether its body mutates or only reads that binding. A lambda whose captures are
-all const has a const `fn(...) -> ...` type. This conservative rule avoids
-classifying callable capability from the operations performed by the body.
+has a `mut fn(...) -> ...` type if any captured binding has mutable binding
+storage or mutable value access, regardless of whether its body uses that
+mutability. A lambda whose captures are const on both axes has a const
+`fn(...) -> ...` type. This conservative rule avoids classifying callable
+capability from the operations performed by the body.
 
-Mutable captures are shared, and a lambda that changes one must be held with
-mutable access:
+Mutable captures are shared, and any lambda with a mutable capture must be held
+with mutable value access:
 
 ```text
 mut count = 0;
 
-mut next = lambda() -> int {
+const vmut next = lambda() -> int {
     count += 1;
     count
 };
@@ -175,10 +176,10 @@ next(); // 2
 // count is now 2
 ```
 
-The inferred type of `next` is `mut fn() -> int`. Binding that lambda with
-`const` instead is a type error because invoking it changes captured state.
-Calling a mutable callable likewise requires mutable access to its binding or
-other containing place.
+The inferred type of the lambda is `mut fn() -> int`. The `const` qualifier
+keeps `next` bound to that callable, while `vmut` provides the mutable value
+access required to invoke it. Writing only `const next` is a type error because
+that binding would provide only const access to a mutable callable.
 
 If several lambdas capture the same mutable binding, they observe
 the same storage. SAO has no ownership-transfer or `move` capture modifier.
