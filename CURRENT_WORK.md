@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-14
+Last reviewed: 2026-08-15
 
 ## Current phase
 
@@ -43,13 +43,12 @@ reviewable phases:
 
 1. Semantic type foundation (in progress)
    - Complete: a program-local canonical type interner with opaque type
-     identities, capability-qualified primitives, copied/reference value
-     metadata, and internal recovery and divergence types.
-   - Next: represent callables, named and anonymous structs, interfaces, and
-     compiler-known built-ins while retaining `const` and `mut` information for
-     copied and reference values.
-   - Add canonical union and intersection normalization, then complete the
-     foundation's identity, equality, and type-metadata APIs.
+     identities; capability-qualified primitives and callables; nominal named
+     and anonymous structs; declared structural interfaces; compiler-known
+     built-ins; copied/reference value metadata; and internal recovery and
+     divergence types.
+   - Next: add canonical union and intersection normalization, then complete
+     the foundation's identity, equality, and type-metadata APIs.
 2. Declarations and signatures
    - Resolve type syntax and collect struct fields, methods, interface
      requirements, callable signatures, and built-in signatures before checking

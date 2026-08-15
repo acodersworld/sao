@@ -3721,6 +3721,44 @@ mod tests {
     }
 
     #[test]
+    fn value_capability_applies_to_an_annotated_callable_binding() {
+        let statement = parse_statement_source(
+            "const vmut callback: fn(mut User) -> () = make_callback();",
+        )
+        .expect("mutable callable binding should parse");
+        let StatementKind::Binding {
+            qualifiers,
+            type_annotation: Some(type_annotation),
+            ..
+        } = statement.kind
+        else {
+            panic!("expected an annotated binding statement");
+        };
+
+        assert_eq!(
+            qualifiers,
+            BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut)
+        );
+        let TypeKind::Callable {
+            parameters,
+            return_type,
+        } = type_annotation.kind
+        else {
+            panic!("expected a callable type annotation");
+        };
+        assert_eq!(parameters.len(), 1);
+        assert!(matches!(
+            &parameters[0].kind,
+            TypeKind::Mutable(inner)
+                if matches!(&inner.kind, TypeKind::Named { .. })
+        ));
+        assert!(matches!(
+            return_type.kind,
+            TypeKind::Primitive(PrimitiveType::Unit)
+        ));
+    }
+
+    #[test]
     fn parses_binding_qualifiers_on_named_parameters() {
         let source = concat!(
             "fn use(",

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ast::PrimitiveType;
+use crate::ast::{BuiltinType, NodeId, PrimitiveType};
 
 /// The canonical identity of one semantic type within a [`TypeStore`].
 ///
@@ -30,6 +30,28 @@ pub enum SemanticType {
         primitive: PrimitiveType,
         capability: AccessCapability,
     },
+    Callable {
+        parameters: Vec<TypeId>,
+        return_type: TypeId,
+        capability: AccessCapability,
+    },
+    NamedStruct {
+        declaration: NodeId,
+        capability: AccessCapability,
+    },
+    AnonymousStruct {
+        expression: NodeId,
+        capability: AccessCapability,
+    },
+    Interface {
+        declaration: NodeId,
+        capability: AccessCapability,
+    },
+    Builtin {
+        builtin: BuiltinType,
+        arguments: Vec<TypeId>,
+        capability: AccessCapability,
+    },
     /// An invalid type used after emitting a diagnostic so checking can
     /// continue without producing cascading errors.
     Recovery,
@@ -42,7 +64,12 @@ impl SemanticType {
     #[must_use]
     pub const fn capability(&self) -> Option<AccessCapability> {
         match self {
-            Self::Primitive { capability, .. } => Some(*capability),
+            Self::Primitive { capability, .. }
+            | Self::Callable { capability, .. }
+            | Self::NamedStruct { capability, .. }
+            | Self::AnonymousStruct { capability, .. }
+            | Self::Interface { capability, .. }
+            | Self::Builtin { capability, .. } => Some(*capability),
             Self::Recovery | Self::Divergence => None,
         }
     }
@@ -54,8 +81,20 @@ impl SemanticType {
             Self::Primitive {
                 primitive: PrimitiveType::String | PrimitiveType::Bytes,
                 ..
+            }
+            | Self::Callable { .. }
+            | Self::NamedStruct { .. }
+            | Self::AnonymousStruct { .. }
+            | Self::Interface { .. }
+            | Self::Builtin {
+                builtin: BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Map,
+                ..
             } => Some(ValueSemantics::Reference),
-            Self::Primitive { .. } => Some(ValueSemantics::Copied),
+            Self::Primitive { .. }
+            | Self::Builtin {
+                builtin: BuiltinType::Error,
+                ..
+            } => Some(ValueSemantics::Copied),
             Self::Recovery | Self::Divergence => None,
         }
     }
@@ -108,6 +147,77 @@ impl TypeStore {
         })
     }
 
+    /// Returns the canonical identity for a capability-qualified callable.
+    ///
+    /// Parameter binding mutability is local declaration metadata and is not
+    /// part of a callable signature. Each parameter's value capability is
+    /// already represented by its semantic type.
+    pub fn callable(
+        &mut self,
+        parameters: Vec<TypeId>,
+        return_type: TypeId,
+        capability: AccessCapability,
+    ) -> TypeId {
+        self.intern(SemanticType::Callable {
+            parameters,
+            return_type,
+            capability,
+        })
+    }
+
+    /// Returns the canonical identity for a named nominal struct declaration.
+    pub fn named_struct(
+        &mut self,
+        declaration: NodeId,
+        capability: AccessCapability,
+    ) -> TypeId {
+        self.intern(SemanticType::NamedStruct {
+            declaration,
+            capability,
+        })
+    }
+
+    /// Returns the canonical identity for an anonymous nominal struct.
+    pub fn anonymous_struct(
+        &mut self,
+        expression: NodeId,
+        capability: AccessCapability,
+    ) -> TypeId {
+        self.intern(SemanticType::AnonymousStruct {
+            expression,
+            capability,
+        })
+    }
+
+    /// Returns the canonical identity for a declared structural interface.
+    pub fn interface(
+        &mut self,
+        declaration: NodeId,
+        capability: AccessCapability,
+    ) -> TypeId {
+        self.intern(SemanticType::Interface {
+            declaration,
+            capability,
+        })
+    }
+
+    /// Returns the canonical identity for a compiler-known parameterized type.
+    ///
+    /// Type argument arity and legality are validated when source type syntax
+    /// is resolved, not by the interner.
+    pub fn builtin(
+        &mut self,
+        builtin: BuiltinType,
+        arguments: Vec<TypeId>,
+        capability: AccessCapability,
+    ) -> TypeId {
+        self.intern(SemanticType::Builtin {
+            builtin,
+            arguments,
+            capability,
+        })
+    }
+
     /// Returns the store's canonical recovery type.
     #[must_use]
     pub const fn recovery(&self) -> TypeId {
@@ -140,6 +250,23 @@ impl TypeStore {
             SemanticType::Primitive { primitive, .. } => {
                 Some(self.primitive(primitive, capability))
             }
+            SemanticType::Callable {
+                parameters,
+                return_type,
+                ..
+            } => Some(self.callable(parameters, return_type, capability)),
+            SemanticType::NamedStruct { declaration, .. } => {
+                Some(self.named_struct(declaration, capability))
+            }
+            SemanticType::AnonymousStruct { expression, .. } => {
+                Some(self.anonymous_struct(expression, capability))
+            }
+            SemanticType::Interface { declaration, .. } => {
+                Some(self.interface(declaration, capability))
+            }
+            SemanticType::Builtin {
+                builtin, arguments, ..
+            } => Some(self.builtin(builtin, arguments, capability)),
             SemanticType::Recovery | SemanticType::Divergence => Some(id),
         }
     }
@@ -176,6 +303,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::source::ModuleId;
 
     const PRIMITIVES: [PrimitiveType; 8] = [
         PrimitiveType::Unit,
@@ -187,6 +315,13 @@ mod tests {
         PrimitiveType::String,
         PrimitiveType::Bytes,
     ];
+
+    const fn node(node_id: u32) -> NodeId {
+        NodeId {
+            module_id: ModuleId::TEST_SOURCE,
+            node_id,
+        }
+    }
 
     #[test]
     fn repeated_primitive_construction_reuses_the_canonical_identity() {
@@ -253,6 +388,162 @@ mod tests {
     }
 
     #[test]
+    fn repeated_compound_and_declared_type_construction_reuses_canonical_identities() {
+        let mut types = TypeStore::new();
+        let parameter = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let return_type = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
+
+        let callable = types.callable(
+            vec![parameter],
+            return_type,
+            AccessCapability::Const,
+        );
+        assert_eq!(
+            types.callable(
+                vec![parameter],
+                return_type,
+                AccessCapability::Const,
+            ),
+            callable
+        );
+
+        let named = types.named_struct(node(1), AccessCapability::Const);
+        assert_eq!(
+            types.named_struct(node(1), AccessCapability::Const),
+            named
+        );
+
+        let anonymous = types.anonymous_struct(node(2), AccessCapability::Const);
+        assert_eq!(
+            types.anonymous_struct(node(2), AccessCapability::Const),
+            anonymous
+        );
+
+        let interface = types.interface(node(3), AccessCapability::Const);
+        assert_eq!(types.interface(node(3), AccessCapability::Const), interface);
+
+        let builtin = types.builtin(
+            BuiltinType::Queue,
+            vec![parameter],
+            AccessCapability::Const,
+        );
+        assert_eq!(
+            types.builtin(
+                BuiltinType::Queue,
+                vec![parameter],
+                AccessCapability::Const,
+            ),
+            builtin
+        );
+    }
+
+    #[test]
+    fn callable_identity_includes_capability_parameters_and_return_type() {
+        let mut types = TypeStore::new();
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let string = types.primitive(PrimitiveType::String, AccessCapability::Const);
+        let unit = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
+
+        let original = types.callable(vec![int, string], unit, AccessCapability::Const);
+        let mutable = types.callable(vec![int, string], unit, AccessCapability::Mut);
+        let reversed = types.callable(vec![string, int], unit, AccessCapability::Const);
+        let different_return =
+            types.callable(vec![int, string], int, AccessCapability::Const);
+
+        assert_ne!(original, mutable);
+        assert_ne!(original, reversed);
+        assert_ne!(original, different_return);
+    }
+
+    #[test]
+    fn declared_type_identity_uses_the_owning_node_and_capability() {
+        let mut types = TypeStore::new();
+
+        let named = types.named_struct(node(1), AccessCapability::Const);
+        let other_named = types.named_struct(node(2), AccessCapability::Const);
+        let mutable_named = types.named_struct(node(1), AccessCapability::Mut);
+        assert_ne!(named, other_named);
+        assert_ne!(named, mutable_named);
+
+        let anonymous = types.anonymous_struct(node(3), AccessCapability::Const);
+        let other_anonymous = types.anonymous_struct(node(4), AccessCapability::Const);
+        let mutable_anonymous = types.anonymous_struct(node(3), AccessCapability::Mut);
+        assert_ne!(anonymous, other_anonymous);
+        assert_ne!(anonymous, mutable_anonymous);
+
+        let interface = types.interface(node(5), AccessCapability::Const);
+        let other_interface = types.interface(node(6), AccessCapability::Const);
+        let mutable_interface = types.interface(node(5), AccessCapability::Mut);
+        assert_ne!(interface, other_interface);
+        assert_ne!(interface, mutable_interface);
+    }
+
+    #[test]
+    fn builtin_identity_includes_constructor_arguments_and_capability() {
+        let mut types = TypeStore::new();
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let string = types.primitive(PrimitiveType::String, AccessCapability::Const);
+
+        let map = types.builtin(
+            BuiltinType::Map,
+            vec![int, string],
+            AccessCapability::Const,
+        );
+        let reversed = types.builtin(
+            BuiltinType::Map,
+            vec![string, int],
+            AccessCapability::Const,
+        );
+        let mutable = types.builtin(
+            BuiltinType::Map,
+            vec![int, string],
+            AccessCapability::Mut,
+        );
+        let queue = types.builtin(BuiltinType::Queue, vec![int], AccessCapability::Const);
+        let vector = types.builtin(BuiltinType::Vector, vec![int], AccessCapability::Const);
+
+        assert_ne!(map, reversed);
+        assert_ne!(map, mutable);
+        assert_ne!(queue, vector);
+    }
+
+    #[test]
+    fn compound_and_declared_type_metadata_tracks_capability_and_value_semantics() {
+        let mut types = TypeStore::new();
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let unit = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
+
+        let callable = types.callable(vec![int], unit, AccessCapability::Mut);
+        let named = types.named_struct(node(1), AccessCapability::Mut);
+        let anonymous = types.anonymous_struct(node(2), AccessCapability::Mut);
+        let interface = types.interface(node(3), AccessCapability::Mut);
+        let queue = types.builtin(BuiltinType::Queue, vec![int], AccessCapability::Mut);
+        let vector = types.builtin(BuiltinType::Vector, vec![int], AccessCapability::Mut);
+        let map = types.builtin(
+            BuiltinType::Map,
+            vec![int, int],
+            AccessCapability::Mut,
+        );
+
+        for id in [callable, named, anonymous, interface, queue, vector, map] {
+            let semantic_type = types.get(id).expect("type should be interned");
+            assert_eq!(semantic_type.capability(), Some(AccessCapability::Mut));
+            assert_eq!(
+                semantic_type.value_semantics(),
+                Some(ValueSemantics::Reference)
+            );
+        }
+
+        let error = types.builtin(BuiltinType::Error, vec![int], AccessCapability::Mut);
+        let semantic_type = types.get(error).expect("Error should be interned");
+        assert_eq!(semantic_type.capability(), Some(AccessCapability::Mut));
+        assert_eq!(
+            semantic_type.value_semantics(),
+            Some(ValueSemantics::Copied)
+        );
+    }
+
+    #[test]
     fn recovery_and_divergence_are_stable_distinct_internal_types() {
         let types = TypeStore::new();
 
@@ -288,6 +579,57 @@ mod tests {
             types.with_capability(mut_type, AccessCapability::Mut),
             Some(mut_type)
         );
+    }
+
+    #[test]
+    fn capability_replacement_preserves_compound_and_declared_type_identity() {
+        let mut types = TypeStore::new();
+        let parameter = types.primitive(PrimitiveType::Int, AccessCapability::Mut);
+        let return_type = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
+
+        let const_callable = types.callable(
+            vec![parameter],
+            return_type,
+            AccessCapability::Const,
+        );
+        let mut_callable = types.callable(
+            vec![parameter],
+            return_type,
+            AccessCapability::Mut,
+        );
+        let const_named = types.named_struct(node(1), AccessCapability::Const);
+        let mut_named = types.named_struct(node(1), AccessCapability::Mut);
+        let const_anonymous = types.anonymous_struct(node(2), AccessCapability::Const);
+        let mut_anonymous = types.anonymous_struct(node(2), AccessCapability::Mut);
+        let const_interface = types.interface(node(3), AccessCapability::Const);
+        let mut_interface = types.interface(node(3), AccessCapability::Mut);
+        let const_builtin = types.builtin(
+            BuiltinType::Queue,
+            vec![parameter],
+            AccessCapability::Const,
+        );
+        let mut_builtin = types.builtin(
+            BuiltinType::Queue,
+            vec![parameter],
+            AccessCapability::Mut,
+        );
+
+        for (const_type, mut_type) in [
+            (const_callable, mut_callable),
+            (const_named, mut_named),
+            (const_anonymous, mut_anonymous),
+            (const_interface, mut_interface),
+            (const_builtin, mut_builtin),
+        ] {
+            assert_eq!(
+                types.with_capability(const_type, AccessCapability::Mut),
+                Some(mut_type)
+            );
+            assert_eq!(
+                types.with_capability(mut_type, AccessCapability::Const),
+                Some(const_type)
+            );
+        }
     }
 
     #[test]
