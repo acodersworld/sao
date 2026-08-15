@@ -1089,13 +1089,17 @@ mod tests {
 
         let source = "const vmut user = other;";
         let statement = parse_statement_source(source);
-        assert!(format_statement(&module(source), &statement)
-            .starts_with("Binding binding=Const value=Mut \"user\""));
+        assert!(
+            format_statement(&module(source), &statement)
+                .starts_with("Binding binding=Const value=Mut \"user\"")
+        );
 
         let source = "mut vconst view = other;";
         let statement = parse_statement_source(source);
-        assert!(format_statement(&module(source), &statement)
-            .starts_with("Binding binding=Mut value=Const \"view\""));
+        assert!(
+            format_statement(&module(source), &statement)
+                .starts_with("Binding binding=Mut value=Const \"view\"")
+        );
     }
 
     #[test]

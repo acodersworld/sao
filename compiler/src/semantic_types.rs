@@ -141,32 +141,26 @@ impl SemanticType {
             ) => left_parameters == right_parameters && left_return == right_return,
             (
                 Self::NamedStruct {
-                    declaration: left,
-                    ..
+                    declaration: left, ..
                 },
                 Self::NamedStruct {
-                    declaration: right,
-                    ..
+                    declaration: right, ..
                 },
             )
             | (
                 Self::Interface {
-                    declaration: left,
-                    ..
+                    declaration: left, ..
                 },
                 Self::Interface {
-                    declaration: right,
-                    ..
+                    declaration: right, ..
                 },
             ) => left == right,
             (
                 Self::AnonymousStruct {
-                    expression: left,
-                    ..
+                    expression: left, ..
                 },
                 Self::AnonymousStruct {
-                    expression: right,
-                    ..
+                    expression: right, ..
                 },
             ) => left == right,
             (
@@ -181,21 +175,10 @@ impl SemanticType {
                     ..
                 },
             ) => left_builtin == right_builtin && left_arguments == right_arguments,
-            (
-                Self::Union {
-                    members: left, ..
-                },
-                Self::Union {
-                    members: right, ..
-                },
-            )
+            (Self::Union { members: left, .. }, Self::Union { members: right, .. })
             | (
-                Self::Intersection {
-                    members: left, ..
-                },
-                Self::Intersection {
-                    members: right, ..
-                },
+                Self::Intersection { members: left, .. },
+                Self::Intersection { members: right, .. },
             ) => left == right,
             (Self::Recovery, Self::Recovery) | (Self::Divergence, Self::Divergence) => true,
             _ => false,
@@ -239,11 +222,7 @@ impl TypeStore {
     }
 
     /// Returns the canonical identity for a capability-qualified primitive.
-    pub fn primitive(
-        &mut self,
-        primitive: PrimitiveType,
-        capability: AccessCapability,
-    ) -> TypeId {
+    pub fn primitive(&mut self, primitive: PrimitiveType, capability: AccessCapability) -> TypeId {
         self.intern(SemanticType::Primitive {
             primitive,
             capability,
@@ -269,11 +248,7 @@ impl TypeStore {
     }
 
     /// Returns the canonical identity for a named nominal struct declaration.
-    pub fn named_struct(
-        &mut self,
-        declaration: NodeId,
-        capability: AccessCapability,
-    ) -> TypeId {
+    pub fn named_struct(&mut self, declaration: NodeId, capability: AccessCapability) -> TypeId {
         self.intern(SemanticType::NamedStruct {
             declaration,
             capability,
@@ -281,11 +256,7 @@ impl TypeStore {
     }
 
     /// Returns the canonical identity for an anonymous nominal struct.
-    pub fn anonymous_struct(
-        &mut self,
-        expression: NodeId,
-        capability: AccessCapability,
-    ) -> TypeId {
+    pub fn anonymous_struct(&mut self, expression: NodeId, capability: AccessCapability) -> TypeId {
         self.intern(SemanticType::AnonymousStruct {
             expression,
             capability,
@@ -293,11 +264,7 @@ impl TypeStore {
     }
 
     /// Returns the canonical identity for a declared structural interface.
-    pub fn interface(
-        &mut self,
-        declaration: NodeId,
-        capability: AccessCapability,
-    ) -> TypeId {
+    pub fn interface(&mut self, declaration: NodeId, capability: AccessCapability) -> TypeId {
         self.intern(SemanticType::Interface {
             declaration,
             capability,
@@ -328,11 +295,7 @@ impl TypeStore {
     /// order does not affect identity. A single remaining member is returned
     /// with the requested outer capability. At least one member must be
     /// supplied.
-    pub fn union(
-        &mut self,
-        members: Vec<TypeId>,
-        capability: AccessCapability,
-    ) -> TypeId {
+    pub fn union(&mut self, members: Vec<TypeId>, capability: AccessCapability) -> TypeId {
         let members = self.normalize_members(members, TypeSetKind::Union);
         self.intern_normalized_type_set(members, TypeSetKind::Union, capability)
     }
@@ -345,11 +308,7 @@ impl TypeStore {
     /// member is returned with the requested outer capability. Member legality
     /// is checked during source type resolution. At least one member must be
     /// supplied.
-    pub fn intersection(
-        &mut self,
-        members: Vec<TypeId>,
-        capability: AccessCapability,
-    ) -> TypeId {
+    pub fn intersection(&mut self, members: Vec<TypeId>, capability: AccessCapability) -> TypeId {
         let members = self.normalize_members(members, TypeSetKind::Intersection);
         self.intern_normalized_type_set(members, TypeSetKind::Intersection, capability)
     }
@@ -411,11 +370,7 @@ impl TypeStore {
     /// members are unchanged because the aggregate carries its own outer
     /// capability. Recovery and divergence do not represent values and are
     /// returned unchanged.
-    pub fn with_capability(
-        &mut self,
-        id: TypeId,
-        capability: AccessCapability,
-    ) -> Option<TypeId> {
+    pub fn with_capability(&mut self, id: TypeId, capability: AccessCapability) -> Option<TypeId> {
         match self.get(id)?.clone() {
             SemanticType::Primitive { primitive, .. } => {
                 Some(self.primitive(primitive, capability))
@@ -481,10 +436,9 @@ impl TypeStore {
         for member in members {
             match (kind, self.get(member)) {
                 (TypeSetKind::Union, Some(SemanticType::Union { members, .. }))
-                | (
-                    TypeSetKind::Intersection,
-                    Some(SemanticType::Intersection { members, .. }),
-                ) => normalized.extend(members.iter().copied()),
+                | (TypeSetKind::Intersection, Some(SemanticType::Intersection { members, .. })) => {
+                    normalized.extend(members.iter().copied())
+                }
                 _ => normalized.push(member),
             }
         }
@@ -623,25 +577,14 @@ mod tests {
         let parameter = types.primitive(PrimitiveType::Int, AccessCapability::Const);
         let return_type = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
 
-        let callable = types.callable(
-            vec![parameter],
-            return_type,
-            AccessCapability::Const,
-        );
+        let callable = types.callable(vec![parameter], return_type, AccessCapability::Const);
         assert_eq!(
-            types.callable(
-                vec![parameter],
-                return_type,
-                AccessCapability::Const,
-            ),
+            types.callable(vec![parameter], return_type, AccessCapability::Const,),
             callable
         );
 
         let named = types.named_struct(node(1), AccessCapability::Const);
-        assert_eq!(
-            types.named_struct(node(1), AccessCapability::Const),
-            named
-        );
+        assert_eq!(types.named_struct(node(1), AccessCapability::Const), named);
 
         let anonymous = types.anonymous_struct(node(2), AccessCapability::Const);
         assert_eq!(
@@ -652,17 +595,9 @@ mod tests {
         let interface = types.interface(node(3), AccessCapability::Const);
         assert_eq!(types.interface(node(3), AccessCapability::Const), interface);
 
-        let builtin = types.builtin(
-            BuiltinType::Queue,
-            vec![parameter],
-            AccessCapability::Const,
-        );
+        let builtin = types.builtin(BuiltinType::Queue, vec![parameter], AccessCapability::Const);
         assert_eq!(
-            types.builtin(
-                BuiltinType::Queue,
-                vec![parameter],
-                AccessCapability::Const,
-            ),
+            types.builtin(BuiltinType::Queue, vec![parameter], AccessCapability::Const,),
             builtin
         );
     }
@@ -677,8 +612,7 @@ mod tests {
         let original = types.callable(vec![int, string], unit, AccessCapability::Const);
         let mutable = types.callable(vec![int, string], unit, AccessCapability::Mut);
         let reversed = types.callable(vec![string, int], unit, AccessCapability::Const);
-        let different_return =
-            types.callable(vec![int, string], int, AccessCapability::Const);
+        let different_return = types.callable(vec![int, string], int, AccessCapability::Const);
 
         assert_ne!(original, mutable);
         assert_ne!(original, reversed);
@@ -714,21 +648,9 @@ mod tests {
         let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
         let string = types.primitive(PrimitiveType::String, AccessCapability::Const);
 
-        let map = types.builtin(
-            BuiltinType::Map,
-            vec![int, string],
-            AccessCapability::Const,
-        );
-        let reversed = types.builtin(
-            BuiltinType::Map,
-            vec![string, int],
-            AccessCapability::Const,
-        );
-        let mutable = types.builtin(
-            BuiltinType::Map,
-            vec![int, string],
-            AccessCapability::Mut,
-        );
+        let map = types.builtin(BuiltinType::Map, vec![int, string], AccessCapability::Const);
+        let reversed = types.builtin(BuiltinType::Map, vec![string, int], AccessCapability::Const);
+        let mutable = types.builtin(BuiltinType::Map, vec![int, string], AccessCapability::Mut);
         let queue = types.builtin(BuiltinType::Queue, vec![int], AccessCapability::Const);
         let vector = types.builtin(BuiltinType::Vector, vec![int], AccessCapability::Const);
 
@@ -749,11 +671,7 @@ mod tests {
         let interface = types.interface(node(3), AccessCapability::Mut);
         let queue = types.builtin(BuiltinType::Queue, vec![int], AccessCapability::Mut);
         let vector = types.builtin(BuiltinType::Vector, vec![int], AccessCapability::Mut);
-        let map = types.builtin(
-            BuiltinType::Map,
-            vec![int, int],
-            AccessCapability::Mut,
-        );
+        let map = types.builtin(BuiltinType::Map, vec![int, int], AccessCapability::Mut);
 
         for id in [callable, named, anonymous, interface, queue, vector, map] {
             let semantic_type = types.get(id).expect("type should be interned");
@@ -824,14 +742,8 @@ mod tests {
         let direct = types.union(vec![string, none, int], AccessCapability::Const);
 
         assert_eq!(flattened, direct);
-        assert_eq!(
-            types.union(vec![int, int], AccessCapability::Const),
-            int
-        );
-        assert_eq!(
-            types.union(vec![string], AccessCapability::Const),
-            string
-        );
+        assert_eq!(types.union(vec![int, int], AccessCapability::Const), int);
+        assert_eq!(types.union(vec![string], AccessCapability::Const), string);
         assert_eq!(types.union(vec![int], AccessCapability::Mut), mut_int);
     }
 
@@ -844,14 +756,8 @@ mod tests {
         let closer = types.interface(node(3), AccessCapability::Const);
 
         let nested = types.intersection(vec![reader, writer], AccessCapability::Const);
-        let flattened = types.intersection(
-            vec![closer, nested, reader],
-            AccessCapability::Const,
-        );
-        let direct = types.intersection(
-            vec![writer, closer, reader],
-            AccessCapability::Const,
-        );
+        let flattened = types.intersection(vec![closer, nested, reader], AccessCapability::Const);
+        let direct = types.intersection(vec![writer, closer, reader], AccessCapability::Const);
 
         assert_eq!(flattened, direct);
         assert_eq!(
@@ -875,8 +781,7 @@ mod tests {
         let writer = types.interface(node(2), AccessCapability::Const);
         let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
 
-        let intersection =
-            types.intersection(vec![reader, writer], AccessCapability::Const);
+        let intersection = types.intersection(vec![reader, writer], AccessCapability::Const);
         let union = types.union(vec![intersection, int], AccessCapability::Const);
 
         let Some(SemanticType::Union { members, .. }) = types.get(union) else {
@@ -895,10 +800,8 @@ mod tests {
 
         let const_union = types.union(vec![first, second], AccessCapability::Const);
         let mut_union = types.union(vec![first, second], AccessCapability::Mut);
-        let const_intersection =
-            types.intersection(vec![first, second], AccessCapability::Const);
-        let mut_intersection =
-            types.intersection(vec![first, second], AccessCapability::Mut);
+        let const_intersection = types.intersection(vec![first, second], AccessCapability::Const);
+        let mut_intersection = types.intersection(vec![first, second], AccessCapability::Mut);
 
         assert_ne!(const_union, mut_union);
         assert_ne!(const_intersection, mut_intersection);
@@ -920,8 +823,7 @@ mod tests {
         let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
 
         let union = types.union(vec![reader, int], AccessCapability::Mut);
-        let intersection =
-            types.intersection(vec![reader, writer], AccessCapability::Mut);
+        let intersection = types.intersection(vec![reader, writer], AccessCapability::Mut);
 
         let union_type = types.get(union).expect("union should be interned");
         assert_eq!(union_type.capability(), Some(AccessCapability::Mut));
@@ -933,10 +835,7 @@ mod tests {
         let intersection_type = types
             .get(intersection)
             .expect("intersection should be interned");
-        assert_eq!(
-            intersection_type.capability(),
-            Some(AccessCapability::Mut)
-        );
+        assert_eq!(intersection_type.capability(), Some(AccessCapability::Mut));
         assert_eq!(
             intersection_type.value_semantics(),
             Some(ValueSemantics::Reference)
@@ -950,10 +849,8 @@ mod tests {
         let second = types.named_struct(node(2), AccessCapability::Const);
         let const_union = types.union(vec![first, second], AccessCapability::Const);
         let mut_union = types.union(vec![first, second], AccessCapability::Mut);
-        let const_intersection =
-            types.intersection(vec![first, second], AccessCapability::Const);
-        let mut_intersection =
-            types.intersection(vec![first, second], AccessCapability::Mut);
+        let const_intersection = types.intersection(vec![first, second], AccessCapability::Const);
+        let mut_intersection = types.intersection(vec![first, second], AccessCapability::Mut);
 
         assert_eq!(
             types.with_capability(const_union, AccessCapability::Mut),
@@ -1017,32 +914,17 @@ mod tests {
         let parameter = types.primitive(PrimitiveType::Int, AccessCapability::Mut);
         let return_type = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
 
-        let const_callable = types.callable(
-            vec![parameter],
-            return_type,
-            AccessCapability::Const,
-        );
-        let mut_callable = types.callable(
-            vec![parameter],
-            return_type,
-            AccessCapability::Mut,
-        );
+        let const_callable = types.callable(vec![parameter], return_type, AccessCapability::Const);
+        let mut_callable = types.callable(vec![parameter], return_type, AccessCapability::Mut);
         let const_named = types.named_struct(node(1), AccessCapability::Const);
         let mut_named = types.named_struct(node(1), AccessCapability::Mut);
         let const_anonymous = types.anonymous_struct(node(2), AccessCapability::Const);
         let mut_anonymous = types.anonymous_struct(node(2), AccessCapability::Mut);
         let const_interface = types.interface(node(3), AccessCapability::Const);
         let mut_interface = types.interface(node(3), AccessCapability::Mut);
-        let const_builtin = types.builtin(
-            BuiltinType::Queue,
-            vec![parameter],
-            AccessCapability::Const,
-        );
-        let mut_builtin = types.builtin(
-            BuiltinType::Queue,
-            vec![parameter],
-            AccessCapability::Mut,
-        );
+        let const_builtin =
+            types.builtin(BuiltinType::Queue, vec![parameter], AccessCapability::Const);
+        let mut_builtin = types.builtin(BuiltinType::Queue, vec![parameter], AccessCapability::Mut);
 
         for (const_type, mut_type) in [
             (const_callable, mut_callable),
@@ -1067,14 +949,8 @@ mod tests {
         let mut types = TypeStore::new();
 
         for id in [types.recovery(), types.divergence()] {
-            assert_eq!(
-                types.with_capability(id, AccessCapability::Const),
-                Some(id)
-            );
-            assert_eq!(
-                types.with_capability(id, AccessCapability::Mut),
-                Some(id)
-            );
+            assert_eq!(types.with_capability(id, AccessCapability::Const), Some(id));
+            assert_eq!(types.with_capability(id, AccessCapability::Mut), Some(id));
         }
     }
 
@@ -1102,8 +978,7 @@ mod tests {
         let first_interface = types.interface(node(3), AccessCapability::Const);
         let second_interface = types.interface(node(4), AccessCapability::Const);
 
-        let const_callable =
-            types.callable(vec![int], unit, AccessCapability::Const);
+        let const_callable = types.callable(vec![int], unit, AccessCapability::Const);
         let mut_callable = types.callable(vec![int], unit, AccessCapability::Mut);
         let const_named = types.named_struct(node(1), AccessCapability::Const);
         let mut_named = types.named_struct(node(1), AccessCapability::Mut);
@@ -1111,19 +986,10 @@ mod tests {
         let mut_anonymous = types.anonymous_struct(node(2), AccessCapability::Mut);
         let const_interface = types.interface(node(3), AccessCapability::Const);
         let mut_interface = types.interface(node(3), AccessCapability::Mut);
-        let const_builtin = types.builtin(
-            BuiltinType::Queue,
-            vec![int],
-            AccessCapability::Const,
-        );
-        let mut_builtin =
-            types.builtin(BuiltinType::Queue, vec![int], AccessCapability::Mut);
-        let const_union = types.union(
-            vec![int, first_interface],
-            AccessCapability::Const,
-        );
-        let mut_union =
-            types.union(vec![int, first_interface], AccessCapability::Mut);
+        let const_builtin = types.builtin(BuiltinType::Queue, vec![int], AccessCapability::Const);
+        let mut_builtin = types.builtin(BuiltinType::Queue, vec![int], AccessCapability::Mut);
+        let const_union = types.union(vec![int, first_interface], AccessCapability::Const);
+        let mut_union = types.union(vec![int, first_interface], AccessCapability::Mut);
         let const_intersection = types.intersection(
             vec![first_interface, second_interface],
             AccessCapability::Const,
@@ -1168,25 +1034,17 @@ mod tests {
         let mut_int = types.primitive(PrimitiveType::Int, AccessCapability::Mut);
         let unit = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
 
-        let const_parameter =
-            types.callable(vec![const_int], unit, AccessCapability::Const);
-        let mut_parameter =
-            types.callable(vec![mut_int], unit, AccessCapability::Const);
+        let const_parameter = types.callable(vec![const_int], unit, AccessCapability::Const);
+        let mut_parameter = types.callable(vec![mut_int], unit, AccessCapability::Const);
         assert_eq!(
             types.has_same_shape(const_parameter, mut_parameter),
             Some(false)
         );
 
-        let const_argument = types.builtin(
-            BuiltinType::Queue,
-            vec![const_int],
-            AccessCapability::Const,
-        );
-        let mut_argument = types.builtin(
-            BuiltinType::Queue,
-            vec![mut_int],
-            AccessCapability::Const,
-        );
+        let const_argument =
+            types.builtin(BuiltinType::Queue, vec![const_int], AccessCapability::Const);
+        let mut_argument =
+            types.builtin(BuiltinType::Queue, vec![mut_int], AccessCapability::Const);
         assert_eq!(
             types.has_same_shape(const_argument, mut_argument),
             Some(false)
@@ -1196,10 +1054,8 @@ mod tests {
         let second_named = types.named_struct(node(2), AccessCapability::Const);
         assert_eq!(types.has_same_shape(first_named, second_named), Some(false));
 
-        let const_member_union =
-            types.union(vec![const_int, first_named], AccessCapability::Const);
-        let mut_member_union =
-            types.union(vec![mut_int, first_named], AccessCapability::Const);
+        let const_member_union = types.union(vec![const_int, first_named], AccessCapability::Const);
+        let mut_member_union = types.union(vec![mut_int, first_named], AccessCapability::Const);
         assert_eq!(
             types.has_same_shape(const_member_union, mut_member_union),
             Some(false)
@@ -1214,9 +1070,6 @@ mod tests {
         assert_eq!(types.get(unknown), None);
         assert!(!types.contains(unknown));
         assert_eq!(types.has_same_shape(types.recovery(), unknown), None);
-        assert_eq!(
-            types.with_capability(unknown, AccessCapability::Mut),
-            None
-        );
+        assert_eq!(types.with_capability(unknown, AccessCapability::Mut), None);
     }
 }

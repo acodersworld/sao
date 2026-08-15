@@ -514,9 +514,8 @@ where
             BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
             |parsed| parsed.qualifiers,
         );
-        let start = parsed_qualifiers.map_or(first.span.start, |parsed| {
-            parsed.binding_token.span.start
-        });
+        let start =
+            parsed_qualifiers.map_or(first.span.start, |parsed| parsed.binding_token.span.start);
         let name = self.expect(TokenKind::Identifier)?;
         self.expect(TokenKind::Colon)?;
         let type_annotation = self.binding_type_annotation()?;
@@ -577,7 +576,9 @@ where
                 TokenKind::VConst,
             ),
             TokenKind::VConst | TokenKind::VMut => {
-                return Err(self.value_capability_without_binding_error(binding_token).into());
+                return Err(self
+                    .value_capability_without_binding_error(binding_token)
+                    .into());
             }
             _ => return Ok(None),
         };
@@ -3751,10 +3752,9 @@ mod tests {
 
     #[test]
     fn value_capability_applies_to_an_annotated_callable_binding() {
-        let statement = parse_statement_source(
-            "const vmut callback: fn(mut User) -> () = make_callback();",
-        )
-        .expect("mutable callable binding should parse");
+        let statement =
+            parse_statement_source("const vmut callback: fn(mut User) -> () = make_callback();")
+                .expect("mutable callable binding should parse");
         let StatementKind::Binding {
             qualifiers,
             type_annotation: Some(type_annotation),
@@ -6542,8 +6542,7 @@ mod tests {
     #[test]
     fn mutable_qualifier_applies_to_the_complete_union() {
         for source in ["mut User | none", "mut (User | none)"] {
-            let type_syntax =
-                parse_type_source(source).expect("mutable union type should parse");
+            let type_syntax = parse_type_source(source).expect("mutable union type should parse");
             let TypeKind::Mutable(inner) = type_syntax.kind else {
                 panic!("expected a mutable type for {source}");
             };
