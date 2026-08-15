@@ -144,8 +144,10 @@ access, reducing mut to const when necessary. A function declared `-> mut T`
 must return mut access. The qualifier is part of function and method signatures,
 including callable types and interface requirements. A return
 capability qualifier is unnecessary for copied value types such as `int`.
-Within a union, `mut` qualifies the immediately following reference member, so
-`-> mut User | none` returns either mutable access to a `User` or `none`.
+Union and intersection capabilities apply to the complete aggregate rather
+than individual members. Grouping is preferred when writing them explicitly,
+so `-> mut (User | none)` returns mutable access through either active member.
+Individual members cannot carry separate capabilities.
 
 Callable types also carry a capability, but it describes mutation of captured
 callable state rather than general side effects. A callable written

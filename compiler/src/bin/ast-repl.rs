@@ -203,6 +203,9 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::BindingValueCapabilityMustPrecedeName => {
             "a binding's value capability must be written before its name".to_owned()
         }
+        ParseErrorKind::AggregateMemberCapabilityNotSupported => {
+            "qualify the complete union or intersection instead of one member".to_owned()
+        }
         ParseErrorKind::ExpectedToken { expected, found } => {
             format!("expected {expected:?}, found {found:?}")
         }
@@ -414,6 +417,13 @@ mod tests {
                 span: Span::new(ModuleId::PRELUDE, 12, 20),
             }),
             "a binding's value capability must be written before its name"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::AggregateMemberCapabilityNotSupported,
+                span: Span::new(ModuleId::PRELUDE, 9, 12),
+            }),
+            "qualify the complete union or intersection instead of one member"
         );
     }
 }

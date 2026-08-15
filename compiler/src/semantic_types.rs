@@ -52,6 +52,16 @@ pub enum SemanticType {
         arguments: Vec<TypeId>,
         capability: AccessCapability,
     },
+    /// A canonical set of at least two alternative member types.
+    Union {
+        members: Vec<TypeId>,
+        capability: AccessCapability,
+    },
+    /// A canonical set of at least two simultaneously required member types.
+    Intersection {
+        members: Vec<TypeId>,
+        capability: AccessCapability,
+    },
     /// An invalid type used after emitting a diagnostic so checking can
     /// continue without producing cascading errors.
     Recovery,
@@ -60,7 +70,7 @@ pub enum SemanticType {
 }
 
 impl SemanticType {
-    /// Returns this type's access capability, if it represents a value.
+    /// Returns the capability attached directly to this type, if it has one.
     #[must_use]
     pub const fn capability(&self) -> Option<AccessCapability> {
         match self {
@@ -69,7 +79,9 @@ impl SemanticType {
             | Self::NamedStruct { capability, .. }
             | Self::AnonymousStruct { capability, .. }
             | Self::Interface { capability, .. }
-            | Self::Builtin { capability, .. } => Some(*capability),
+            | Self::Builtin { capability, .. }
+            | Self::Union { capability, .. }
+            | Self::Intersection { capability, .. } => Some(*capability),
             Self::Recovery | Self::Divergence => None,
         }
     }
@@ -89,12 +101,14 @@ impl SemanticType {
             | Self::Builtin {
                 builtin: BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Map,
                 ..
-            } => Some(ValueSemantics::Reference),
+            }
+            | Self::Intersection { .. } => Some(ValueSemantics::Reference),
             Self::Primitive { .. }
             | Self::Builtin {
                 builtin: BuiltinType::Error,
                 ..
-            } => Some(ValueSemantics::Copied),
+            }
+            | Self::Union { .. } => Some(ValueSemantics::Copied),
             Self::Recovery | Self::Divergence => None,
         }
     }
@@ -218,6 +232,39 @@ impl TypeStore {
         })
     }
 
+    /// Returns the canonical identity for a union of the supplied members.
+    ///
+    /// Union construction is associative, commutative, and idempotent: nested
+    /// unions are flattened, exact duplicate members are removed, and member
+    /// order does not affect identity. A single remaining member is returned
+    /// with the requested outer capability. At least one member must be
+    /// supplied.
+    pub fn union(
+        &mut self,
+        members: Vec<TypeId>,
+        capability: AccessCapability,
+    ) -> TypeId {
+        let members = self.normalize_members(members, TypeSetKind::Union);
+        self.intern_normalized_type_set(members, TypeSetKind::Union, capability)
+    }
+
+    /// Returns the canonical identity for an intersection of the supplied members.
+    ///
+    /// Intersection construction is associative, commutative, and idempotent:
+    /// nested intersections are flattened, exact duplicate members are
+    /// removed, and member order does not affect identity. A single remaining
+    /// member is returned with the requested outer capability. Member legality
+    /// is checked during source type resolution. At least one member must be
+    /// supplied.
+    pub fn intersection(
+        &mut self,
+        members: Vec<TypeId>,
+        capability: AccessCapability,
+    ) -> TypeId {
+        let members = self.normalize_members(members, TypeSetKind::Intersection);
+        self.intern_normalized_type_set(members, TypeSetKind::Intersection, capability)
+    }
+
     /// Returns the store's canonical recovery type.
     #[must_use]
     pub const fn recovery(&self) -> TypeId {
@@ -239,8 +286,10 @@ impl TypeStore {
     /// Returns the canonical form of a type with the requested capability.
     ///
     /// This operation constructs a type; it does not decide whether increasing
-    /// a capability is legal at a particular use site. Recovery and divergence
-    /// do not represent values and are returned unchanged.
+    /// a capability is legal at a particular use site. Union and intersection
+    /// members are unchanged because the aggregate carries its own outer
+    /// capability. Recovery and divergence do not represent values and are
+    /// returned unchanged.
     pub fn with_capability(
         &mut self,
         id: TypeId,
@@ -267,6 +316,10 @@ impl TypeStore {
             SemanticType::Builtin {
                 builtin, arguments, ..
             } => Some(self.builtin(builtin, arguments, capability)),
+            SemanticType::Union { members, .. } => Some(self.union(members, capability)),
+            SemanticType::Intersection { members, .. } => {
+                Some(self.intersection(members, capability))
+            }
             SemanticType::Recovery | SemanticType::Divergence => Some(id),
         }
     }
@@ -296,6 +349,59 @@ impl TypeStore {
         self.type_ids.insert(semantic_type, id);
         id
     }
+
+    fn normalize_members(&self, members: Vec<TypeId>, kind: TypeSetKind) -> Vec<TypeId> {
+        assert!(
+            !members.is_empty(),
+            "a union or intersection requires at least one member"
+        );
+
+        let mut normalized = Vec::new();
+        for member in members {
+            match (kind, self.get(member)) {
+                (TypeSetKind::Union, Some(SemanticType::Union { members, .. }))
+                | (
+                    TypeSetKind::Intersection,
+                    Some(SemanticType::Intersection { members, .. }),
+                ) => normalized.extend(members.iter().copied()),
+                _ => normalized.push(member),
+            }
+        }
+
+        normalized.sort_unstable_by_key(|member| member.0);
+        normalized.dedup();
+        normalized
+    }
+
+    fn intern_normalized_type_set(
+        &mut self,
+        members: Vec<TypeId>,
+        kind: TypeSetKind,
+        capability: AccessCapability,
+    ) -> TypeId {
+        if let [member] = members.as_slice() {
+            return self
+                .with_capability(*member, capability)
+                .expect("a normalized member belongs to this type store");
+        }
+
+        match kind {
+            TypeSetKind::Union => self.intern(SemanticType::Union {
+                members,
+                capability,
+            }),
+            TypeSetKind::Intersection => self.intern(SemanticType::Intersection {
+                members,
+                capability,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeSetKind {
+    Union,
+    Intersection,
 }
 
 #[cfg(test)]
@@ -540,6 +646,203 @@ mod tests {
         assert_eq!(
             semantic_type.value_semantics(),
             Some(ValueSemantics::Copied)
+        );
+    }
+
+    #[test]
+    fn union_identity_is_order_independent_and_reuses_the_canonical_type() {
+        let mut types = TypeStore::new();
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let string = types.primitive(PrimitiveType::String, AccessCapability::Const);
+
+        let forward = types.union(vec![int, string], AccessCapability::Const);
+        let reversed = types.union(vec![string, int], AccessCapability::Const);
+
+        assert_eq!(forward, reversed);
+        assert_eq!(
+            types.get(forward),
+            Some(&SemanticType::Union {
+                members: vec![int, string],
+                capability: AccessCapability::Const,
+            })
+        );
+    }
+
+    #[test]
+    fn intersection_identity_is_order_independent_and_reuses_the_canonical_type() {
+        let mut types = TypeStore::new();
+        let reader = types.interface(node(1), AccessCapability::Const);
+        let writer = types.interface(node(2), AccessCapability::Const);
+
+        let forward = types.intersection(vec![reader, writer], AccessCapability::Const);
+        let reversed = types.intersection(vec![writer, reader], AccessCapability::Const);
+
+        assert_eq!(forward, reversed);
+        assert_eq!(
+            types.get(forward),
+            Some(&SemanticType::Intersection {
+                members: vec![reader, writer],
+                capability: AccessCapability::Const,
+            })
+        );
+    }
+
+    #[test]
+    fn unions_are_flattened_deduplicated_and_collapsed() {
+        let mut types = TypeStore::new();
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let mut_int = types.primitive(PrimitiveType::Int, AccessCapability::Mut);
+        let string = types.primitive(PrimitiveType::String, AccessCapability::Const);
+        let none = types.primitive(PrimitiveType::None, AccessCapability::Const);
+
+        let nested = types.union(vec![int, string], AccessCapability::Const);
+        let flattened = types.union(vec![none, nested, int], AccessCapability::Const);
+        let direct = types.union(vec![string, none, int], AccessCapability::Const);
+
+        assert_eq!(flattened, direct);
+        assert_eq!(
+            types.union(vec![int, int], AccessCapability::Const),
+            int
+        );
+        assert_eq!(
+            types.union(vec![string], AccessCapability::Const),
+            string
+        );
+        assert_eq!(types.union(vec![int], AccessCapability::Mut), mut_int);
+    }
+
+    #[test]
+    fn intersections_are_flattened_deduplicated_and_collapsed() {
+        let mut types = TypeStore::new();
+        let reader = types.interface(node(1), AccessCapability::Const);
+        let mut_reader = types.interface(node(1), AccessCapability::Mut);
+        let writer = types.interface(node(2), AccessCapability::Const);
+        let closer = types.interface(node(3), AccessCapability::Const);
+
+        let nested = types.intersection(vec![reader, writer], AccessCapability::Const);
+        let flattened = types.intersection(
+            vec![closer, nested, reader],
+            AccessCapability::Const,
+        );
+        let direct = types.intersection(
+            vec![writer, closer, reader],
+            AccessCapability::Const,
+        );
+
+        assert_eq!(flattened, direct);
+        assert_eq!(
+            types.intersection(vec![reader, reader], AccessCapability::Const),
+            reader
+        );
+        assert_eq!(
+            types.intersection(vec![writer], AccessCapability::Const),
+            writer
+        );
+        assert_eq!(
+            types.intersection(vec![reader], AccessCapability::Mut),
+            mut_reader
+        );
+    }
+
+    #[test]
+    fn normalization_only_flattens_the_same_type_operator() {
+        let mut types = TypeStore::new();
+        let reader = types.interface(node(1), AccessCapability::Const);
+        let writer = types.interface(node(2), AccessCapability::Const);
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+
+        let intersection =
+            types.intersection(vec![reader, writer], AccessCapability::Const);
+        let union = types.union(vec![intersection, int], AccessCapability::Const);
+
+        let Some(SemanticType::Union { members, .. }) = types.get(union) else {
+            panic!("expected a union");
+        };
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&intersection));
+        assert!(members.contains(&int));
+    }
+
+    #[test]
+    fn type_set_identity_includes_its_outer_capability() {
+        let mut types = TypeStore::new();
+        let first = types.named_struct(node(1), AccessCapability::Const);
+        let second = types.named_struct(node(2), AccessCapability::Const);
+
+        let const_union = types.union(vec![first, second], AccessCapability::Const);
+        let mut_union = types.union(vec![first, second], AccessCapability::Mut);
+        let const_intersection =
+            types.intersection(vec![first, second], AccessCapability::Const);
+        let mut_intersection =
+            types.intersection(vec![first, second], AccessCapability::Mut);
+
+        assert_ne!(const_union, mut_union);
+        assert_ne!(const_intersection, mut_intersection);
+        assert_ne!(const_union, const_intersection);
+        assert_eq!(
+            types.get(mut_union),
+            Some(&SemanticType::Union {
+                members: vec![first, second],
+                capability: AccessCapability::Mut,
+            })
+        );
+    }
+
+    #[test]
+    fn type_set_metadata_reflects_aggregate_runtime_representation() {
+        let mut types = TypeStore::new();
+        let reader = types.interface(node(1), AccessCapability::Const);
+        let writer = types.interface(node(2), AccessCapability::Const);
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+
+        let union = types.union(vec![reader, int], AccessCapability::Mut);
+        let intersection =
+            types.intersection(vec![reader, writer], AccessCapability::Mut);
+
+        let union_type = types.get(union).expect("union should be interned");
+        assert_eq!(union_type.capability(), Some(AccessCapability::Mut));
+        assert_eq!(union_type.value_semantics(), Some(ValueSemantics::Copied));
+
+        let intersection_type = types
+            .get(intersection)
+            .expect("intersection should be interned");
+        assert_eq!(
+            intersection_type.capability(),
+            Some(AccessCapability::Mut)
+        );
+        assert_eq!(
+            intersection_type.value_semantics(),
+            Some(ValueSemantics::Reference)
+        );
+    }
+
+    #[test]
+    fn capability_replacement_preserves_type_set_members() {
+        let mut types = TypeStore::new();
+        let first = types.named_struct(node(1), AccessCapability::Const);
+        let second = types.named_struct(node(2), AccessCapability::Const);
+        let const_union = types.union(vec![first, second], AccessCapability::Const);
+        let mut_union = types.union(vec![first, second], AccessCapability::Mut);
+        let const_intersection =
+            types.intersection(vec![first, second], AccessCapability::Const);
+        let mut_intersection =
+            types.intersection(vec![first, second], AccessCapability::Mut);
+
+        assert_eq!(
+            types.with_capability(const_union, AccessCapability::Mut),
+            Some(mut_union)
+        );
+        assert_eq!(
+            types.with_capability(mut_union, AccessCapability::Const),
+            Some(const_union)
+        );
+        assert_eq!(
+            types.with_capability(const_intersection, AccessCapability::Mut),
+            Some(mut_intersection)
+        );
+        assert_eq!(
+            types.with_capability(mut_intersection, AccessCapability::Const),
+            Some(const_intersection)
         );
     }
 

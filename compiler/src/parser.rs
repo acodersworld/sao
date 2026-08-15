@@ -63,6 +63,7 @@ pub enum ParseErrorKind {
     },
     InvalidReceiverQualifiers,
     BindingValueCapabilityMustPrecedeName,
+    AggregateMemberCapabilityNotSupported,
     ExpectedToken {
         expected: TokenKind,
         found: TokenKind,
@@ -750,6 +751,14 @@ where
     }
 
     fn type_expression(&mut self) -> ParseResult<TypeSyntax> {
+        let token = self.current()?;
+        if token.kind == TokenKind::Mut {
+            self.advance()?;
+            let inner = self.type_expression()?;
+            let span = Span::new(self.module_id, token.span.start, inner.span.end);
+            return Ok(TypeSyntax::new(TypeKind::Mutable(Box::new(inner)), span));
+        }
+
         let first = self.intersection_type()?;
 
         if self.current()?.kind != TokenKind::Pipe {
@@ -764,6 +773,14 @@ where
             members.push(self.intersection_type()?);
         }
 
+        if let Some(member) = members.iter().find(|member| outer_mutable_type(member)) {
+            return Err(ParseError {
+                kind: ParseErrorKind::AggregateMemberCapabilityNotSupported,
+                span: member.span,
+            }
+            .into());
+        }
+
         let end = members.last().expect("a union has members").span.end;
         Ok(TypeSyntax::new(
             TypeKind::Union { members },
@@ -772,7 +789,16 @@ where
     }
 
     fn intersection_type(&mut self) -> ParseResult<TypeSyntax> {
-        let first = self.prefix_type()?;
+        let token = self.current()?;
+        if token.kind == TokenKind::Mut {
+            return Err(ParseError {
+                kind: ParseErrorKind::AggregateMemberCapabilityNotSupported,
+                span: token.span,
+            }
+            .into());
+        }
+
+        let first = self.primary_type()?;
 
         if self.current()?.kind != TokenKind::Ampersand {
             return Ok(first);
@@ -783,7 +809,23 @@ where
 
         while self.current()?.kind == TokenKind::Ampersand {
             self.advance()?;
-            members.push(self.prefix_type()?);
+            let token = self.current()?;
+            if token.kind == TokenKind::Mut {
+                return Err(ParseError {
+                    kind: ParseErrorKind::AggregateMemberCapabilityNotSupported,
+                    span: token.span,
+                }
+                .into());
+            }
+            members.push(self.primary_type()?);
+        }
+
+        if let Some(member) = members.iter().find(|member| outer_mutable_type(member)) {
+            return Err(ParseError {
+                kind: ParseErrorKind::AggregateMemberCapabilityNotSupported,
+                span: member.span,
+            }
+            .into());
         }
 
         let end = members
@@ -795,19 +837,6 @@ where
             TypeKind::Intersection { members },
             Span::new(self.module_id, start, end),
         ))
-    }
-
-    fn prefix_type(&mut self) -> ParseResult<TypeSyntax> {
-        let token = self.current()?;
-
-        if token.kind != TokenKind::Mut {
-            return self.primary_type();
-        }
-
-        self.advance()?;
-        let inner = self.prefix_type()?;
-        let span = Span::new(self.module_id, token.span.start, inner.span.end);
-        Ok(TypeSyntax::new(TypeKind::Mutable(Box::new(inner)), span))
     }
 
     fn primary_type(&mut self) -> ParseResult<TypeSyntax> {
@@ -6511,19 +6540,46 @@ mod tests {
     }
 
     #[test]
-    fn mutable_qualifier_applies_to_the_following_union_member() {
-        let type_syntax =
-            parse_type_source("mut User | none").expect("mutable union type should parse");
-        let TypeKind::Union { members } = type_syntax.kind else {
-            panic!("expected a union type");
-        };
+    fn mutable_qualifier_applies_to_the_complete_union() {
+        for source in ["mut User | none", "mut (User | none)"] {
+            let type_syntax =
+                parse_type_source(source).expect("mutable union type should parse");
+            let TypeKind::Mutable(inner) = type_syntax.kind else {
+                panic!("expected a mutable type for {source}");
+            };
 
-        assert_eq!(members.len(), 2);
-        assert!(matches!(&members[0].kind, TypeKind::Mutable(_)));
-        assert!(matches!(
-            &members[1].kind,
-            TypeKind::Primitive(PrimitiveType::None)
-        ));
+            let union = match inner.kind {
+                TypeKind::Union { members } => members,
+                TypeKind::Group(grouped) => {
+                    let TypeKind::Union { members } = grouped.kind else {
+                        panic!("expected a grouped union for {source}");
+                    };
+                    members
+                }
+                _ => panic!("expected a union for {source}"),
+            };
+
+            assert_eq!(union.len(), 2);
+        }
+    }
+
+    #[test]
+    fn rejects_capabilities_on_individual_aggregate_members() {
+        for (source, start, end) in [
+            ("User | mut none", 7, 10),
+            ("Reader & mut Writer", 9, 12),
+            ("User | (mut none)", 7, 17),
+            ("Reader & (mut Writer)", 9, 21),
+        ] {
+            assert_eq!(
+                parse_type_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::AggregateMemberCapabilityNotSupported,
+                    span: span(start, end),
+                })),
+                "incorrect diagnostic for {source}",
+            );
+        }
     }
 
     #[test]

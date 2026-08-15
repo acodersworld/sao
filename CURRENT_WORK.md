@@ -47,8 +47,11 @@ reviewable phases:
      and anonymous structs; declared structural interfaces; compiler-known
      built-ins; copied/reference value metadata; and internal recovery and
      divergence types.
-   - Next: add canonical union and intersection normalization, then complete
-     the foundation's identity, equality, and type-metadata APIs.
+   - Complete: capability-qualified canonical union and intersection identities
+     with associative flattening, exact-member deduplication,
+     order-independent identity, and capability-preserving singleton collapse.
+   - Next: complete the foundation's identity, equality, and type-metadata
+     APIs.
 2. Declarations and signatures
    - Resolve type syntax and collect struct fields, methods, interface
      requirements, callable signatures, and built-in signatures before checking
