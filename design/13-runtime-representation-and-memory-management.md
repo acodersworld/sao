@@ -53,6 +53,9 @@ Initial union-layout rules:
 
 - Every materialized union has an explicit tag identifying its active member.
 - The payload has the size and alignment required by the largest member.
+- Union values have shallow-copy semantics: copying a union duplicates its tag
+  and active payload, but any references in that payload continue to refer to
+  the same shared storage.
 - Primitive members such as `int` and `float` remain unboxed in the payload.
 - `none` has a tag but requires no payload data.
 - Converting a narrower union to a wider union remaps the tag and copies its

@@ -98,8 +98,9 @@ The initial `Queue<T>` requires that `T` not contain `none`; otherwise an empty
 queue could not be distinguished from a successfully received `none` value.
 A future explicitly tagged receive-result type may remove this restriction.
 
-Sending follows ordinary assignment semantics. Independently copied value types
-are copied into the queue; reference values copy their object reference and
+Sending follows ordinary assignment semantics. Shallow-copied values duplicate
+their immediate representation in the queue; any references within that
+representation remain shared. Reference values copy their object reference and
 preserve the access capability admitted by `T`. Queue references themselves may
 be shared between coroutines under SAO's existing aliasing and capability rules.
 Because scheduling never occurs during a queue operation, each operation

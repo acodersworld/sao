@@ -45,8 +45,8 @@ reviewable phases:
    - Complete: a program-local canonical type interner with opaque type
      identities; capability-qualified primitives and callables; nominal named
      and anonymous structs; declared structural interfaces; compiler-known
-     built-ins; copied/reference value metadata; and internal recovery and
-     divergence types.
+     built-ins; shallow-copied/reference value metadata; and internal recovery
+     and divergence types.
    - Complete: capability-qualified canonical union and intersection identities
      with associative flattening, exact-member deduplication,
      order-independent identity, and capability-preserving singleton collapse.
@@ -69,8 +69,8 @@ reviewable phases:
      capability in semantic types.
    - Check binding, parameter, receiver, field, index, assignment,
      compound-assignment, and range-binding mutability.
-   - Permit copied values to acquire independent mutable storage without
-     allowing reference capabilities to increase.
+   - Permit shallow-copied values to acquire independent mutable storage
+     without allowing reference capabilities to increase.
 5. Aggregates and structural typing
    - Check named and anonymous struct construction, fields, methods, associated
      functions, member selection, and structural interface satisfaction.

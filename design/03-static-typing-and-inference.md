@@ -92,9 +92,11 @@ a location requiring `mut`. Multiple aliases are allowed, so the object observed
 through `view` may still change through `user` or another `mut` alias. SAO does
 not enforce uniqueness, ownership, borrowing, or lifetimes.
 
-These capability restrictions apply to references. Independently copied value
-types may use a different binding qualifier because changing the copy cannot
-affect the source:
+These capability restrictions apply to references. Shallow-copied values
+duplicate their immediate representation when assigned or passed. References
+contained in that representation remain shared; copying never recursively
+duplicates referenced objects. A shallow-copied value may use a different
+binding qualifier because changing the immediate copy cannot affect the source:
 
 ```text
 const original = 10;
@@ -143,7 +145,8 @@ A function declared to return a const reference may return either const or mut
 access, reducing mut to const when necessary. A function declared `-> mut T`
 must return mut access. The qualifier is part of function and method signatures,
 including callable types and interface requirements. A return
-capability qualifier is unnecessary for copied value types such as `int`.
+capability qualifier is unnecessary for shallow-copied value types such as
+`int`.
 Union and intersection capabilities apply to the complete aggregate rather
 than individual members. Grouping is preferred when writing them explicitly,
 so `-> mut (User | none)` returns mutable access through either active member.

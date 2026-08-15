@@ -16,10 +16,14 @@ pub enum AccessCapability {
     Mut,
 }
 
-/// Whether values of a type are copied directly or refer to shared storage.
+/// How assigning or passing a value preserves its runtime identity.
+///
+/// A shallow-copied value duplicates its immediate representation. References
+/// contained within that representation continue to refer to the same shared
+/// storage; copying does not recursively duplicate referenced objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueSemantics {
-    Copied,
+    ShallowCopied,
     Reference,
 }
 
@@ -108,7 +112,7 @@ impl SemanticType {
                 builtin: BuiltinType::Error,
                 ..
             }
-            | Self::Union { .. } => Some(ValueSemantics::Copied),
+            | Self::Union { .. } => Some(ValueSemantics::ShallowCopied),
             Self::Recovery | Self::Divergence => None,
         }
     }
@@ -463,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn primitive_metadata_distinguishes_copied_and_reference_values() {
+    fn primitive_metadata_distinguishes_shallow_copied_and_reference_values() {
         let mut types = TypeStore::new();
 
         for primitive in [
@@ -478,7 +482,10 @@ mod tests {
             let semantic_type = types.get(id).expect("primitive should be interned");
 
             assert_eq!(semantic_type.capability(), Some(AccessCapability::Const));
-            assert_eq!(semantic_type.value_semantics(), Some(ValueSemantics::Copied));
+            assert_eq!(
+                semantic_type.value_semantics(),
+                Some(ValueSemantics::ShallowCopied)
+            );
         }
 
         for primitive in [PrimitiveType::String, PrimitiveType::Bytes] {
@@ -645,7 +652,7 @@ mod tests {
         assert_eq!(semantic_type.capability(), Some(AccessCapability::Mut));
         assert_eq!(
             semantic_type.value_semantics(),
-            Some(ValueSemantics::Copied)
+            Some(ValueSemantics::ShallowCopied)
         );
     }
 
@@ -801,7 +808,10 @@ mod tests {
 
         let union_type = types.get(union).expect("union should be interned");
         assert_eq!(union_type.capability(), Some(AccessCapability::Mut));
-        assert_eq!(union_type.value_semantics(), Some(ValueSemantics::Copied));
+        assert_eq!(
+            union_type.value_semantics(),
+            Some(ValueSemantics::ShallowCopied)
+        );
 
         let intersection_type = types
             .get(intersection)
