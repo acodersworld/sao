@@ -148,6 +148,19 @@ const scale = lambda(value: float) -> float {
 };
 ```
 
+For a zero-parameter lambda, the empty parameter list may be omitted. A return
+annotation, when needed, follows `lambda` directly:
+
+```text
+const notify = lambda {
+    output.write("done");
+};
+
+const answer = lambda -> int {
+    42
+};
+```
+
 As with named functions, omitting `-> Type` means `-> ()`; the return type is
 not inferred from the body.
 

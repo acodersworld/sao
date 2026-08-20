@@ -1480,7 +1480,11 @@ where
 
     fn lambda_expression(&mut self) -> ParseResult {
         let keyword = self.expect(TokenKind::Lambda)?;
-        let parameters = self.function_parameters(false)?;
+        let parameters = if self.current()?.kind == TokenKind::LeftParen {
+            self.function_parameters(false)?
+        } else {
+            Vec::new()
+        };
         let return_type = self.optional_return_type()?;
         let body = self.block()?;
         let span = Span::new(self.module_id, keyword.span.start, body.span.end);
@@ -3249,6 +3253,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_zero_parameter_lambdas_without_parentheses() {
+        let expression = parse("lambda { work(); }").expect("lambda shorthand should parse");
+
+        assert_eq!(expression.span, span(0, 18));
+        let ExpressionKind::Lambda {
+            parameters,
+            return_type,
+            body,
+        } = expression.kind
+        else {
+            panic!("expected a lambda expression");
+        };
+        assert!(parameters.is_empty());
+        assert_eq!(return_type, None);
+        assert_eq!(body.span, span(7, 18));
+        assert_eq!(body.statements.len(), 1);
+
+        let expression = parse("lambda -> int { 1 }")
+            .expect("lambda shorthand with an explicit return should parse");
+        let ExpressionKind::Lambda {
+            parameters,
+            return_type,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected a lambda expression");
+        };
+        assert!(parameters.is_empty());
+        assert!(matches!(
+            return_type.map(|return_type| return_type.kind),
+            Some(TypeKind::Primitive(PrimitiveType::Int))
+        ));
+    }
+
+    #[test]
     fn parses_typed_lambda_parameters_and_explicit_returns() {
         let source = "lambda(value: int, mut output: Writer,) -> int { return value; }";
         let expression = parse(source).expect("typed lambda should parse");
@@ -3423,7 +3462,7 @@ mod tests {
             (
                 "lambda",
                 ParseErrorKind::ExpectedToken {
-                    expected: TokenKind::LeftParen,
+                    expected: TokenKind::LeftBrace,
                     found: TokenKind::Eof,
                 },
                 span(6, 6),

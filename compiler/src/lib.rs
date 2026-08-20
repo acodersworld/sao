@@ -87,6 +87,9 @@ fn main() -> Summary {
     const heap_scale: &fn(int) -> int = &lambda(value: int) -> int {
         return scale(value + 1);
     };
+    const notify = lambda {
+        announce(initial);
+    };
 
     const formatter: Formatter = struct {
         prefix: string = "total: ";
@@ -133,6 +136,7 @@ fn main() -> Summary {
     formatter.format(middle);
     heap_formatter.format(text);
     heap_scale(initial);
+    notify();
     shared_summary.format("shared: ");
     capabilities.format("capabilities: ");
     queue.length();
