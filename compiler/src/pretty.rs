@@ -312,14 +312,18 @@ fn format_parameter_into(
             );
             child_type(output, source, "type", type_annotation, depth);
         }
-        FunctionParameterKind::Receiver { .. } => {
+        FunctionParameterKind::Receiver {
+            storage,
+            ..
+        } => {
             line(
                 output,
                 depth,
                 format_args!(
-                    "Parameter binding={:?} value={:?} Self {}",
+                    "Parameter binding={:?} value={:?} storage={:?} Self {}",
                     parameter.qualifiers.binding,
                     parameter.qualifiers.value,
+                    storage,
                     location(parameter.span)
                 ),
             );
@@ -452,6 +456,10 @@ fn format_expression_into(
                 format_args!("PrimitiveConversion {target:?} {}", location(span)),
             );
             child_expression(output, source, "value", value, depth);
+        }
+        ExpressionKind::GarbageCollect(inner) => {
+            line(output, depth, format_args!("GarbageCollect {}", location(span)));
+            child_expression(output, source, "value", inner, depth);
         }
         ExpressionKind::StructConstruction { name, fields } => {
             line(
@@ -760,6 +768,14 @@ fn format_type_into(
             line(output, depth, format_args!("Mutable {}", location(span)));
             child_type(output, source, "type", inner, depth);
         }
+        TypeKind::GarbageCollected(inner) => {
+            line(
+                output,
+                depth,
+                format_args!("GarbageCollected {}", location(span)),
+            );
+            child_type(output, source, "type", inner, depth);
+        }
         TypeKind::Group(inner) => {
             line(output, depth, format_args!("Group {}", location(span)));
             child_type(output, source, "type", inner, depth);
@@ -906,7 +922,7 @@ mod tests {
         assert!(output.contains("Field \"x\" @ 15..24"));
         assert!(output.contains("Primitive Float @ 18..23"));
         assert!(output.contains("Function \"get_x\" @ 25..59"));
-        assert!(output.contains("Parameter binding=Const value=Const Self"));
+        assert!(output.contains("Parameter binding=Const value=Const storage=Plain Self"));
     }
 
     #[test]
@@ -923,7 +939,7 @@ mod tests {
         assert!(output.contains(&format!("Interface \"Writer\" @ 0..{}", source.len())));
         assert!(output.contains("requirements:"));
         assert!(output.contains("MethodRequirement \"write\""));
-        assert!(output.contains("Parameter binding=Const value=Mut Self"));
+        assert!(output.contains("Parameter binding=Const value=Mut storage=Plain Self"));
         assert!(output.contains("Parameter binding=Const value=Const \"data\""));
         assert!(output.contains("Primitive Bytes"));
         assert!(output.contains("Primitive Int"));
@@ -1285,7 +1301,7 @@ mod tests {
         let statement = parse_statement_source(source);
         let output = format_statement(&module(source), &statement);
 
-        assert!(output.contains("Parameter binding=Const value=Mut Self @ 8..16"));
+        assert!(output.contains("Parameter binding=Const value=Mut storage=Plain Self @ 8..16"));
         assert!(output.contains("return_type:\n    (default ())"));
         assert!(output.contains("Return @ 20..27\n            value:\n              (none)"));
     }

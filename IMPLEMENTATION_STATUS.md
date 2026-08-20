@@ -8,7 +8,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-08-15
+Last reviewed: 2026-08-20
 
 ## Lexer status
 
@@ -34,9 +34,11 @@ The parser currently supports:
 - Semicolon-terminated interface method requirements with receiver, parameter,
   and return-type syntax.
 - Primitive, named, parameterized, mutable, grouped, callable, union, and
-  intersection type syntax.
+  intersection type syntax, plus explicit `&T` and `&mut T` GC qualification.
 - Literals, identifiers, `self`, grouping, and expression-oriented blocks.
 - Prefix, binary, assignment, type-test, and postfix operators.
+- Prefix GC allocation with `&expression`, while retaining infix bitwise-and
+  and reserving `&&` exclusively for logical-and.
 - Calls, value-member access with `.`, type-associated access with `::`,
   indexing, exclusive open or bounded slicing, and postfix error propagation
   with `?`.
@@ -50,7 +52,7 @@ The parser currently supports:
   expressions, including initialized fields and methods.
 - Immutable and mutable bindings.
 - Named and nested functions, receiverless named-struct functions, method
-  receivers, returns, and lambdas.
+  receivers including `&self` and `&mut self`, returns, and lambdas.
 - Call-only `defer` and coroutine-start `co` statements.
 - `if`/`else if`/`else`, `loop`, `while`, and integer range `for` expressions.
 - `break`, `continue`, and value-producing loop syntax.
@@ -83,9 +85,10 @@ body. Parentheses re-enable it, as in `if (Position { x: 1.0, y: 2.0 }) {}`.
 
 Interfaces use contextual structural conversion rather than dedicated
 construction syntax. `struct { ... }` is the only anonymous-struct expression;
-an annotation, parameter, or return type may later convert its hidden concrete
-type to a satisfied interface during semantic analysis. `Writer { ... }` is not
-an interface implementation expression.
+a local annotation or parameter may later borrow its hidden concrete type as a
+satisfied plain interface. Field, capture, and return contexts require a
+GC-qualified interface and implementation. `Writer { ... }` is not an interface
+implementation expression.
 
 ## Semantic analysis status
 
@@ -129,16 +132,18 @@ Context resolution is implemented as an AST-only pass. It:
 The semantic type foundation is implemented. It provides a program-local
 canonical type store for capability-qualified primitives, callables, nominal
 named and anonymous structs, interfaces, compiler-known parameterized types,
-unions, intersections, and internal recovery and divergence types. Union and
+unions, intersections, canonical explicit GC references, and internal recovery
+and divergence types. Union and
 intersection construction is associative, commutative, and idempotent, with an
 outer capability distinct from member capabilities. The store exposes exact
 identity, equality that ignores only the outer capability, safe structural
-lookup, and shallow-copied/reference value semantics directly on the canonical
-type representation.
+lookup, inline/borrowed/GC storage semantics, compiler-defined copy semantics,
+and typed-expression value categories.
 
 Source type resolution, declaration and signature collection, expression type
-checking and inference, assignability, capture analysis, and typed IR production
-are not yet implemented.
+checking and inference, assignability, finite-layout validation, capture and
+escape analysis, hidden-root calculation, and typed IR production are not yet
+implemented.
 
 ## Runtime prototype status
 

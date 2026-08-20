@@ -50,6 +50,12 @@ and another integer rather than a floating-point literal. The `..=` token is
 valid for inclusive range headers but is rejected as an inclusive slice
 delimiter.
 
+`&` remains one token with context-dependent grammar roles: infix bitwise-and
+in expressions, infix intersection in types, prefix GC allocation in
+expressions, and prefix GC qualification in types. `&&` is exclusively the
+logical-and token and is never interpreted as repeated GC qualification.
+Mutable GC type access is written `&mut T`, not `mut &T`.
+
 Digit separators and binary, octal, or hexadecimal integer literals are not
 initially supported. Range checking and numeric conversion belong to semantic
 analysis rather than lexing.

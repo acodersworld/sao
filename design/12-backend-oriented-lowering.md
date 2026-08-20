@@ -25,6 +25,12 @@ Loop expressions similarly lower to a result temporary plus ordinary branches.
 The IR, rather than the C syntax, should represent block parameters, loop result
 values, and cleanup edges.
 
+Plain aggregate returns use caller-provided result storage. Fresh temporaries
+may be constructed directly in that slot; returning a named source emits the
+compiler-defined recursive copy. Prefix `&` instead allocates a common GC
+header plus payload and moves a fresh temporary into the payload. Inline locals
+and fields do not receive individual GC headers.
+
 The initial coroutine implementation uses explicit compiler-generated activation
 frames rather than native C stack suspension. Every generated C function accepts
 a pointer to a frame struct containing its parameters, source locals,

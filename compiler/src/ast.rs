@@ -348,8 +348,20 @@ pub enum FunctionParameterKind {
         name: Span,
         type_annotation: TypeSyntax,
     },
-    /// A method receiver written as `self` or `mut self`.
-    Receiver { name: Span },
+    /// A method receiver written as `self`, `mut self`, `&self`, or
+    /// `&mut self`.
+    Receiver {
+        name: Span,
+        /// Whether the receiver is a non-escaping view or requires
+        /// independently GC-managed storage and may be retained.
+        storage: ReceiverStorage,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReceiverStorage {
+    Plain,
+    GarbageCollected,
 }
 
 /// The syntax accepted after an `else` keyword.
@@ -431,6 +443,9 @@ pub enum TypeKind {
         arguments: Vec<TypeSyntax>,
     },
     Mutable(Box<TypeSyntax>),
+    /// An explicitly garbage-collected, escapable value. The contained type
+    /// carries the access capability selected by `&T` or `&mut T`.
+    GarbageCollected(Box<TypeSyntax>),
     Group(Box<TypeSyntax>),
     Callable {
         parameters: Vec<TypeSyntax>,
@@ -508,6 +523,9 @@ pub enum ExpressionKind {
         target: PrimitiveType,
         value: Box<Expression>,
     },
+    /// Moves a fresh value into independently managed GC storage. Reapplying
+    /// `&` to an already GC-qualified value is semantically idempotent.
+    GarbageCollect(Box<Expression>),
     StructConstruction {
         name: Span,
         fields: Vec<StructFieldInitializer>,

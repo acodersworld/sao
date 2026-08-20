@@ -494,6 +494,7 @@ impl ContextResolver {
                 self.enter_callable(expression.id, false, body);
             }
             ExpressionKind::PrimitiveConversion { value, .. } => self.visit_expression(value),
+            ExpressionKind::GarbageCollect(value) => self.visit_expression(value),
             ExpressionKind::StructConstruction { fields, .. } => {
                 for field in fields {
                     self.visit_expression(&field.value);

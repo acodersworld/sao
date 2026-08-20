@@ -74,8 +74,8 @@ references remain resolved to the earlier declaration. This permission applies
 to local binding shadowing, not to duplicate parameters or duplicate named
 function, struct, or interface declarations, which are compile-time errors.
 
-For reference types, const value access is a transitive read-only capability
-rather than a deep-immutability guarantee:
+For borrowed views and explicit `&T` GC references, const value access is a
+transitive read-only capability rather than a deep-immutability guarantee:
 
 ```text
 mut user = User { name: "Ben" };
@@ -92,11 +92,11 @@ a location requiring `mut`. Multiple aliases are allowed, so the object observed
 through `view` may still change through `user` or another `mut` alias. SAO does
 not enforce uniqueness, ownership, borrowing, or lifetimes.
 
-These capability restrictions apply to references. Shallow-copied values
-duplicate their immediate representation when assigned or passed. References
-contained in that representation remain shared; copying never recursively
-duplicates referenced objects. A shallow-copied value may use a different
-binding qualifier because changing the immediate copy cannot affect the source:
+These capability restrictions apply to borrows and GC references. Scalar values
+are copied trivially. Object-like plain values bind and pass as non-escaping
+borrows unless an owning boundary explicitly or implicitly copies them as
+specified in Chapter 18. The reserved `.copy()` operation recursively copies
+inline storage while preserving shared nested GC references.
 
 ```text
 const original = 10;
@@ -128,25 +128,23 @@ The induction binding of a range `for` loop is always immutable and is controlle
 by the loop. It is written without `const`; `mut` is not permitted for this
 binding.
 
-Reference return types are also const by default. Returning mutable access is
-explicit with `mut`:
+Plain returns copy or move their value into caller-owned storage. GC-reference
+returns are written with `&`; mutable access through one is written `&mut`:
 
 ```text
 fn current_user() -> User {
-    // Returns const access.
+    // Returns a value copy.
 }
 
-fn create_user(name: string) -> mut User {
-    User { name: name }
+fn shared_user(name: string) -> &mut User {
+    &User { name: name }
 }
 ```
 
-A function declared to return a const reference may return either const or mut
-access, reducing mut to const when necessary. A function declared `-> mut T`
-must return mut access. The qualifier is part of function and method signatures,
-including callable types and interface requirements. A return
-capability qualifier is unnecessary for shallow-copied value types such as
-`int`.
+A function declared to return `&T` may return either const or mutable GC access,
+reducing mutable access to const when necessary. A function declared `-> &mut T`
+must return mutable GC access. A plain erased interface or capturing callable
+cannot be returned; those returns require `&Interface` or `&fn(...)`.
 Union and intersection capabilities apply to the complete aggregate rather
 than individual members. Grouping is preferred when writing them explicitly,
 so `-> mut (User | none)` returns mutable access through either active member.
@@ -189,8 +187,8 @@ SAO has a deliberately small, fixed primitive set:
 - `bool` has the values `true` and `false`. Conditions require `bool`; SAO has
   no implicit truthiness conversions.
 - `char` is a one-byte ASCII value in the range 0 through 127.
-- `string` is a garbage-collected mutable sequence of one-byte ASCII
-  characters. It is a reference type despite being part of the primitive set.
+- `string` is a mutable sequence of one-byte ASCII characters. A plain string
+  is frame-owned and non-escaping; `&string` is independently GC-managed.
 - `()` is the unit type and has one value, also written `()`.
 - `none` is the singleton absence type and value described with unions in
   Section 8.
@@ -365,15 +363,16 @@ String rules:
 - Out-of-range indexing or indexed assignment panics.
 - String length and encoded byte length are identical and available in constant
   time.
-- A const string reference is transitively read-only. A mut string reference
+- A const string view is transitively read-only. A mut string view
   supports indexed mutation, append, extend, and resize.
-- Assignment, parameter passing, returning, and capture copy the string object
-  reference. Mutations are visible through every alias to that object.
+- Local binding and parameter passing may borrow the same string storage.
+  Owning boundaries move a temporary or copy as specified in Chapter 18.
 - Concatenation with `+` creates a new mutable string and does not modify either
   operand.
 
-The built-in `bytes` type is a garbage-collected sequence of arbitrary byte
-values from 0 through 255. It is separate from `string`:
+The built-in `bytes` type is a mutable sequence of arbitrary byte values from 0
+through 255. It follows the uniform plain/explicit-GC rules and is separate from
+`string`:
 
 - `bytes[index]` returns an `int` in the range 0 through 255.
 - Indexed assignment accepts only an `int` in that range and panics otherwise.

@@ -42,16 +42,16 @@ fn copy_once(mut stream: Reader & Writer) -> int {
     stream.write(data)
 }
 
-fn prefixed_writer(prefix: bytes, const vmut destination: Writer) -> mut Writer {
-    struct {
+fn prefixed_writer(prefix: bytes, destination: &mut Writer) -> &mut Writer {
+    &struct {
         fn write(mut self, data: bytes) -> int {
             destination.write(bytes::concat(prefix, data))
         }
     }
 }
 
-fn make_prefixer(prefix: bytes) -> fn(bytes) -> bytes {
-    lambda(data: bytes) -> bytes {
+fn make_prefixer(prefix: bytes) -> &fn(bytes) -> bytes {
+    &lambda(data: bytes) -> bytes {
         bytes::concat(prefix, data)
     }
 }
@@ -64,7 +64,9 @@ fn write_file(path: string, data: bytes) -> int {
 }
 ```
 
-The anonymous writer and lambda examples use automatic lexical capture. Their
-environments use the specialized garbage-collected layouts described above.
+The anonymous writer and lambda examples use automatic lexical capture and
+explicitly GC-qualify the escaping values. Their environments use specialized
+garbage-collected layouts. Plain capturing values instead remain frame-owned
+and non-escaping.
 The file example shows the intended lexical cleanup behaviour without allowing
 a resource to escape its scope.

@@ -60,9 +60,10 @@ fn inner() -> () {
 
 ## 10.1 Queues
 
-Coroutines communicate through the compiler-known built-in reference type
-`Queue<T>`. Like `Error<T>`, this is a dedicated parameterized type and does not
-enable user-defined generics. A fresh queue is constructed with:
+Coroutines communicate through the compiler-known built-in type `Queue<T>`.
+Like `Error<T>`, this is a dedicated parameterized type and does not enable
+user-defined generics. It follows the uniform plain/explicit-GC rules; a fresh
+queue is constructed with:
 
 ```text
 mut messages = Queue<int>::new();
@@ -98,10 +99,10 @@ The initial `Queue<T>` requires that `T` not contain `none`; otherwise an empty
 queue could not be distinguished from a successfully received `none` value.
 A future explicitly tagged receive-result type may remove this restriction.
 
-Sending follows ordinary assignment semantics. Shallow-copied values duplicate
-their immediate representation in the queue; any references within that
-representation remain shared. Reference values copy their object reference and
-preserve the access capability admitted by `T`. Queue references themselves may
-be shared between coroutines under SAO's existing aliasing and capability rules.
+Sending is an owning boundary. Fresh plain values may move into queue storage;
+named plain values require explicit `.copy()`, and nested `&T`
+members remain shared. GC-qualified values copy their stable reference and
+preserve the access capability admitted by `T`. Queue references may be shared
+between coroutines under SAO's existing aliasing and capability rules.
 Because scheduling never occurs during a queue operation, each operation
 completes before another coroutine can access the queue.

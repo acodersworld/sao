@@ -5,7 +5,7 @@ use crate::ast::{
     BindingMutability, BindingQualifiers, Block, BuiltinType, ConditionalElse, Declaration,
     Expression, ExpressionKind, Function, FunctionParameter, FunctionParameterKind,
     InterfaceDeclaration, InterfaceMethodRequirement, LiteralKind, NodeId, PrimitiveType, Program,
-    RangeInclusivity, Statement, StatementKind, StructDeclaration, StructField,
+    RangeInclusivity, ReceiverStorage, Statement, StatementKind, StructDeclaration, StructField,
     StructFieldInitializer, StructMember, TypeKind, TypeSyntax, UnaryOperator, ValueCapability,
 };
 use crate::lexer::{LexError, Token, TokenKind};
@@ -62,6 +62,7 @@ pub enum ParseErrorKind {
         found: TokenKind,
     },
     InvalidReceiverQualifiers,
+    InvalidGarbageCollectedCapabilitySyntax,
     BindingValueCapabilityMustPrecedeName,
     AggregateMemberCapabilityNotSupported,
     ExpectedToken {
@@ -475,6 +476,7 @@ where
                 BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
                 FunctionParameterKind::Receiver {
                     name: receiver.span,
+                    storage: ReceiverStorage::Plain,
                 },
                 receiver.span,
             ));
@@ -501,12 +503,39 @@ where
                 BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut),
                 FunctionParameterKind::Receiver {
                     name: receiver.span,
+                    storage: ReceiverStorage::Plain,
                 },
                 Span::new(
                     self.module_id,
                     parsed.binding_token.span.start,
                     receiver.span.end,
                 ),
+            ));
+        }
+
+        if allow_receiver && first.kind == TokenKind::Ampersand {
+            let ampersand = self.advance()?;
+            let mutable = if self.current()?.kind == TokenKind::Mut {
+                self.advance()?;
+                true
+            } else {
+                false
+            };
+            let receiver = self.expect(TokenKind::SelfValue)?;
+            return Ok(FunctionParameter::new(
+                BindingQualifiers::new(
+                    BindingMutability::Const,
+                    if mutable {
+                        ValueCapability::Mut
+                    } else {
+                        ValueCapability::Const
+                    },
+                ),
+                FunctionParameterKind::Receiver {
+                    name: receiver.span,
+                    storage: ReceiverStorage::GarbageCollected,
+                },
+                Span::new(self.module_id, ampersand.span.start, receiver.span.end),
             ));
         }
 
@@ -755,6 +784,13 @@ where
         let token = self.current()?;
         if token.kind == TokenKind::Mut {
             self.advance()?;
+            if self.current()?.kind == TokenKind::Ampersand {
+                return Err(ParseError {
+                    kind: ParseErrorKind::InvalidGarbageCollectedCapabilitySyntax,
+                    span: token.span,
+                }
+                .into());
+            }
             let inner = self.type_expression()?;
             let span = Span::new(self.module_id, token.span.start, inner.span.end);
             return Ok(TypeSyntax::new(TypeKind::Mutable(Box::new(inner)), span));
@@ -844,6 +880,7 @@ where
         let token = self.current()?;
 
         match token.kind {
+            TokenKind::Ampersand => self.garbage_collected_type(),
             TokenKind::Int => self.primitive_type(PrimitiveType::Int),
             TokenKind::Float => self.primitive_type(PrimitiveType::Float),
             TokenKind::Bool => self.primitive_type(PrimitiveType::Bool),
@@ -864,6 +901,32 @@ where
             }
             .into()),
         }
+    }
+
+    fn garbage_collected_type(&mut self) -> ParseResult<TypeSyntax> {
+        let ampersand = self.advance()?;
+        let mutable = if self.current()?.kind == TokenKind::Mut {
+            self.advance()?;
+            true
+        } else {
+            false
+        };
+        let inner = self.primary_type()?;
+        let end = inner.span.end;
+        let mut inner = match inner.kind {
+            TypeKind::GarbageCollected(inner) => *inner,
+            kind => TypeSyntax::new(kind, inner.span),
+        };
+
+        if mutable && !matches!(&inner.kind, TypeKind::Mutable(_)) {
+            let span = Span::new(self.module_id, ampersand.span.start, inner.span.end);
+            inner = TypeSyntax::new(TypeKind::Mutable(Box::new(inner)), span);
+        }
+
+        Ok(TypeSyntax::new(
+            TypeKind::GarbageCollected(Box::new(inner)),
+            Span::new(self.module_id, ampersand.span.start, end),
+        ))
     }
 
     fn primitive_type(&mut self, primitive: PrimitiveType) -> ParseResult<TypeSyntax> {
@@ -1285,6 +1348,20 @@ where
         let token = self.current()?;
 
         match token.kind {
+            TokenKind::Ampersand => {
+                self.advance()?;
+                let operand = self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
+                let span = Span::new(self.module_id, token.span.start, operand.span.end);
+                let operand = match operand.kind {
+                    ExpressionKind::GarbageCollect(inner) => *inner,
+                    kind => Expression::new(kind, operand.span),
+                };
+
+                Ok(Expression::new(
+                    ExpressionKind::GarbageCollect(Box::new(operand)),
+                    span,
+                ))
+            }
             TokenKind::Minus => {
                 self.advance()?;
                 let operand =
@@ -2002,6 +2079,7 @@ fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext
     expression.id = context.next_node_id();
     match &mut expression.kind {
         ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {}
+        ExpressionKind::GarbageCollect(inner) => assign_expression_ids(inner, context),
         ExpressionKind::Group(inner) => assign_expression_ids(inner, context),
         ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
             assign_block_ids(block, context);
@@ -2130,7 +2208,9 @@ fn assign_type_ids(type_syntax: &mut TypeSyntax, context: &mut ParseContext) {
                 assign_type_ids(argument, context);
             }
         }
-        TypeKind::Mutable(inner) | TypeKind::Group(inner) => assign_type_ids(inner, context),
+        TypeKind::Mutable(inner)
+        | TypeKind::GarbageCollected(inner)
+        | TypeKind::Group(inner) => assign_type_ids(inner, context),
         TypeKind::Callable {
             parameters,
             return_type,
@@ -2239,7 +2319,10 @@ const PREFIX_BINDING_POWER: u8 = 23;
 
 const fn prefix_binding_power(kind: TokenKind) -> u8 {
     match kind {
-        TokenKind::Minus | TokenKind::Bang | TokenKind::Tilde => PREFIX_BINDING_POWER,
+        TokenKind::Ampersand
+        | TokenKind::Minus
+        | TokenKind::Bang
+        | TokenKind::Tilde => PREFIX_BINDING_POWER,
         _ => LOWEST_BINDING_POWER,
     }
 }
@@ -3053,7 +3136,7 @@ mod tests {
             function.parameters[0].qualifiers,
             BindingQualifiers::new(BindingMutability::Const, ValueCapability::Mut)
         );
-        let FunctionParameterKind::Receiver { name } = &function.parameters[0].kind else {
+        let FunctionParameterKind::Receiver { name, .. } = &function.parameters[0].kind else {
             panic!("expected a receiver parameter");
         };
         assert_eq!(*name, span(14, 18));
@@ -3071,6 +3154,35 @@ mod tests {
             Statement::new(StatementKind::Return(None), span(42, 49))
         );
         assert!(function.body.value.is_none());
+    }
+
+    #[test]
+    fn parses_gc_method_receivers() {
+        for (source, mutable) in [
+            ("fn retain(&self) {}", false),
+            ("fn retain(&mut self) {}", true),
+        ] {
+            let statement = parse_statement_source(source).expect("GC receiver should parse");
+            let StatementKind::Function(function) = statement.kind else {
+                panic!("expected a function declaration");
+            };
+            let FunctionParameterKind::Receiver {
+                storage,
+                ..
+            } = &function.parameters[0].kind
+            else {
+                panic!("expected a receiver");
+            };
+            assert_eq!(*storage, ReceiverStorage::GarbageCollected);
+            assert_eq!(
+                function.parameters[0].qualifiers.value,
+                if mutable {
+                    ValueCapability::Mut
+                } else {
+                    ValueCapability::Const
+                }
+            );
+        }
     }
 
     #[test]
@@ -6068,6 +6180,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_gc_allocation_as_a_prefix_without_changing_infix_ampersand() {
+        let expression = parse("&Point {} & flags").expect("GC allocation should parse");
+        let ExpressionKind::Binary {
+            left,
+            operator: BinaryOperator::BitwiseAnd,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected bitwise-and at the root");
+        };
+        let ExpressionKind::GarbageCollect(value) = left.kind else {
+            panic!("expected GC allocation on the left");
+        };
+        assert!(matches!(value.kind, ExpressionKind::StructConstruction { .. }));
+
+        assert!(matches!(
+            parse("&&Point {}"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedExpression {
+                    found: TokenKind::LogicalAnd,
+                },
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn reports_incomplete_postfix_expressions() {
         assert_eq!(
             parse("value."),
@@ -6437,6 +6576,37 @@ mod tests {
                 span(0, 4),
             ))
         );
+    }
+
+    #[test]
+    fn parses_gc_qualified_types_and_reserves_logical_and_for_expressions() {
+        let type_syntax = parse_type_source("&mut (Reader & Writer)")
+            .expect("mutable GC intersection should parse");
+        let TypeKind::GarbageCollected(inner) = type_syntax.kind else {
+            panic!("expected a GC-qualified type");
+        };
+        let TypeKind::Mutable(inner) = inner.kind else {
+            panic!("expected mutable access inside GC qualification");
+        };
+        assert!(matches!(inner.kind, TypeKind::Group(_)));
+
+        assert!(matches!(
+            parse_type_source("&&User"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ExpectedType {
+                    found: TokenKind::LogicalAnd,
+                },
+                ..
+            }))
+        ));
+
+        assert!(matches!(
+            parse_type_source("mut &User"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::InvalidGarbageCollectedCapabilitySyntax,
+                ..
+            }))
+        ));
     }
 
     #[test]

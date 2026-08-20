@@ -16,20 +16,80 @@ pub enum AccessCapability {
     Mut,
 }
 
-/// How assigning or passing a value preserves its runtime identity.
-///
-/// A shallow-copied value duplicates its immediate representation. References
-/// contained within that representation continue to refer to the same shared
-/// storage; copying does not recursively duplicate referenced objects.
+/// Where a value's independently owned storage resides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ValueSemantics {
-    ShallowCopied,
-    Reference,
+pub enum StorageSemantics {
+    /// Statically sized storage owned by a frame, aggregate, or return slot.
+    Inline,
+    /// An erased, non-escaping view whose concrete storage is owned elsewhere.
+    BorrowedView,
+    /// A stable reference to an independently traced GC allocation.
+    GarbageCollected,
+}
+
+/// The compiler-defined behavior of the reserved `.copy()` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CopySemantics {
+    /// The representation can be copied directly without changing identity.
+    Trivial,
+    /// Inline members are copied recursively while nested GC references remain
+    /// shared.
+    Recursive,
+    /// Explicit `.copy()` materializes a plain copy of the GC payload. A GC
+    /// reference encountered as a nested field of another recursive copy is
+    /// still copied trivially and remains shared.
+    GarbageCollectedPayload,
+    /// The erased value cannot cross an owning boundary without GC storage.
+    NonEscapingErasedView,
+}
+
+/// The provenance category attached to a typed expression or place. This is
+/// deliberately separate from [`SemanticType`]: the same plain `T` may denote
+/// owned inline storage or a borrow of storage owned elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueCategory {
+    FreshTemporary,
+    OwnedInlinePlace,
+    BorrowedPlace,
+    GarbageCollectedReference,
+}
+
+/// A transfer selected by type checking and consumed by escape analysis and
+/// typed-IR lowering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueTransfer {
+    TrivialCopy,
+    Borrow,
+    MoveTemporary,
+    RecursiveCopy,
+    BorrowFromGarbageCollected {
+        /// Lowering must retain the originating allocation as a hidden root.
+        retain_hidden_owner_root: bool,
+    },
+    AllocateGarbageCollected,
+    ReuseGarbageCollected,
+}
+
+/// Owning/retaining destinations checked by the per-function escape pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EscapeDestination {
+    GarbageCollectedReturn,
+    GarbageCollectedParameter,
+    RetainedField,
+    QueueElement,
+    EscapingCapture,
+    GarbageCollectedReceiver,
 }
 
 /// A canonical semantic type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SemanticType {
+    /// An escapable GC reference. Repeated qualification is normalized by
+    /// [`TypeStore::garbage_collected`].
+    GarbageCollected {
+        target: TypeId,
+        capability: AccessCapability,
+    },
     Primitive {
         primitive: PrimitiveType,
         capability: AccessCapability,
@@ -78,7 +138,8 @@ impl SemanticType {
     #[must_use]
     pub const fn capability(&self) -> Option<AccessCapability> {
         match self {
-            Self::Primitive { capability, .. }
+            Self::GarbageCollected { capability, .. }
+            | Self::Primitive { capability, .. }
             | Self::Callable { capability, .. }
             | Self::NamedStruct { capability, .. }
             | Self::AnonymousStruct { capability, .. }
@@ -90,35 +151,56 @@ impl SemanticType {
         }
     }
 
-    /// Returns how values of this type are passed and stored.
+    /// Returns the storage representation required by this type. Whether a
+    /// plain value is owned or borrowed is recorded separately as a
+    /// [`ValueCategory`].
     #[must_use]
-    pub const fn value_semantics(&self) -> Option<ValueSemantics> {
+    pub const fn storage_semantics(&self) -> Option<StorageSemantics> {
         match self {
-            Self::Primitive {
-                primitive: PrimitiveType::String | PrimitiveType::Bytes,
-                ..
+            Self::GarbageCollected { .. } => Some(StorageSemantics::GarbageCollected),
+            Self::Callable { .. } | Self::Interface { .. } | Self::Intersection { .. } => {
+                Some(StorageSemantics::BorrowedView)
             }
-            | Self::Callable { .. }
+            Self::Primitive { .. }
             | Self::NamedStruct { .. }
             | Self::AnonymousStruct { .. }
-            | Self::Interface { .. }
-            | Self::Builtin {
-                builtin: BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Map,
+            | Self::Builtin { .. }
+            | Self::Union { .. } => Some(StorageSemantics::Inline),
+            Self::Recovery | Self::Divergence => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn copy_semantics(&self) -> Option<CopySemantics> {
+        match self {
+            Self::GarbageCollected { .. } => Some(CopySemantics::GarbageCollectedPayload),
+            Self::Primitive {
+                primitive: PrimitiveType::Unit
+                    | PrimitiveType::None
+                    | PrimitiveType::Int
+                    | PrimitiveType::Float
+                    | PrimitiveType::Bool
+                    | PrimitiveType::Char,
                 ..
+            } => Some(CopySemantics::Trivial),
+            Self::Callable { .. } | Self::Interface { .. } | Self::Intersection { .. } => {
+                Some(CopySemantics::NonEscapingErasedView)
             }
-            | Self::Intersection { .. } => Some(ValueSemantics::Reference),
             Self::Primitive { .. }
-            | Self::Builtin {
-                builtin: BuiltinType::Error,
-                ..
-            }
-            | Self::Union { .. } => Some(ValueSemantics::ShallowCopied),
+            | Self::NamedStruct { .. }
+            | Self::AnonymousStruct { .. }
+            | Self::Builtin { .. }
+            | Self::Union { .. } => Some(CopySemantics::Recursive),
             Self::Recovery | Self::Divergence => None,
         }
     }
 
     fn has_same_shape(&self, other: &Self) -> bool {
         match (self, other) {
+            (
+                Self::GarbageCollected { target: left, .. },
+                Self::GarbageCollected { target: right, .. },
+            ) => left == right,
             (
                 Self::Primitive {
                     primitive: left, ..
@@ -218,6 +300,34 @@ impl TypeStore {
             type_ids,
             recovery_id: recovery,
             divergence_id: divergence,
+        }
+    }
+
+    /// Returns the canonical escapable GC reference for `target`.
+    ///
+    /// GC qualification is idempotent. Its access capability mirrors the
+    /// target capability so `&T` and `&mut T` remain distinct without making
+    /// GC ownership itself mutable.
+    pub fn garbage_collected(&mut self, target: TypeId) -> Option<TypeId> {
+        let semantic_type = self.get(target)?.clone();
+        if matches!(semantic_type, SemanticType::Recovery | SemanticType::Divergence) {
+            return Some(target);
+        }
+        if matches!(semantic_type, SemanticType::GarbageCollected { .. }) {
+            return Some(target);
+        }
+        let capability = semantic_type.capability()?;
+        Some(self.intern(SemanticType::GarbageCollected { target, capability }))
+    }
+
+    /// Returns the plain target of a GC-qualified type, or `None` when `id` is
+    /// valid but plain. An unknown ID also returns `None`; use [`Self::contains`]
+    /// when that distinction matters.
+    #[must_use]
+    pub fn garbage_collected_target(&self, id: TypeId) -> Option<TypeId> {
+        match self.get(id)? {
+            SemanticType::GarbageCollected { target, .. } => Some(*target),
+            _ => None,
         }
     }
 
@@ -353,14 +463,28 @@ impl TypeStore {
 
     /// Tests equality while ignoring only the types' outer capabilities.
     ///
-    /// Capabilities on nested callable parameters, return types, built-in type
-    /// arguments, and union or intersection members remain significant. This
+    /// The payload capability of an outer GC qualifier is treated as that
+    /// qualifier's outer capability. Capabilities on nested callable
+    /// parameters, return types, built-in type arguments, and union or
+    /// intersection members remain significant. This
     /// is structural comparison of canonical representations, not
     /// assignability or an implicit-conversion check. `None` is returned if
     /// either ID is unknown to this store.
     #[must_use]
     pub fn has_same_shape(&self, left: TypeId, right: TypeId) -> Option<bool> {
-        Some(self.get(left)?.has_same_shape(self.get(right)?))
+        match (self.get(left)?, self.get(right)?) {
+            (
+                SemanticType::GarbageCollected {
+                    target: left_target,
+                    ..
+                },
+                SemanticType::GarbageCollected {
+                    target: right_target,
+                    ..
+                },
+            ) => self.has_same_shape(*left_target, *right_target),
+            (left, right) => Some(left.has_same_shape(right)),
+        }
     }
 
     /// Returns the canonical form of a type with the requested capability.
@@ -372,6 +496,10 @@ impl TypeStore {
     /// returned unchanged.
     pub fn with_capability(&mut self, id: TypeId, capability: AccessCapability) -> Option<TypeId> {
         match self.get(id)?.clone() {
+            SemanticType::GarbageCollected { target, .. } => {
+                let target = self.with_capability(target, capability)?;
+                self.garbage_collected(target)
+            }
             SemanticType::Primitive { primitive, .. } => {
                 Some(self.primitive(primitive, capability))
             }
@@ -538,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn primitive_metadata_distinguishes_shallow_copied_and_reference_values() {
+    fn primitive_metadata_distinguishes_trivial_and_recursive_copies() {
         let mut types = TypeStore::new();
 
         for primitive in [
@@ -554,9 +682,10 @@ mod tests {
 
             assert_eq!(semantic_type.capability(), Some(AccessCapability::Const));
             assert_eq!(
-                semantic_type.value_semantics(),
-                Some(ValueSemantics::ShallowCopied)
+                semantic_type.storage_semantics(),
+                Some(StorageSemantics::Inline)
             );
+            assert_eq!(semantic_type.copy_semantics(), Some(CopySemantics::Trivial));
         }
 
         for primitive in [PrimitiveType::String, PrimitiveType::Bytes] {
@@ -565,9 +694,10 @@ mod tests {
 
             assert_eq!(semantic_type.capability(), Some(AccessCapability::Mut));
             assert_eq!(
-                semantic_type.value_semantics(),
-                Some(ValueSemantics::Reference)
+                semantic_type.storage_semantics(),
+                Some(StorageSemantics::Inline)
             );
+            assert_eq!(semantic_type.copy_semantics(), Some(CopySemantics::Recursive));
         }
     }
 
@@ -599,6 +729,34 @@ mod tests {
         assert_eq!(
             types.builtin(BuiltinType::Queue, vec![parameter], AccessCapability::Const,),
             builtin
+        );
+    }
+
+    #[test]
+    fn garbage_collection_is_explicit_idempotent_and_capability_qualified() {
+        let mut types = TypeStore::new();
+        let plain = types.named_struct(node(1), AccessCapability::Const);
+        let mutable_plain = types.named_struct(node(1), AccessCapability::Mut);
+        let gc = types
+            .garbage_collected(plain)
+            .expect("plain values can be GC qualified");
+        let mutable_gc = types
+            .garbage_collected(mutable_plain)
+            .expect("mutable plain values can be GC qualified");
+
+        assert_eq!(types.garbage_collected(gc), Some(gc));
+        assert_eq!(types.garbage_collected_target(gc), Some(plain));
+        assert_eq!(types.garbage_collected_target(plain), None);
+        assert_ne!(gc, mutable_gc);
+        assert_eq!(types.has_same_shape(gc, mutable_gc), Some(true));
+        assert_eq!(types.with_capability(gc, AccessCapability::Mut), Some(mutable_gc));
+        assert_eq!(
+            types.get(gc).and_then(SemanticType::storage_semantics),
+            Some(StorageSemantics::GarbageCollected)
+        );
+        assert_eq!(
+            types.get(gc).and_then(SemanticType::copy_semantics),
+            Some(CopySemantics::GarbageCollectedPayload)
         );
     }
 
@@ -660,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn compound_and_declared_type_metadata_tracks_capability_and_value_semantics() {
+    fn compound_and_declared_type_metadata_tracks_storage_and_copy_semantics() {
         let mut types = TypeStore::new();
         let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
         let unit = types.primitive(PrimitiveType::Unit, AccessCapability::Const);
@@ -673,12 +831,26 @@ mod tests {
         let vector = types.builtin(BuiltinType::Vector, vec![int], AccessCapability::Mut);
         let map = types.builtin(BuiltinType::Map, vec![int, int], AccessCapability::Mut);
 
-        for id in [callable, named, anonymous, interface, queue, vector, map] {
+        for id in [named, anonymous, queue, vector, map] {
             let semantic_type = types.get(id).expect("type should be interned");
             assert_eq!(semantic_type.capability(), Some(AccessCapability::Mut));
             assert_eq!(
-                semantic_type.value_semantics(),
-                Some(ValueSemantics::Reference)
+                semantic_type.storage_semantics(),
+                Some(StorageSemantics::Inline)
+            );
+            assert_eq!(semantic_type.copy_semantics(), Some(CopySemantics::Recursive));
+        }
+
+        for id in [callable, interface] {
+            let semantic_type = types.get(id).expect("type should be interned");
+            assert_eq!(semantic_type.capability(), Some(AccessCapability::Mut));
+            assert_eq!(
+                semantic_type.storage_semantics(),
+                Some(StorageSemantics::BorrowedView)
+            );
+            assert_eq!(
+                semantic_type.copy_semantics(),
+                Some(CopySemantics::NonEscapingErasedView)
             );
         }
 
@@ -686,8 +858,8 @@ mod tests {
         let semantic_type = types.get(error).expect("Error should be interned");
         assert_eq!(semantic_type.capability(), Some(AccessCapability::Mut));
         assert_eq!(
-            semantic_type.value_semantics(),
-            Some(ValueSemantics::ShallowCopied)
+            semantic_type.storage_semantics(),
+            Some(StorageSemantics::Inline)
         );
     }
 
@@ -828,8 +1000,8 @@ mod tests {
         let union_type = types.get(union).expect("union should be interned");
         assert_eq!(union_type.capability(), Some(AccessCapability::Mut));
         assert_eq!(
-            union_type.value_semantics(),
-            Some(ValueSemantics::ShallowCopied)
+            union_type.storage_semantics(),
+            Some(StorageSemantics::Inline)
         );
 
         let intersection_type = types
@@ -837,8 +1009,8 @@ mod tests {
             .expect("intersection should be interned");
         assert_eq!(intersection_type.capability(), Some(AccessCapability::Mut));
         assert_eq!(
-            intersection_type.value_semantics(),
-            Some(ValueSemantics::Reference)
+            intersection_type.storage_semantics(),
+            Some(StorageSemantics::BorrowedView)
         );
     }
 
@@ -884,7 +1056,8 @@ mod tests {
         for id in [types.recovery(), types.divergence()] {
             let semantic_type = types.get(id).expect("internal type should exist");
             assert_eq!(semantic_type.capability(), None);
-            assert_eq!(semantic_type.value_semantics(), None);
+            assert_eq!(semantic_type.storage_semantics(), None);
+            assert_eq!(semantic_type.copy_semantics(), None);
         }
     }
 

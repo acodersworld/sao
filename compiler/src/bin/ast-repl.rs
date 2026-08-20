@@ -198,7 +198,10 @@ fn syntax_error_message(error: ParseError) -> String {
             format!("{found:?} must follow const or mut in a binding")
         }
         ParseErrorKind::InvalidReceiverQualifiers => {
-            "a receiver must be written as self or mut self".to_owned()
+            "a receiver must be written as self, mut self, &self, or &mut self".to_owned()
+        }
+        ParseErrorKind::InvalidGarbageCollectedCapabilitySyntax => {
+            "mutable GC access is written &mut T, not mut &T".to_owned()
         }
         ParseErrorKind::BindingValueCapabilityMustPrecedeName => {
             "a binding's value capability must be written before its name".to_owned()
@@ -409,7 +412,14 @@ mod tests {
                 kind: ParseErrorKind::InvalidReceiverQualifiers,
                 span: Span::new(ModuleId::PRELUDE, 9, 13),
             }),
-            "a receiver must be written as self or mut self"
+            "a receiver must be written as self, mut self, &self, or &mut self"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::InvalidGarbageCollectedCapabilitySyntax,
+                span: Span::new(ModuleId::PRELUDE, 0, 3),
+            }),
+            "mutable GC access is written &mut T, not mut &T"
         );
         assert_eq!(
             syntax_error_message(ParseError {

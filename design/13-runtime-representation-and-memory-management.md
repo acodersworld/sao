@@ -17,9 +17,10 @@ Initial collector rules:
   collector does not conservatively scan the native C stack.
 - Collection occurs only at well-defined safe points, initially allocation
   points.
-- Lambda environments, anonymous-struct environments, and shared
-  cells created for mutable captures are ordinary traced heap objects. Coroutine
-  objects, activation frames, queues, and queued values are traced as well.
+- Values explicitly qualified with `&`, coroutine objects, and activation
+  frames are traced heap objects. Frame metadata traces GC references contained
+  by inline locals and hidden roots retained for GC-derived borrows. Queues and
+  queued values follow their source-level plain or `&` storage qualification.
 - Reference cycles are collected naturally.
 - The first implementation has no user-defined destructors, finalizers, weak
   references, generational collection, or incremental collection.
@@ -93,7 +94,8 @@ queues use vtables with empty method dictionaries.
 `int` and `float` are unboxed 64-bit values. `bool` is an unboxed Boolean, and
 `char` is an unboxed unsigned byte restricted to 0 through 127.
 
-Both `string` and `bytes` values are stable pointers to mutable sequence objects:
+Plain `string` and `bytes` values contain sequence metadata inline. Their
+`&string` and `&bytes` forms prefix the same payload with a GC header:
 
 ```text
 +-------------------+
@@ -105,32 +107,34 @@ Both `string` and `bytes` values are stable pointers to mutable sequence objects
 ```
 
 The data pointer refers to raw storage obtained with `malloc` and grown with
-`realloc`. Resizing can change the data pointer without changing the outer
-object, so every alias observes the new length and contents. When the collector
-sweeps the outer object, its runtime release function frees the raw buffer
-before the object itself. String storage contains ASCII bytes; `bytes` storage
-contains unrestricted byte values.
+`realloc`. Resizing can change the data pointer without changing the owning
+inline or GC payload, so every borrow observes the new length and contents. A
+frame cleanup function frees a plain value's buffer; the runtime release
+function does the same when the collector sweeps a GC allocation. String
+storage contains ASCII bytes; `bytes` storage contains unrestricted byte values.
 
-Slicing a `string` or `bytes` value allocates an ordinary sequence object of the
-same type and a separate raw buffer containing the selected elements. A slice
-does not share its buffer with the source, including for empty and full slices.
+Slicing a `string` or `bytes` value produces a fresh plain sequence value with a
+separate raw buffer. A slice does not share its buffer with the source,
+including for empty and full slices; prefix `&` may move that result into GC
+storage.
 
-A struct value is a stable pointer to one garbage-collected object. Declared
-fields follow the common header in declaration order, with backend-required
-padding. Anonymous structs place hidden captures after their declared fields.
-Every instance points to its concrete type's shared vtable; no method table is
-stored directly in an instance.
+A plain struct value is stored inline in its frame, containing aggregate, or
+caller-provided result slot. An `&Struct` is a stable pointer to a GC allocation
+whose common header is followed by those same inline fields in declaration
+order, with backend-required padding. Anonymous structs place copied hidden
+captures after their declared fields. Plain values do not carry a GC header.
 
-A callable function value is two words: a signature-specific code pointer and
-an environment pointer. Capturing lambdas point to a garbage-collected
-environment object. Named functions and non-capturing lambdas use a null
-environment pointer and allocate no environment. The compiler traces only the
-environment word; code pointers are not GC references.
+A plain callable is a non-escaping code-and-environment view. Its environment is
+owned inline by the creating frame. `&fn(...)` places the callable environment
+in GC storage and may escape. Named functions and non-capturing lambdas use a
+null environment pointer and allocate no environment. Code pointers are never
+GC references.
 
-An interface or intersection value is exactly the same one-word object pointer
-as its underlying struct reference. Dispatch follows the object header's vtable
-pointer and searches its sorted method dictionary. Anonymous interface objects
-are compiler-generated structs with the same representation.
+A plain interface or intersection is a non-escaping pair containing a borrowed
+object address and dispatch/type metadata, so it can view inline storage.
+`&Interface` uses a GC-backed concrete object whose header supplies its vtable;
+it may use a compact one-pointer representation. Anonymous interface objects
+are compiler-generated structs following the same qualification rules.
 
 A queue object stores its length, capacity, head position, and a pointer to raw
 ring-buffer storage specialized for its element type. Its generated tracing

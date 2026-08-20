@@ -12,14 +12,17 @@ Interface satisfaction is structural and implicit. A type satisfies an
 interface when it has the required method set with compatible signatures. No
 explicit `implements` declaration is required.
 
-Every interface function requirement must declare `self` or `mut self` as its
-first parameter. Interfaces describe behaviour of values and cannot require or
-expose receiverless associated functions. A named struct's associated functions
-therefore do not participate in interface satisfaction.
+Every interface function requirement must declare `self`, `mut self`, `&self`,
+or `&mut self` as its first parameter. The GC-qualified receiver forms permit
+retention and are distinct signature requirements. Interfaces describe
+behaviour of values and cannot require or expose receiverless associated
+functions. A named struct's associated functions therefore do not participate
+in interface satisfaction.
 
 When an expression is expected to have an interface or interface-intersection
-type, a satisfying named or anonymous struct reference is implicitly converted
-to that type. Interface names do not provide construction expressions of their
+type, a satisfying named or anonymous struct value is implicitly converted to a
+non-escaping view of that type. GC-qualified interface contexts require a
+GC-qualified implementation. Interface names do not provide construction expressions of their
 own. An interface with no method requirements is valid and is satisfied by
 every struct.
 
@@ -91,12 +94,11 @@ interface that the type happens to satisfy. For a small method set the backend
 may use a sequential search; for a larger sorted set it may use binary search.
 The threshold is an implementation detail.
 
-Because every initial interface implementation is a garbage-collected struct,
-an interface value uses the same object pointer as the concrete struct
-reference. Dispatch loads the object's vtable, looks up the canonical method ID,
-and indirectly calls the resulting function. Converting a concrete reference to
-an interface therefore creates no wrapper and no interface-specific method
-table. Intersection types use the same representation and lookup path.
+A plain interface value is a non-escaping object-address and dispatch-metadata
+pair, allowing it to borrow either inline or GC-backed implementations without
+allocation. An `&Interface` requires a GC-backed concrete value and may escape;
+dispatch can obtain its method dictionary from the common object header.
+Intersection types follow the same plain-versus-GC distinction.
 
 The portable C backend must generate appropriately typed receiver-adapter
 functions rather than call through an incompatible C function-pointer type.

@@ -22,15 +22,17 @@ const greeter: Greeter = struct {
 The `struct { ... }` expression creates a hidden nominal struct containing the
 declared fields and methods. The `Greeter` annotation supplies the expected
 type, so the compiler verifies structural satisfaction and converts the result
-to an interface value. Function arguments and return expressions receive the
-same contextual conversion from their parameter or return type.
+to a borrowed interface value. Function arguments receive the same contextual
+conversion. A field, capture, or return instead requires an `&Interface`
+expected type and a GC-qualified implementation.
 
 Contextual interface-conversion rules:
 
 - `struct { ... }` is the only anonymous-struct construction syntax; an
   interface name is never itself constructed.
 - An expected interface or interface-intersection type checks the hidden
-  struct's method set and converts the resulting reference to that type.
+  struct's method set and creates a non-escaping borrowed view. A GC-qualified
+  expected interface requires a GC-qualified concrete value.
 - Without an expected interface type, local inference retains the anonymous
   struct's exact hidden type until it is used in an interface context.
 - Field initializers at object scope define hidden fields and are written
@@ -57,8 +59,8 @@ interface IntPredicate {
     fn test(self, value: int) -> bool;
 }
 
-fn greater_than(limit: int) -> IntPredicate {
-    struct {
+fn greater_than(limit: int) -> &IntPredicate {
+    &struct {
         fn test(self, value: int) -> bool {
             value > limit
         }
@@ -74,8 +76,8 @@ Capture rules:
 - Captures are discovered automatically from free-variable references.
 - Capture lists are always implicit; SAO has no explicit capture-list syntax.
 - A `const` binding is captured as the value it holds when the anonymous value
-  is created. Value types are copied directly; reference values copy the
-  reference and preserve its access capability.
+  is created. Plain values are copied recursively; nested `&T` values copy the
+  shared GC reference and preserve its access capability.
 - A captured `mut` binding is lifted into a shared garbage-collected cell.
   Mutations are visible to the outer scope and to every anonymous value that
   captures it.
@@ -200,8 +202,9 @@ value has a uniform two-word representation:
 ```
 
 The code pointer uses the function value's statically known signature and
-accepts the environment pointer as a hidden first argument. The environment is
-a non-moving garbage-collected object specialized for that expression:
+accepts the environment pointer as a hidden first argument. A plain callable's
+environment is frame-owned and non-escaping; an `&fn(...)` environment is a
+non-moving garbage-collected object specialized for that expression:
 
 ```text
 +---------------------------+
@@ -222,8 +225,8 @@ no environment allocation. Named function values use the same representation
 with a null environment pointer.
 
 Anonymous structs do not need a separate environment allocation. Their
-compiler-generated garbage-collected object contains declared fields and hidden
-captures together:
+compiler-generated value contains declared fields and copied hidden captures
+together. It is inline by default; prefix `&` adds the GC header shown below:
 
 ```text
 +------------------+

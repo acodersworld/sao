@@ -3,12 +3,12 @@
 Structs are nominal. Their identity comes from their declaration, not merely
 from their fields.
 
-All named and anonymous structs have reference semantics. Constructing a struct
-allocates a garbage-collected object and initially produces mut access to it.
-Assignment, parameter passing, returning, and capture copy the reference rather
-than the object's fields, subject to the `mut`-to-`const` capability rules. SAO
-performs no implicit deep copies and has no ownership, borrowing, or move
-semantics. Every mutable alias observes and may change the same object.
+Named and anonymous structs use the inline-value and explicit-GC model in
+Chapter 18. Plain construction produces frame-owned or containing-object
+storage. `&Struct { ... }` instead constructs an independently GC-managed,
+escapable object. Local bindings and plain parameters may borrow object storage;
+inline fields and plain returns own copied or moved values. SAO has no
+user-visible ownership, dereference, or lifetime syntax.
 
 ```text
 struct Position {
@@ -67,13 +67,13 @@ assignable to the declared field type and must obey the reference-capability
 rules.
 
 Named struct declarations may refer to themselves and to structs declared later
-in the same program. Recursive and mutually recursive struct types have finite
-layouts because struct values are references:
+in the same program. Recursive and mutually recursive layouts must cross an
+explicit GC reference so that every inline layout is finite:
 
 ```text
 struct Node {
     value: int,
-    next: Node | none,
+    next: &Node | none,
 }
 ```
 
@@ -91,10 +91,11 @@ mut node = Node {
 node.next = node;
 ```
 
-The implementation may allocate and root the object before evaluating its field
-initializers, but that partially initialized storage is not observable by the
-source program. A field initializer that exits through `?` leaves the incomplete
-allocation unreachable and eligible for garbage collection.
+The implementation reserves destination storage before evaluating field
+initializers, but partially initialized storage is not observable by the source
+program. A field initializer that exits through `?` cleans up initialized inline
+members; an incomplete `&Struct` allocation becomes unreachable and eligible
+for garbage collection.
 
 Functions are declared directly in the struct body alongside its fields. SAO
 has no separate `impl` block and does not attach functions to a struct after its
@@ -163,8 +164,8 @@ through a `const` reference. Reference-valued field initialization and
 assignment must not convert const access back to mut; a const reference cannot
 be placed where later mutable field access would recover mut capability.
 
-An instance-method receiver `self` is a const reference to the original object
-by default. A method requiring mutable access declares `mut self`:
+An instance-method receiver `self` is a const, non-escapable view of the original
+object by default. A method requiring mutable access declares `mut self`:
 
 ```text
 fn describe(self) -> string {
@@ -179,3 +180,7 @@ fn rename(mut self, name: string) -> () {
 A const method may be called through either capability. A `mut self` method may
 only be called through a mut reference. Receiver capability is part of a method
 signature and participates in interface matching.
+
+An `&self` or `&mut self` receiver additionally requires independently
+GC-managed storage and permits the method to retain the receiver. GC
+escapability is part of method signatures and interface matching.
