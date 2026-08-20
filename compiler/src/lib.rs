@@ -7,6 +7,7 @@ pub mod pretty;
 pub mod semantic_types;
 pub mod source;
 pub mod symbol_table;
+pub mod type_resolution;
 
 #[cfg(test)]
 mod tests {

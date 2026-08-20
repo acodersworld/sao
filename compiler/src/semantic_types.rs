@@ -1,3 +1,11 @@
+//! Defines the compiler's canonical semantic type representation.
+//!
+//! The [`TypeStore`] interns program-local type identities and provides the
+//! capability, storage, copying, and value-transfer metadata used by later
+//! semantic analysis and lowering. This module defines and canonicalizes types;
+//! resolving source [`TypeSyntax`](crate::ast::TypeSyntax), checking expressions,
+//! assignability, and escape behavior are performed by separate passes.
+
 use std::collections::HashMap;
 
 use crate::ast::{BuiltinType, NodeId, PrimitiveType};

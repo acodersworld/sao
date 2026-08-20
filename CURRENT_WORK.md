@@ -36,6 +36,12 @@ intersections, recovery and divergence types, exact identity, outer-capability-
 insensitive shape equality, explicit GC qualification, storage/copy semantics,
 and typed-expression value-category metadata are implemented.
 
+Source type resolution is complete. It predeclares nominal struct and interface
+types, resolves every explicit type-syntax node to a canonical type identity,
+supports forward and recursive references, and diagnoses invalid named type
+arguments, built-in arity, queue element types, and intersection members. Unknown
+type names remain diagnostics of the preceding name-resolution pass.
+
 ## Semantic analysis work queue
 
 Semantic analysis is one compiler subsystem with ordered internal passes.
@@ -60,18 +66,17 @@ reviewable phases:
    - Complete: store-validated exact identity, equality that ignores only the
      outer capability, safe structural lookup, and capability, storage, and
      copy metadata on the canonical type representation.
-2. Declarations and signatures (next)
-   - Next increment: resolve source `TypeSyntax`, including `&T` and `&mut T`,
-     into canonical `TypeId`s and
-     record the resolved type for each type-syntax node. Diagnose unknown named
-     types and invalid compiler-known type arguments while preserving recovery
-     types so independent errors can still be collected.
-   - Resolve type syntax and collect struct fields, methods, interface
-     requirements, callable signatures, and built-in signatures before checking
-     bodies.
+2. Declarations and signatures (in progress)
+   - Complete: resolve source `TypeSyntax`, including `&T` and `&mut T`, into
+     canonical `TypeId`s and record the resolved type for every type-syntax node.
+     Predeclare named structs and interfaces for forward and recursive references;
+     validate named arguments, compiler-known type arguments, queue element
+     types, and interface-only intersections while preserving recovery types for
+     independent diagnostics.
+   - Next increment: collect struct fields, methods, interface requirements,
+     callable signatures, and built-in signatures before checking bodies.
    - Support recursive and forward-referenced declarations.
-   - Validate type arguments, member namespaces, and the required `main`
-     signature.
+   - Validate member namespaces and the required `main` signature.
 3. Core expression checking
    - Add expected-type-driven checking and local inference.
    - Cover literals, identifiers, `self`, functions, lambdas, calls, operators,

@@ -1,3 +1,11 @@
+//! Resolves source names to stable semantic symbol identities.
+//!
+//! This pass builds the program's value and type scopes, collects declarations
+//! needed for forward references, and connects lexical name uses to their
+//! declarations while reporting unknown or duplicate names. Member lookup,
+//! `self` and control-flow context, type resolution, and capture restrictions
+//! are handled by later semantic passes.
+
 use std::{collections::HashMap, fmt};
 
 use crate::{

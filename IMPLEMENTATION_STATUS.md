@@ -129,7 +129,8 @@ Context resolution is implemented as an AST-only pass. It:
 - Leaves every `const` and `mut` restriction, including range induction-binding
   immutability, to the type checker.
 
-The semantic type foundation is implemented. It provides a program-local
+The semantic type foundation and source type resolution are implemented. They
+provide a program-local
 canonical type store for capability-qualified primitives, callables, nominal
 named and anonymous structs, interfaces, compiler-known parameterized types,
 unions, intersections, canonical explicit GC references, and internal recovery
@@ -138,12 +139,17 @@ intersection construction is associative, commutative, and idempotent, with an
 outer capability distinct from member capabilities. The store exposes exact
 identity, equality that ignores only the outer capability, safe structural
 lookup, inline/borrowed/GC storage semantics, compiler-defined copy semantics,
-and typed-expression value categories.
+and typed-expression value categories. Source type resolution predeclares named
+structs and interfaces, resolves all explicit annotations including mutable and
+GC-qualified forms, records canonical types by syntax and declaration identity,
+supports forward and recursive references, and diagnoses invalid named type
+arguments, compiler-known arity, queue element types, and non-interface
+intersection members. Unknown type names are diagnosed earlier by name
+resolution.
 
-Source type resolution, declaration and signature collection, expression type
-checking and inference, assignability, finite-layout validation, capture and
-escape analysis, hidden-root calculation, and typed IR production are not yet
-implemented.
+Declaration and signature collection, expression type checking and inference,
+assignability, finite-layout validation, capture and escape analysis, hidden-root
+calculation, and typed IR production are not yet implemented.
 
 ## Runtime prototype status
 

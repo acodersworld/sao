@@ -438,6 +438,10 @@ pub enum TypeKind {
         builtin: BuiltinType,
         arguments: Vec<TypeSyntax>,
     },
+    /// A type referenced by its declared source name, such as a user-defined
+    /// struct or interface. Arguments are retained syntactically for future
+    /// generic declarations, but are rejected for named types in the initial
+    /// language.
     Named {
         name: Span,
         arguments: Vec<TypeSyntax>,

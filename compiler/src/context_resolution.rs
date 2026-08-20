@@ -1,3 +1,11 @@
+//! Resolves structural context that can be determined without type information.
+//!
+//! This pass classifies callables, connects `self`, `return`, `break`, and
+//! `continue` uses to their enclosing targets, and validates receiver placement,
+//! control-flow context, deferred and coroutine calls, and assignment-target
+//! shapes. Name lookup, mutability, type checking, and capture analysis remain
+//! the responsibility of other semantic passes.
+
 use std::{collections::HashMap, fmt, mem};
 
 use crate::{
