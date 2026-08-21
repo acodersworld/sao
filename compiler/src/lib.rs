@@ -5,6 +5,7 @@ pub mod name_resolution;
 pub mod parser;
 pub mod pretty;
 pub mod semantic_types;
+pub mod signature_collection;
 pub mod source;
 pub mod symbol_table;
 pub mod type_resolution;

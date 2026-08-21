@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-20
+Last reviewed: 2026-08-21
 
 ## Current phase
 
@@ -37,10 +37,18 @@ insensitive shape equality, explicit GC qualification, storage/copy semantics,
 and typed-expression value-category metadata are implemented.
 
 Source type resolution is complete. It predeclares nominal struct and interface
-types, resolves every explicit type-syntax node to a canonical type identity,
-supports forward and recursive references, and diagnoses invalid named type
+types, resolves every concrete type-syntax node to a canonical type identity,
+leaves the unspecialized `Error::new` owner for built-in inference, supports
+forward and recursive references, and diagnoses invalid named type
 arguments, built-in arity, queue element types, and intersection members. Unknown
 type names remain diagnostics of the preceding name-resolution pass.
+
+Declaration and signature collection is complete. It records named and anonymous
+struct members, every explicit callable header, interface requirements,
+owner-independent canonical method identities, callable value types, and the
+specified compiler-known signature catalogue. It also validates shared member
+namespaces and the required `main` signature while preserving deferred anonymous
+field inference.
 
 ## Semantic analysis work queue
 
@@ -66,18 +74,23 @@ reviewable phases:
    - Complete: store-validated exact identity, equality that ignores only the
      outer capability, safe structural lookup, and capability, storage, and
      copy metadata on the canonical type representation.
-2. Declarations and signatures (in progress)
-   - Complete: resolve source `TypeSyntax`, including `&T` and `&mut T`, into
-     canonical `TypeId`s and record the resolved type for every type-syntax node.
+2. Declarations and signatures (complete)
+   - Complete: resolve concrete source `TypeSyntax`, including `&T` and `&mut T`,
+     into canonical `TypeId`s and record every resolved type-syntax node while
+     leaving the unspecialized `Error::new` owner for built-in inference.
      Predeclare named structs and interfaces for forward and recursive references;
      validate named arguments, compiler-known type arguments, queue element
      types, and interface-only intersections while preserving recovery types for
      independent diagnostics.
-   - Next increment: collect struct fields, methods, interface requirements,
-     callable signatures, and built-in signatures before checking bodies.
-   - Support recursive and forward-referenced declarations.
-   - Validate member namespaces and the required `main` signature.
-3. Core expression checking
+   - Complete: collect named and anonymous struct members, methods, interface
+     requirements, all explicit callable signatures, and the currently specified
+     built-in signature templates before checking bodies.
+   - Complete: support recursive and forward-referenced declarations, intern
+     canonical owner-independent method identities, and retain pending inferred
+     anonymous fields for expression checking.
+   - Complete: validate shared member namespaces and the required `main`
+     signature.
+3. Core expression checking (next)
    - Add expected-type-driven checking and local inference.
    - Cover literals, identifiers, `self`, functions, lambdas, calls, operators,
      conversions, GC allocation, blocks, conditionals, returns, and ordinary

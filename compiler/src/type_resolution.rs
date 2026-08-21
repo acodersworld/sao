@@ -2,9 +2,11 @@
 //!
 //! This pass runs after name resolution and before signature collection or
 //! expression type checking. It predeclares nominal types for recursive and
-//! forward references, records a [`TypeId`] for every [`TypeSyntax`] node, and
-//! reports type-syntax legality errors while using recovery types to continue
-//! resolving independent annotations.
+//! forward references, records a [`TypeId`] for every concrete [`TypeSyntax`]
+//! node, and reports type-syntax legality errors while using recovery types to
+//! continue resolving independent annotations. The unspecialized owner in
+//! `Error::new(...)` remains for built-in inference because it is not a
+//! concrete source type.
 
 use std::{collections::HashMap, fmt};
 
@@ -17,11 +19,11 @@ use crate::{
     },
     name_resolution::NameResolution,
     semantic_types::{AccessCapability, SemanticType, TypeId, TypeStore},
-    source::Span,
+    source::{SourceModule, Span},
     symbol_table::SymbolId,
 };
 
-/// Canonical types produced from all explicit source type syntax in a program.
+/// Canonical types produced from concrete source type syntax in a program.
 #[derive(Debug)]
 pub struct TypeResolution {
     types: TypeStore,
@@ -123,17 +125,27 @@ impl std::error::Error for TypeResolutionError {}
 
 pub type TypeResolutionResult = Result<TypeResolution, Vec<TypeResolutionError>>;
 
-/// Resolves every explicit source type after successful name resolution.
+/// Resolves every concrete source type after successful name resolution.
 ///
 /// Struct and interface types are predeclared before annotations are visited,
 /// so forward and recursive references resolve to stable canonical identities.
 /// Invalid syntax nodes receive the recovery type internally, allowing later
 /// annotations to be resolved and independently diagnosed.
-pub fn resolve_types(program: &Program, names: &NameResolution) -> TypeResolutionResult {
-    Resolver::new(names).resolve(program)
+pub fn resolve_types(
+    module: &SourceModule,
+    program: &Program,
+    names: &NameResolution,
+) -> TypeResolutionResult {
+    assert_eq!(
+        module.module_id(),
+        program.id.module_id,
+        "program types must be resolved with their source module"
+    );
+    Resolver::new(module, names).resolve(program)
 }
 
-struct Resolver<'names> {
+struct Resolver<'source, 'names> {
+    module: &'source SourceModule,
     names: &'names NameResolution,
     types: TypeStore,
     syntax_types: HashMap<NodeId, TypeId>,
@@ -142,9 +154,10 @@ struct Resolver<'names> {
     errors: Vec<TypeResolutionError>,
 }
 
-impl<'names> Resolver<'names> {
-    fn new(names: &'names NameResolution) -> Self {
+impl<'source, 'names> Resolver<'source, 'names> {
+    fn new(module: &'source SourceModule, names: &'names NameResolution) -> Self {
         Self {
+            module,
             names,
             types: TypeStore::new(),
             syntax_types: HashMap::new(),
@@ -364,8 +377,25 @@ impl<'names> Resolver<'names> {
                 }
             }
             ExpressionKind::MemberAccess { object, .. } => self.visit_expression(object),
-            ExpressionKind::AssociatedAccess { owner, .. } => {
-                self.resolve_type(owner);
+            ExpressionKind::AssociatedAccess { owner, member } => {
+                // `Error::new` uses an intentionally unspecialized built-in
+                // owner whose payload type is inferred while checking the
+                // associated function. It is not valid ordinary type syntax,
+                // so it has no concrete TypeId at this stage.
+                if !matches!(
+                    &owner.kind,
+                    TypeKind::Builtin {
+                        builtin: BuiltinType::Error,
+                        arguments,
+                    } if arguments.is_empty()
+                        && self
+                            .module
+                            .text(*member)
+                            .expect("associated member span belongs to the source module")
+                            == "new"
+                ) {
+                    self.resolve_type(owner);
+                }
             }
             ExpressionKind::Index { object, index } => {
                 self.visit_expression(object);
@@ -579,7 +609,8 @@ mod tests {
     fn resolve(source: &str) -> (Program, TypeResolution) {
         let (module, program) = parse(source);
         let names = resolve_program(&module, &program).expect("test names should resolve");
-        let resolution = resolve_types(&program, &names).expect("test types should resolve");
+        let resolution =
+            resolve_types(&module, &program, &names).expect("test types should resolve");
         (program, resolution)
     }
 
@@ -768,7 +799,8 @@ mod tests {
             ") {}\n",
         ));
         let names = resolve_program(&module, &program).expect("test names should resolve");
-        let errors = resolve_types(&program, &names).expect_err("types should be invalid");
+        let errors =
+            resolve_types(&module, &program, &names).expect_err("types should be invalid");
 
         assert_eq!(errors.len(), 4);
         assert!(matches!(
@@ -810,7 +842,8 @@ mod tests {
         arguments.clear();
         let annotation_span = type_annotation.span;
 
-        let errors = resolve_types(&program, &names).expect_err("arity should be invalid");
+        let errors =
+            resolve_types(&module, &program, &names).expect_err("arity should be invalid");
         assert_eq!(
             errors,
             vec![TypeResolutionError {
@@ -822,5 +855,75 @@ mod tests {
                 span: annotation_span,
             }]
         );
+    }
+
+    #[test]
+    fn permits_unspecialized_error_only_as_an_associated_owner() {
+        let (module, program) = parse("fn main() { Error::new(1); }");
+        let names = resolve_program(&module, &program).expect("test names should resolve");
+        let resolution = resolve_types(&module, &program, &names)
+            .expect("Error::new should leave its payload type for call inference");
+
+        let Declaration::Function(main) = &program.declarations[0] else {
+            panic!("expected main")
+        };
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::Call { callee, .. },
+            ..
+        }) = &main.body.statements[0].kind
+        else {
+            panic!("expected Error::new call")
+        };
+        let ExpressionKind::AssociatedAccess { owner, .. } = &callee.kind else {
+            panic!("expected associated access")
+        };
+        assert_eq!(resolution.type_for_syntax(owner.id), None);
+
+        let (module, mut program) = parse("fn main(value: Error<int>) {}");
+        let names = resolve_program(&module, &program).expect("test names should resolve");
+        let Declaration::Function(main) = &mut program.declarations[0] else {
+            panic!("expected main")
+        };
+        let FunctionParameterKind::Named {
+            type_annotation, ..
+        } = &mut main.parameters[0].kind
+        else {
+            panic!("expected named parameter")
+        };
+        let TypeKind::Builtin { arguments, .. } = &mut type_annotation.kind else {
+            panic!("expected Error type")
+        };
+        arguments.clear();
+        assert!(matches!(
+            resolve_types(&module, &program, &names),
+            Err(errors) if matches!(
+                errors.as_slice(),
+                [TypeResolutionError {
+                    kind: TypeResolutionErrorKind::InvalidBuiltinTypeArgumentCount {
+                        builtin: BuiltinType::Error,
+                        expected: 1,
+                        found: 0,
+                    },
+                    ..
+                }]
+            )
+        ));
+
+        let (module, program) = parse("fn main() { Error::other; }");
+        let names = resolve_program(&module, &program).expect("test names should resolve");
+        assert!(matches!(
+            resolve_types(&module, &program, &names),
+            Err(errors) if matches!(
+                errors.as_slice(),
+                [TypeResolutionError {
+                    kind: TypeResolutionErrorKind::InvalidBuiltinTypeArgumentCount {
+                        builtin: BuiltinType::Error,
+                        expected: 1,
+                        found: 0,
+                    },
+                    ..
+                }]
+            )
+        ));
     }
 }
