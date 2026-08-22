@@ -60,6 +60,8 @@ enum ExpressionCheckingErrorKind {
         operator: BinaryOperator,
         found: TypeId,
     },
+    NotCallable { found: TypeId },
+    ArgumentCountMismatch { expected: usize, found: usize },
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +295,9 @@ impl<'semantic> Analyzer<'semantic> {
                 operator,
                 right,
             } => self.synthesize_binary(left, *operator, right)?,
+            ExpressionKind::Call { callee, arguments } => {
+                self.synthesize_call(expression, callee, arguments)?
+            }
             _ => return None,
         };
         self.checking.expressions.insert(expression.id, typed);
@@ -492,6 +497,94 @@ impl<'semantic> Analyzer<'semantic> {
         Some(self.fresh_primitive(result))
     }
 
+    fn synthesize_call(
+        &mut self,
+        expression: &Expression,
+        callee: &Expression,
+        arguments: &[Expression],
+    ) -> Option<TypedExpression> {
+        let typed_callee = self.synthesize(callee)?;
+        if self.is_recovery(typed_callee.type_id) {
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(self.recovery_temporary());
+        }
+
+        let Some(SemanticType::Callable {
+            parameters,
+            return_type,
+            ..
+        }) = self.types.types().get(typed_callee.type_id).cloned()
+        else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::NotCallable {
+                    found: typed_callee.type_id,
+                },
+                span: callee.span,
+            });
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(self.recovery_temporary());
+        };
+
+        let arity_matches = parameters.len() == arguments.len();
+        if !arity_matches {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                    expected: parameters.len(),
+                    found: arguments.len(),
+                },
+                span: expression.span,
+            });
+        }
+
+        let mut arguments_valid = true;
+        let mut all_supported = true;
+        for (index, argument) in arguments.iter().enumerate() {
+            let Some(expected) = parameters.get(index).copied() else {
+                all_supported &= self.synthesize(argument).is_some();
+                continue;
+            };
+            let Some(checked) = self.check(argument, expected) else {
+                all_supported = false;
+                continue;
+            };
+            if self.is_recovery(checked.type_id) {
+                arguments_valid = false;
+                continue;
+            }
+            if let Some(transfer) = self.argument_transfer(checked) {
+                self.checking.transfers.insert(argument.id, transfer);
+            }
+        }
+
+        if !all_supported {
+            return None;
+        }
+        if !arity_matches || !arguments_valid || self.is_recovery(return_type) {
+            return Some(self.recovery_temporary());
+        }
+
+        let category = if self
+            .types
+            .types()
+            .get(return_type)
+            .is_some_and(|semantic| {
+                semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
+            })
+        {
+            ValueCategory::GarbageCollectedReference
+        } else {
+            ValueCategory::FreshTemporary
+        };
+        Some(TypedExpression {
+            type_id: return_type,
+            category,
+        })
+    }
+
     fn primitive_kind(&self, type_id: TypeId) -> Option<PrimitiveType> {
         match self.types.types().get(type_id) {
             Some(SemanticType::Primitive { primitive, .. }) => Some(*primitive),
@@ -655,6 +748,24 @@ impl<'semantic> Analyzer<'semantic> {
         (ValueCategory::BorrowedPlace, Some(ValueTransfer::Borrow))
     }
 
+    fn argument_transfer(&self, source: TypedExpression) -> Option<ValueTransfer> {
+        let semantic = self
+            .types
+            .types()
+            .get(source.type_id)
+            .expect("argument type belongs to the program type store");
+        if matches!(semantic, SemanticType::Recovery | SemanticType::Divergence) {
+            return None;
+        }
+        if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+            return Some(ValueTransfer::ReuseGarbageCollected);
+        }
+        if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
+            return Some(ValueTransfer::TrivialCopy);
+        }
+        Some(ValueTransfer::Borrow)
+    }
+
     fn with_value_capability(&mut self, type_id: TypeId, capability: ValueCapability) -> TypeId {
         self.types
             .types_mut()
@@ -736,6 +847,13 @@ mod tests {
             panic!("expected expression statement")
         };
         expression
+    }
+
+    fn call(expression: &Expression) -> (&Expression, &[Expression]) {
+        let ExpressionKind::Call { callee, arguments } = &expression.kind else {
+            panic!("expected call expression")
+        };
+        (callee, arguments)
     }
 
     fn named_parameter(function: &Function, index: usize) -> &FunctionParameter {
@@ -1374,5 +1492,211 @@ mod tests {
             assert_eq!(checking.transfers.get(&initializer.id), Some(&transfer));
         }
         assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn synthesizes_calls_through_ordinary_callable_values() {
+        let source = concat!(
+            "fn first(value: int) -> bool { second(value); true }\n",
+            "fn second(value: int) -> bool { second(value); true }\n",
+            "fn invoke(operation: fn(int) -> bool, value: int) {\n",
+            "    operation(value);\n",
+            "    const alias = first;\n",
+            "    alias(value);\n",
+            "    println(\"ok\");\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let first = function(&program.declarations[0]);
+        let second = function(&program.declarations[1]);
+        let invoke = function(&program.declarations[2]);
+        for called in [
+            expression(&first.body.statements[0]),
+            expression(&second.body.statements[0]),
+            expression(&invoke.body.statements[0]),
+            expression(&invoke.body.statements[2]),
+        ] {
+            assert_primitive_expression(
+                &types,
+                &checking,
+                called,
+                PrimitiveType::Bool,
+                AccessCapability::Const,
+            );
+        }
+        assert_primitive_expression(
+            &types,
+            &checking,
+            expression(&invoke.body.statements[3]),
+            PrimitiveType::Unit,
+            AccessCapability::Const,
+        );
+        assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn assigns_call_result_categories_from_return_storage() {
+        let source = concat!(
+            "struct User {}\n",
+            "fn count() -> int {}\n",
+            "fn user() -> User {}\n",
+            "fn shared() -> &User {}\n",
+            "fn main() { count(); user(); shared(); }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[4]);
+        for (statement, declaration, category) in [
+            (&main.body.statements[0], 1, ValueCategory::FreshTemporary),
+            (&main.body.statements[1], 2, ValueCategory::FreshTemporary),
+            (
+                &main.body.statements[2],
+                3,
+                ValueCategory::GarbageCollectedReference,
+            ),
+        ] {
+            let called = expression(statement);
+            let signature = signatures
+                .callable(function(&program.declarations[declaration]).id)
+                .expect("called function should have a signature");
+            assert_eq!(checking.expressions[&called.id].type_id, signature.return_type);
+            assert_eq!(checking.expressions[&called.id].category, category);
+        }
+        assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn records_parameter_transfers_for_successful_arguments() {
+        let source = concat!(
+            "struct User {}\n",
+            "fn consume(count: int, user: User, text: string, shared: &User) {}\n",
+            "fn inspect(count: int, user: User, shared: &User) {\n",
+            "    consume(count, user, \"a\" + \"b\", shared);\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let inspect = function(&program.declarations[2]);
+        let (_, arguments) = call(expression(&inspect.body.statements[0]));
+        assert_eq!(arguments.len(), 4);
+        for (argument, transfer) in arguments.iter().zip([
+            ValueTransfer::TrivialCopy,
+            ValueTransfer::Borrow,
+            ValueTransfer::Borrow,
+            ValueTransfer::ReuseGarbageCollected,
+        ]) {
+            assert_eq!(checking.transfers.get(&argument.id), Some(&transfer));
+        }
+        assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn diagnoses_invalid_calls_and_recovers_without_parent_errors() {
+        let source = concat!(
+            "fn target(left: int, right: float) -> int {}\n",
+            "fn main() {\n",
+            "    const recovered: bool = target(true, 9223372036854775808);\n",
+            "    1(9223372036854775808);\n",
+            "    target(1);\n",
+            "    target(1, 2.0, 3);\n",
+            "    9223372036854775808(1, false);\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[1]);
+        let StatementKind::Binding { initializer, .. } = &main.body.statements[0].kind else {
+            panic!("expected recovered binding")
+        };
+        let (_, mismatched_arguments) = call(initializer);
+        assert_eq!(checking.errors[0].span, mismatched_arguments[0].span);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert_eq!(checking.errors[1].span, mismatched_arguments[1].span);
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::IntegerLiteralOutOfRange
+        );
+
+        let non_callable = expression(&main.body.statements[1]);
+        let (non_callable_callee, non_callable_arguments) = call(non_callable);
+        assert_eq!(checking.errors[2].span, non_callable_callee.span);
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::NotCallable { .. }
+        ));
+        assert_eq!(checking.errors[3].span, non_callable_arguments[0].span);
+        assert_eq!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::IntegerLiteralOutOfRange
+        );
+
+        for (error, expected, found) in [(&checking.errors[4], 2, 1), (&checking.errors[5], 2, 3)] {
+            assert_eq!(
+                error.kind,
+                ExpressionCheckingErrorKind::ArgumentCountMismatch { expected, found }
+            );
+        }
+
+        let recovered_callee_call = expression(&main.body.statements[4]);
+        let (_, recovered_callee_arguments) = call(recovered_callee_call);
+        assert_eq!(
+            checking.errors[6].kind,
+            ExpressionCheckingErrorKind::IntegerLiteralOutOfRange
+        );
+        assert_eq!(checking.errors.len(), 7);
+        for called in [
+            initializer,
+            non_callable,
+            expression(&main.body.statements[2]),
+            expression(&main.body.statements[3]),
+            recovered_callee_call,
+        ] {
+            assert_eq!(
+                checking.expressions[&called.id].type_id,
+                types.types().recovery()
+            );
+        }
+        assert!(recovered_callee_arguments.iter().all(|argument| {
+            checking.expressions.contains_key(&argument.id)
+        }));
+        assert!(!checking
+            .transfers
+            .contains_key(&mismatched_arguments[0].id));
+        let (_, surplus_arguments) = call(expression(&main.body.statements[3]));
+        assert!(!checking.transfers.contains_key(&surplus_arguments[2].id));
     }
 }
