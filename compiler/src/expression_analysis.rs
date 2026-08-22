@@ -60,6 +60,10 @@ enum ExpressionCheckingErrorKind {
         operator: BinaryOperator,
         found: TypeId,
     },
+    InvalidGarbageCollectionSource {
+        found: TypeId,
+        category: ValueCategory,
+    },
     NotCallable { found: TypeId },
     ArgumentCountMismatch { expected: usize, found: usize },
 }
@@ -287,6 +291,9 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::PrimitiveConversion { target, value } => {
                 self.synthesize_primitive_conversion(*target, value)?
             }
+            ExpressionKind::GarbageCollect(value) => {
+                self.synthesize_garbage_collection(value)?
+            }
             ExpressionKind::Unary { operator, operand } => {
                 self.synthesize_unary(*operator, operand)?
             }
@@ -374,6 +381,58 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         }
         Some(self.fresh_primitive(target))
+    }
+
+    /// Types prefix GC allocation and records how its operand enters GC storage.
+    ///
+    /// Fresh temporaries are moved into a new allocation, existing GC
+    /// references are reused, and plain places are rejected because allocation
+    /// cannot change the storage identity of an existing value.
+    fn synthesize_garbage_collection(
+        &mut self,
+        value: &Expression,
+    ) -> Option<TypedExpression> {
+        let source = self.synthesize(value)?;
+        let semantic = self
+            .types
+            .types()
+            .get(source.type_id)
+            .expect("allocated value type belongs to the program type store");
+        if matches!(semantic, SemanticType::Recovery | SemanticType::Divergence) {
+            return Some(source);
+        }
+        if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+            self.checking
+                .transfers
+                .insert(value.id, ValueTransfer::ReuseGarbageCollected);
+            return Some(TypedExpression {
+                type_id: source.type_id,
+                category: ValueCategory::GarbageCollectedReference,
+            });
+        }
+        if source.category != ValueCategory::FreshTemporary {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidGarbageCollectionSource {
+                    found: source.type_id,
+                    category: source.category,
+                },
+                span: value.span,
+            });
+            return Some(self.recovery_temporary());
+        }
+
+        let type_id = self
+            .types
+            .types_mut()
+            .garbage_collected(source.type_id)
+            .expect("fresh value must have GC-qualifiable storage");
+        self.checking
+            .transfers
+            .insert(value.id, ValueTransfer::AllocateGarbageCollected);
+        Some(TypedExpression {
+            type_id,
+            category: ValueCategory::GarbageCollectedReference,
+        })
     }
 
     fn synthesize_unary(
@@ -854,6 +913,13 @@ mod tests {
             panic!("expected call expression")
         };
         (callee, arguments)
+    }
+
+    fn garbage_collected(expression: &Expression) -> &Expression {
+        let ExpressionKind::GarbageCollect(value) = &expression.kind else {
+            panic!("expected garbage-collection expression")
+        };
+        value
     }
 
     fn named_parameter(function: &Function, index: usize) -> &FunctionParameter {
@@ -1612,6 +1678,196 @@ mod tests {
             assert_eq!(checking.transfers.get(&argument.id), Some(&transfer));
         }
         assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn allocates_fresh_values_and_reuses_gc_references() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn make() -> Item {}\n",
+            "fn shared() -> &Item {}\n",
+            "fn main() {\n",
+            "    const number = &1;\n",
+            "    const text = &\"text\";\n",
+            "    const item = &make();\n",
+            "    const first = shared();\n",
+            "    const again = &first;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[3]);
+        assert_eq!(main.body.statements.len(), 5);
+
+        let mut initializers = Vec::new();
+        for statement in &main.body.statements {
+            let StatementKind::Binding { initializer, .. } = &statement.kind else {
+                panic!("expected binding")
+            };
+            let symbol = names
+                .symbol_for_declaration(statement.id)
+                .expect("binding should have a symbol");
+            assert_eq!(
+                checking.bindings[&symbol].category,
+                ValueCategory::GarbageCollectedReference
+            );
+            initializers.push(initializer);
+        }
+        for initializer in &initializers {
+            assert_eq!(
+                checking.expressions[&initializer.id].category,
+                ValueCategory::GarbageCollectedReference
+            );
+        }
+
+        let number_value = garbage_collected(initializers[0]);
+        let number_type = checking.expressions[&initializers[0].id].type_id;
+        let number_target = types
+            .types()
+            .garbage_collected_target(number_type)
+            .expect("allocated integer should have a GC target");
+        assert!(matches!(
+            types.types().get(number_target),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                capability: AccessCapability::Const,
+            })
+        ));
+
+        let text_value = garbage_collected(initializers[1]);
+        let text_type = checking.expressions[&initializers[1].id].type_id;
+        let text_target = types
+            .types()
+            .garbage_collected_target(text_type)
+            .expect("allocated string should have a GC target");
+        assert!(matches!(
+            types.types().get(text_target),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::String,
+                capability: AccessCapability::Mut,
+            })
+        ));
+
+        let item_value = garbage_collected(initializers[2]);
+        let item_type = checking.expressions[&initializers[2].id].type_id;
+        assert_eq!(
+            types.types().garbage_collected_target(item_type),
+            Some(
+                signatures
+                    .callable(function(&program.declarations[1]).id)
+                    .expect("make should have a signature")
+                    .return_type
+            )
+        );
+
+        let again_value = garbage_collected(initializers[4]);
+        assert_eq!(
+            checking.expressions[&initializers[4].id].type_id,
+            checking.expressions[&initializers[3].id].type_id
+        );
+        for value in [number_value, text_value, item_value] {
+            assert_eq!(
+                checking.transfers.get(&value.id),
+                Some(&ValueTransfer::AllocateGarbageCollected)
+            );
+        }
+        assert_eq!(
+            checking.transfers.get(&again_value.id),
+            Some(&ValueTransfer::ReuseGarbageCollected)
+        );
+        for initializer in initializers {
+            assert_eq!(
+                checking.transfers.get(&initializer.id),
+                Some(&ValueTransfer::ReuseGarbageCollected)
+            );
+        }
+        assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn rejects_plain_places_as_gc_allocation_sources_without_cascades() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn make() -> Item {}\n",
+            "fn inspect(parameter: Item) {\n",
+            "    const local = make();\n",
+            "    const recovered: bool = &local;\n",
+            "    &parameter;\n",
+            "    &9223372036854775808;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let inspect = function(&program.declarations[2]);
+        assert_eq!(inspect.body.statements.len(), 4);
+        let StatementKind::Binding {
+            initializer: recovered,
+            ..
+        } = &inspect.body.statements[1].kind
+        else {
+            panic!("expected recovered binding")
+        };
+        let local = garbage_collected(recovered);
+        let borrowed = expression(&inspect.body.statements[2]);
+        let parameter = garbage_collected(borrowed);
+        let overflow = expression(&inspect.body.statements[3]);
+        let overflow_value = garbage_collected(overflow);
+
+        assert_eq!(checking.errors.len(), 3);
+        assert_eq!(checking.errors[0].span, local.span);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::InvalidGarbageCollectionSource {
+                category: ValueCategory::OwnedInlinePlace,
+                ..
+            }
+        ));
+        assert_eq!(checking.errors[1].span, parameter.span);
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::InvalidGarbageCollectionSource {
+                category: ValueCategory::BorrowedPlace,
+                ..
+            }
+        ));
+        assert_eq!(checking.errors[2].span, overflow_value.span);
+        assert_eq!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::IntegerLiteralOutOfRange
+        );
+        for allocated in [recovered, borrowed, overflow] {
+            assert_eq!(
+                checking.expressions[&allocated.id].type_id,
+                types.types().recovery()
+            );
+        }
+        assert!(checking
+            .transfers
+            .get(&local.id)
+            .is_none());
+        assert!(checking
+            .transfers
+            .get(&parameter.id)
+            .is_none());
+        assert!(checking
+            .transfers
+            .get(&overflow_value.id)
+            .is_none());
     }
 
     #[test]
