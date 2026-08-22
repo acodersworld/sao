@@ -220,7 +220,7 @@ define_token_kinds! {
     #[token("/")] Slash,
     // Computes the integer remainder.
     #[token("%")] Percent,
-    // Negates a Boolean operand.
+    // Negates a Boolean operand or computes an integer's bitwise complement.
     #[token("!")] Bang,
     // Computes bitwise AND or joins types by intersection.
     #[token("&")] Ampersand,
@@ -228,8 +228,6 @@ define_token_kinds! {
     #[token("|")] Pipe,
     // Computes bitwise exclusive OR.
     #[token("^")] Caret,
-    // Computes bitwise complement.
-    #[token("~")] Tilde,
     // Computes short-circuiting logical AND.
     #[token("&&")] LogicalAnd,
     // Computes short-circuiting logical OR.
@@ -720,7 +718,7 @@ mod tests {
     fn lexes_punctuation_and_operators_with_longest_match() {
         let source = concat!(
             "( ) { } [ ] , ; :: : . .. ..= -> ? ",
-            "= + - * / % ! & | ^ ~ && || << >> == != < <= > >= ",
+            "= + - * / % ! & | ^ && || << >> == != < <= > >= ",
             "+= -= *= /= %= &= |= ^= <<= >>=",
         );
 
@@ -752,7 +750,6 @@ mod tests {
                 TokenKind::Ampersand,
                 TokenKind::Pipe,
                 TokenKind::Caret,
-                TokenKind::Tilde,
                 TokenKind::LogicalAnd,
                 TokenKind::LogicalOr,
                 TokenKind::ShiftLeft,
@@ -944,14 +941,14 @@ mod tests {
 
     #[test]
     fn reports_each_unrecognized_source_character_and_continues() {
-        let source = "@ $";
+        let source = "@ ~ $";
         let (tokens, errors) = streamed(source);
 
         assert_eq!(
             tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
             vec![TokenKind::Eof]
         );
-        assert_eq!(errors.len(), 2);
+        assert_eq!(errors.len(), 3);
         assert!(
             errors
                 .iter()

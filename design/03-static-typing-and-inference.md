@@ -229,9 +229,9 @@ by structs or interfaces, and operands are never implicitly converted.
 | unary `-` | `int` or `float` | the operand type |
 | `<`, `<=`, `>`, `>=` | two `int`, two `float`, or two `char` values | `bool` |
 | `!` | `bool` | `bool` |
+| `!` | `int` | `int` |
 | `&&`, `\|\|` | `bool`, `bool` | `bool` |
 | `&`, `\|`, `^`, `<<`, `>>` | `int`, `int` | `int` |
-| `~` | `int` | `int` |
 
 `==` and `!=` are available only when both operands have the same primitive
 type, as defined in Section 3.7. They do not perform numeric coercion or invoke

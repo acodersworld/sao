@@ -1376,20 +1376,15 @@ where
                     span,
                 ))
             }
-            TokenKind::Bang | TokenKind::Tilde => {
+            TokenKind::Bang => {
                 self.advance()?;
                 let operand =
                     self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
                 let span = Span::new(self.module_id, token.span.start, operand.span.end);
-                let operator = match token.kind {
-                    TokenKind::Bang => UnaryOperator::LogicalNot,
-                    TokenKind::Tilde => UnaryOperator::BitwiseNot,
-                    _ => unreachable!(),
-                };
 
                 Ok(Expression::new(
                     ExpressionKind::Unary {
-                        operator,
+                        operator: UnaryOperator::Not,
                         operand: Box::new(operand),
                     },
                     span,
@@ -2325,8 +2320,7 @@ const fn prefix_binding_power(kind: TokenKind) -> u8 {
     match kind {
         TokenKind::Ampersand
         | TokenKind::Minus
-        | TokenKind::Bang
-        | TokenKind::Tilde => PREFIX_BINDING_POWER,
+        | TokenKind::Bang => PREFIX_BINDING_POWER,
         _ => LOWEST_BINDING_POWER,
     }
 }
@@ -6312,8 +6306,7 @@ mod tests {
     fn parses_all_prefix_operators() {
         for (source, expected) in [
             ("-value", UnaryOperator::Negate),
-            ("!value", UnaryOperator::LogicalNot),
-            ("~value", UnaryOperator::BitwiseNot),
+            ("!value", UnaryOperator::Not),
         ] {
             let expression = parse(source).expect("prefix expression should parse");
             let ExpressionKind::Unary { operator, .. } = expression.kind else {
@@ -6322,6 +6315,37 @@ mod tests {
 
             assert_eq!(operator, expected, "incorrect operator for {source}");
         }
+    }
+
+    #[test]
+    fn rejects_tilde_as_an_unexpected_character() {
+        assert_eq!(
+            parse("~value"),
+            Err(FrontendError::Lexical(LexError {
+                kind: LexErrorKind::UnexpectedCharacter,
+                span: span(0, 1),
+            }))
+        );
+    }
+
+    #[test]
+    fn unary_not_retains_prefix_precedence() {
+        let expression = parse("!value == false").expect("unary not should parse");
+        let ExpressionKind::Binary {
+            left,
+            operator: BinaryOperator::Equal,
+            ..
+        } = expression.kind
+        else {
+            panic!("expected equality around unary not")
+        };
+        assert!(matches!(
+            left.kind,
+            ExpressionKind::Unary {
+                operator: UnaryOperator::Not,
+                ..
+            }
+        ));
     }
 
     #[test]

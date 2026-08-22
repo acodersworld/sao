@@ -600,8 +600,7 @@ pub enum LiteralKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOperator {
     Negate,
-    LogicalNot,
-    BitwiseNot,
+    Not,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
