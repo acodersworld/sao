@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{BuiltinType, NodeId, PrimitiveType};
+use crate::ast::{BuiltinType, NodeId, PrimitiveType, ValueCapability};
 
 /// The canonical identity of one semantic type within a [`TypeStore`].
 ///
@@ -22,6 +22,15 @@ pub struct TypeId(usize);
 pub enum AccessCapability {
     Const,
     Mut,
+}
+
+impl From<ValueCapability> for AccessCapability {
+    fn from(value: ValueCapability) -> Self {
+        match value {
+            ValueCapability::Const => Self::Const,
+            ValueCapability::Mut => Self::Mut,
+        }
+    }
 }
 
 /// Where a value's independently owned storage resides.
@@ -638,6 +647,18 @@ mod tests {
             module_id: ModuleId::TEST_SOURCE,
             node_id,
         }
+    }
+
+    #[test]
+    fn source_value_capabilities_map_to_semantic_capabilities() {
+        assert_eq!(
+            AccessCapability::from(ValueCapability::Const),
+            AccessCapability::Const
+        );
+        assert_eq!(
+            AccessCapability::from(ValueCapability::Mut),
+            AccessCapability::Mut
+        );
     }
 
     #[test]

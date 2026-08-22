@@ -12,7 +12,7 @@ use crate::{
         AnonymousStructMember, Block, BuiltinType, ConditionalElse, Declaration, Expression,
         ExpressionKind, Function, FunctionParameter, FunctionParameterKind,
         InterfaceMethodRequirement, NodeId, PrimitiveType, Program, ReceiverStorage, Statement,
-        StatementKind, StructMember, ValueCapability,
+        StatementKind, StructMember,
     },
     context_resolution::{CallableKind, ContextResolution},
     name_resolution::NameResolution,
@@ -903,7 +903,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                 FunctionParameterKind::Receiver { storage, .. } => {
                     receiver = Some(ReceiverSignature {
                         storage: *storage,
-                        capability: capability(parameter.qualifiers.value),
+                        capability: parameter.qualifiers.value.into(),
                     });
                 }
                 FunctionParameterKind::Named {
@@ -913,7 +913,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     let resolved = self
                         .types
                         .types_mut()
-                        .with_capability(resolved, capability(parameter.qualifiers.value))
+                        .with_capability(resolved, parameter.qualifiers.value.into())
                         .expect("resolved parameter type belongs to the program type store");
                     semantic_parameters.push(resolved);
                 }
@@ -1225,13 +1225,6 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
         self.module
             .text(span)
             .expect("AST name span must point into its source module")
-    }
-}
-
-const fn capability(value: ValueCapability) -> AccessCapability {
-    match value {
-        ValueCapability::Const => AccessCapability::Const,
-        ValueCapability::Mut => AccessCapability::Mut,
     }
 }
 
