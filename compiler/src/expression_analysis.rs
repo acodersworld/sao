@@ -13,9 +13,9 @@ use std::collections::HashMap;
 
 use crate::{
     ast::{
-        BindingQualifiers, Declaration, Expression, ExpressionKind, Function,
+        BinaryOperator, BindingQualifiers, Declaration, Expression, ExpressionKind, Function,
         FunctionParameterKind, LiteralKind, NodeId, PrimitiveType, Program, ReceiverStorage,
-        Statement, StatementKind, StructMember, ValueCapability,
+        Statement, StatementKind, StructMember, UnaryOperator, ValueCapability,
     },
     context_resolution::ContextResolution,
     name_resolution::NameResolution,
@@ -52,6 +52,14 @@ struct ExpressionCheckingError {
 enum ExpressionCheckingErrorKind {
     IntegerLiteralOutOfRange,
     TypeMismatch { expected: TypeId, found: TypeId },
+    InvalidUnaryOperand {
+        operator: UnaryOperator,
+        found: TypeId,
+    },
+    InvalidBinaryOperand {
+        operator: BinaryOperator,
+        found: TypeId,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -273,6 +281,18 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::Literal(literal) => self.synthesize_literal(expression, *literal),
             ExpressionKind::Identifier => self.synthesize_identifier(expression)?,
             ExpressionKind::SelfValue => self.synthesize_self(expression),
+            ExpressionKind::Group(inner) => self.synthesize(inner)?,
+            ExpressionKind::PrimitiveConversion { target, value } => {
+                self.synthesize_primitive_conversion(*target, value)?
+            }
+            ExpressionKind::Unary { operator, operand } => {
+                self.synthesize_unary(*operator, operand)?
+            }
+            ExpressionKind::Binary {
+                left,
+                operator,
+                right,
+            } => self.synthesize_binary(left, *operator, right)?,
             _ => return None,
         };
         self.checking.expressions.insert(expression.id, typed);
@@ -280,7 +300,24 @@ impl<'semantic> Analyzer<'semantic> {
     }
 
     fn check(&mut self, expression: &Expression, expected: TypeId) -> Option<TypedExpression> {
+        if let ExpressionKind::Group(inner) = &expression.kind
+            && !self.checking.expressions.contains_key(&expression.id)
+        {
+            let typed = self.check(inner, expected)?;
+            self.checking.expressions.insert(expression.id, typed);
+            return Some(typed);
+        }
+
         let found = self.synthesize(expression)?;
+        self.check_typed(expression, expected, found)
+    }
+
+    fn check_typed(
+        &mut self,
+        expression: &Expression,
+        expected: TypeId,
+        found: TypedExpression,
+    ) -> Option<TypedExpression> {
         if self.is_recovery(expected) || self.is_recovery(found.type_id) {
             return Some(found);
         }
@@ -306,6 +343,177 @@ impl<'semantic> Analyzer<'semantic> {
         };
         self.checking.expressions.insert(expression.id, recovered);
         Some(recovered)
+    }
+
+    fn synthesize_primitive_conversion(
+        &mut self,
+        target: PrimitiveType,
+        value: &Expression,
+    ) -> Option<TypedExpression> {
+        let source = match target {
+            PrimitiveType::Int => PrimitiveType::Float,
+            PrimitiveType::Float => PrimitiveType::Int,
+            PrimitiveType::Char => PrimitiveType::Int,
+            PrimitiveType::Unit
+            | PrimitiveType::None
+            | PrimitiveType::Bool
+            | PrimitiveType::String
+            | PrimitiveType::Bytes => return None,
+        };
+        let expected = self
+            .types
+            .types_mut()
+            .primitive(source, AccessCapability::Const);
+        let checked = self.check(value, expected)?;
+        if self.is_recovery(checked.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        Some(self.fresh_primitive(target))
+    }
+
+    fn synthesize_unary(
+        &mut self,
+        operator: UnaryOperator,
+        operand: &Expression,
+    ) -> Option<TypedExpression> {
+        let typed_operand = self.synthesize(operand)?;
+        if self.is_recovery(typed_operand.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        let primitive = self.primitive_kind(typed_operand.type_id);
+        let valid = matches!(
+            (operator, primitive),
+            (UnaryOperator::Negate, Some(PrimitiveType::Int | PrimitiveType::Float))
+                | (UnaryOperator::Not, Some(PrimitiveType::Bool | PrimitiveType::Int))
+        );
+        if valid {
+            return Some(self.fresh_primitive(
+                primitive.expect("valid unary operand must be primitive"),
+            ));
+        }
+
+        self.checking.errors.push(ExpressionCheckingError {
+            kind: ExpressionCheckingErrorKind::InvalidUnaryOperand {
+                operator,
+                found: typed_operand.type_id,
+            },
+            span: operand.span,
+        });
+        Some(self.recovery_temporary())
+    }
+
+    fn synthesize_binary(
+        &mut self,
+        left: &Expression,
+        operator: BinaryOperator,
+        right: &Expression,
+    ) -> Option<TypedExpression> {
+        let typed_left = self.synthesize(left)?;
+        if self.is_recovery(typed_left.type_id) {
+            let _ = self.synthesize(right);
+            return Some(self.recovery_temporary());
+        }
+
+        let left_primitive = self.primitive_kind(typed_left.type_id);
+        let result = match operator {
+            BinaryOperator::Add => match left_primitive {
+                Some(PrimitiveType::Int | PrimitiveType::Float | PrimitiveType::String) => {
+                    left_primitive
+                }
+                _ => None,
+            },
+            BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide => match left_primitive {
+                Some(PrimitiveType::Int | PrimitiveType::Float) => left_primitive,
+                _ => None,
+            },
+            BinaryOperator::Remainder
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight
+            | BinaryOperator::BitwiseAnd
+            | BinaryOperator::BitwiseXor
+            | BinaryOperator::BitwiseOr => match left_primitive {
+                Some(PrimitiveType::Int) => Some(PrimitiveType::Int),
+                _ => None,
+            },
+            BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual => match left_primitive {
+                Some(PrimitiveType::Int | PrimitiveType::Float | PrimitiveType::Char) => {
+                    Some(PrimitiveType::Bool)
+                }
+                _ => None,
+            },
+            BinaryOperator::Equal | BinaryOperator::NotEqual => match left_primitive {
+                Some(
+                    PrimitiveType::Unit
+                    | PrimitiveType::None
+                    | PrimitiveType::Int
+                    | PrimitiveType::Float
+                    | PrimitiveType::Bool
+                    | PrimitiveType::Char
+                    | PrimitiveType::String,
+                ) => Some(PrimitiveType::Bool),
+                _ => None,
+            },
+            BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => match left_primitive {
+                Some(PrimitiveType::Bool) => Some(PrimitiveType::Bool),
+                _ => None,
+            },
+        };
+
+        let Some(result) = result else {
+            let _ = self.synthesize(right);
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidBinaryOperand {
+                    operator,
+                    found: typed_left.type_id,
+                },
+                span: left.span,
+            });
+            return Some(self.recovery_temporary());
+        };
+
+        let typed_right = self.check(right, typed_left.type_id)?;
+        if self.is_recovery(typed_right.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        if operator == BinaryOperator::Add && left_primitive == Some(PrimitiveType::String) {
+            return Some(TypedExpression {
+                type_id: self
+                    .types
+                    .types_mut()
+                    .primitive(PrimitiveType::String, AccessCapability::Mut),
+                category: ValueCategory::FreshTemporary,
+            });
+        }
+        Some(self.fresh_primitive(result))
+    }
+
+    fn primitive_kind(&self, type_id: TypeId) -> Option<PrimitiveType> {
+        match self.types.types().get(type_id) {
+            Some(SemanticType::Primitive { primitive, .. }) => Some(*primitive),
+            _ => None,
+        }
+    }
+
+    fn fresh_primitive(&mut self, primitive: PrimitiveType) -> TypedExpression {
+        TypedExpression {
+            type_id: self
+                .types
+                .types_mut()
+                .primitive(primitive, AccessCapability::Const),
+            category: ValueCategory::FreshTemporary,
+        }
+    }
+
+    fn recovery_temporary(&self) -> TypedExpression {
+        TypedExpression {
+            type_id: self.types.types().recovery(),
+            category: ValueCategory::FreshTemporary,
+        }
     }
 
     fn synthesize_literal(
@@ -539,6 +747,27 @@ mod tests {
             })
             .nth(index)
             .expect("named parameter should exist")
+    }
+
+    fn assert_primitive_expression(
+        types: &TypeResolution,
+        checking: &ExpressionChecking,
+        expression: &Expression,
+        primitive: PrimitiveType,
+        capability: AccessCapability,
+    ) {
+        let typed = checking
+            .expressions
+            .get(&expression.id)
+            .expect("expression should have semantic information");
+        assert_eq!(typed.category, ValueCategory::FreshTemporary);
+        assert!(matches!(
+            types.types().get(typed.type_id),
+            Some(SemanticType::Primitive {
+                primitive: found_primitive,
+                capability: found_capability,
+            }) if *found_primitive == primitive && *found_capability == capability
+        ));
     }
 
     #[test]
@@ -884,5 +1113,266 @@ mod tests {
                 capability: AccessCapability::Const,
             })
         ));
+    }
+
+    #[test]
+    fn groups_preserve_semantics_and_forward_expected_types() {
+        let source = concat!(
+            "fn main() { ",
+            "const value = 1; ",
+            "(value); ",
+            "const bad: float = (1); ",
+            "}",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[0]);
+        let grouped = expression(&main.body.statements[1]);
+        let ExpressionKind::Group(inner) = &grouped.kind else {
+            panic!("expected grouped expression")
+        };
+        assert_eq!(checking.expressions[&grouped.id], checking.expressions[&inner.id]);
+        assert_eq!(
+            checking.expressions[&grouped.id].category,
+            ValueCategory::OwnedInlinePlace
+        );
+
+        let StatementKind::Binding {
+            initializer: bad_group,
+            ..
+        } = &main.body.statements[2].kind
+        else {
+            panic!("expected annotated binding")
+        };
+        let ExpressionKind::Group(bad_inner) = &bad_group.kind else {
+            panic!("expected grouped initializer")
+        };
+        assert_eq!(checking.errors.len(), 1);
+        assert_eq!(checking.errors[0].span, bad_inner.span);
+        assert_eq!(
+            checking.expressions[&bad_group.id].type_id,
+            types.types().recovery()
+        );
+        assert_eq!(
+            checking.expressions[&bad_inner.id].type_id,
+            types.types().recovery()
+        );
+    }
+
+    #[test]
+    fn checks_primitive_unary_operators() {
+        let (module, program, names, context, mut types, signatures) = prepare(
+            "fn main() { -1; -1.0; !true; !1; -\"text\"; !1.0; }",
+        );
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[0]);
+        let expected = [
+            PrimitiveType::Int,
+            PrimitiveType::Float,
+            PrimitiveType::Bool,
+            PrimitiveType::Int,
+        ];
+        for (statement, primitive) in main.body.statements.iter().zip(expected) {
+            assert_primitive_expression(
+                &types,
+                &checking,
+                expression(statement),
+                primitive,
+                AccessCapability::Const,
+            );
+        }
+        assert_eq!(checking.errors.len(), 2);
+        assert!(checking.errors.iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::InvalidUnaryOperand { .. }
+        )));
+        for statement in &main.body.statements[4..] {
+            assert_eq!(
+                checking.expressions[&expression(statement).id].type_id,
+                types.types().recovery()
+            );
+        }
+    }
+
+    #[test]
+    fn checks_all_primitive_binary_operator_families() {
+        let source = concat!(
+            "fn main() { ",
+            "1 + 2; 1.0 + 2.0; \"a\" + \"b\"; 1 - 2; 1.0 * 2.0; 1 / 2; ",
+            "1 % 2; 1 << 2; 1 >> 2; 1 & 2; 1 ^ 2; 1 | 2; ",
+            "1 < 2; 1.0 <= 2.0; 'a' > 'b'; 1 >= 2; ",
+            "() == (); none != none; true == false; 'a' == 'b'; \"a\" != \"b\"; ",
+            "true && false; false || true; ",
+            "}",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[0]);
+        let expected = [
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Float, AccessCapability::Const),
+            (PrimitiveType::String, AccessCapability::Mut),
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Float, AccessCapability::Const),
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Int, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+            (PrimitiveType::Bool, AccessCapability::Const),
+        ];
+        assert_eq!(main.body.statements.len(), expected.len());
+        for (statement, (primitive, capability)) in
+            main.body.statements.iter().zip(expected)
+        {
+            assert_primitive_expression(
+                &types,
+                &checking,
+                expression(statement),
+                primitive,
+                capability,
+            );
+        }
+        assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn diagnoses_binary_operands_without_cascading() {
+        let source = "fn main() { true + false; 1 + 1.0; (1 + 1.0) + 2; }";
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 3);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::InvalidBinaryOperand {
+                operator: BinaryOperator::Add,
+                ..
+            }
+        ));
+        assert!(checking.errors[1..].iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        )));
+        let main = function(&program.declarations[0]);
+        assert_eq!(
+            checking.expressions[&expression(&main.body.statements[2]).id].type_id,
+            types.types().recovery()
+        );
+    }
+
+    #[test]
+    fn checks_supported_primitive_conversions() {
+        let source = concat!(
+            "fn main() { ",
+            "int(1.0); float(1); char(65); int(1); ",
+            "const bad: float = int(1.0); string(1); ",
+            "}",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[0]);
+        for (statement, primitive) in main.body.statements[..3]
+            .iter()
+            .zip([PrimitiveType::Int, PrimitiveType::Float, PrimitiveType::Char])
+        {
+            assert_primitive_expression(
+                &types,
+                &checking,
+                expression(statement),
+                primitive,
+                AccessCapability::Const,
+            );
+        }
+        assert_eq!(checking.errors.len(), 2);
+        assert!(checking.errors.iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        )));
+        assert_eq!(
+            checking.expressions[&expression(&main.body.statements[3]).id].type_id,
+            types.types().recovery()
+        );
+        let unsupported = expression(&main.body.statements[5]);
+        assert!(!checking.expressions.contains_key(&unsupported.id));
+    }
+
+    #[test]
+    fn records_binding_transfers_from_primitive_expressions() {
+        let (module, program, names, context, mut types, signatures) = prepare(
+            concat!(
+                "fn main() { ",
+                "const prefix = \"a\"; ",
+                "const sum = 1 + 2; ",
+                "const text = prefix + \"b\"; ",
+                "}",
+            ),
+        );
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[0]);
+        for (statement, transfer) in main.body.statements.iter().zip([
+            ValueTransfer::MoveTemporary,
+            ValueTransfer::TrivialCopy,
+            ValueTransfer::MoveTemporary,
+        ]) {
+            let StatementKind::Binding { initializer, .. } = &statement.kind else {
+                panic!("expected binding")
+            };
+            assert_eq!(checking.transfers.get(&initializer.id), Some(&transfer));
+        }
+        assert!(checking.errors.is_empty());
     }
 }
