@@ -1,9 +1,9 @@
 //! Internal foundation for core expression type checking.
 //!
 //! This module intentionally has no public whole-program entry point yet. It
-//! records the leaf-expression and ordinary-binding facts needed by later
-//! increments without treating not-yet-implemented expression forms as source
-//! errors.
+//! records the expression, binding, call, and callable-result facts needed by
+//! later increments without treating not-yet-implemented expression forms as
+//! source errors.
 
 // The whole-program entry point remains intentionally private and unconnected
 // until the core-expression phase covers every expression form in its scope.
@@ -61,6 +61,10 @@ enum ExpressionCheckingErrorKind {
         found: TypeId,
     },
     InvalidGarbageCollectionSource {
+        found: TypeId,
+        category: ValueCategory,
+    },
+    InvalidReturnSource {
         found: TypeId,
         category: ValueCategory,
     },
@@ -149,7 +153,12 @@ impl<'semantic> Analyzer<'semantic> {
 
     fn visit_function(&mut self, function: &Function) {
         self.seed_parameters(function);
-        self.visit_block(&function.body);
+        let return_type = self
+            .signatures
+            .callable(function.id)
+            .expect("function signature must have been collected")
+            .return_type;
+        self.visit_callable_body(&function.body, return_type);
     }
 
     /// Makes a function's named parameters available while checking its body.
@@ -191,37 +200,74 @@ impl<'semantic> Analyzer<'semantic> {
         );
     }
 
-    fn visit_block(&mut self, block: &crate::ast::Block) {
+    /// Checks a named callable body and whether its sequential execution can
+    /// reach the body's implicit result.
+    ///
+    /// Every statement is analyzed even after control flow has diverged. A
+    /// reachable final expression supplies the callable result, while reachable
+    /// completion without one supplies unit.
+    fn visit_callable_body(&mut self, block: &crate::ast::Block, expected: TypeId) {
+        // A return or diverging statement prevents execution from reaching the
+        // body's final value or implicit unit result.
+        let mut can_reach_body_end = true;
         for statement in &block.statements {
-            self.visit_statement(statement);
+            let statement_can_complete = self.visit_statement(statement);
+            can_reach_body_end &= statement_can_complete;
         }
-        if let Some(value) = &block.value {
-            self.synthesize(value);
+        match (&block.value, can_reach_body_end) {
+            (Some(value), true) => self.analyze_return_value(value, expected),
+            (Some(value), false) => {
+                let _ = self.synthesize(value);
+            }
+            (None, true) => self.check_absent_value(expected, block.span),
+            (None, false) => {}
         }
     }
 
-    fn visit_statement(&mut self, statement: &Statement) {
+    fn visit_statement(&mut self, statement: &Statement) -> bool {
         match &statement.kind {
             StatementKind::Binding {
                 qualifiers,
                 type_annotation,
                 initializer,
                 ..
-            } => self.analyze_binding(
-                statement,
-                *qualifiers,
-                type_annotation.as_ref().map(|syntax| syntax.id),
-                initializer,
-            ),
-            StatementKind::Expression(expression) => {
-                self.synthesize(expression);
+            } => {
+                let source = self.analyze_binding(
+                    statement,
+                    *qualifiers,
+                    type_annotation.as_ref().map(|syntax| syntax.id),
+                    initializer,
+                );
+                source.map_or(true, |typed| !self.is_divergence(typed.type_id))
             }
-            StatementKind::Function(function) => self.visit_function(function),
+            StatementKind::Expression(expression) => self
+                .synthesize(expression)
+                .map_or(true, |typed| !self.is_divergence(typed.type_id)),
+            StatementKind::Function(function) => {
+                self.visit_function(function);
+                true
+            }
+            StatementKind::Return(value) => {
+                let callable = self
+                    .context
+                    .callable_for_return(statement.id)
+                    .expect("return statement must have a resolved callable target");
+                let expected = self
+                    .signatures
+                    .callable(callable)
+                    .expect("return target must have a collected signature")
+                    .return_type;
+                if let Some(value) = value {
+                    self.analyze_return_value(value, expected);
+                } else {
+                    self.check_absent_value(expected, statement.span);
+                }
+                false
+            }
             StatementKind::Defer(_)
             | StatementKind::Coroutine(_)
             | StatementKind::Break(_)
-            | StatementKind::Continue
-            | StatementKind::Return(_) => {}
+            | StatementKind::Continue => true,
         }
     }
 
@@ -237,7 +283,7 @@ impl<'semantic> Analyzer<'semantic> {
         qualifiers: BindingQualifiers,
         annotation: Option<NodeId>,
         initializer: &Expression,
-    ) {
+    ) -> Option<TypedExpression> {
         let expected = annotation.map(|id| {
             let resolved = self
                 .types
@@ -250,7 +296,7 @@ impl<'semantic> Analyzer<'semantic> {
             None => self.synthesize(initializer),
         };
         let Some(source) = source else {
-            return;
+            return None;
         };
 
         let stored_type = if self.is_recovery(source.type_id) {
@@ -276,6 +322,95 @@ impl<'semantic> Analyzer<'semantic> {
                 category,
             },
         );
+        Some(source)
+    }
+
+    /// Checks a returned expression and records how its value enters the
+    /// caller-owned result location.
+    fn analyze_return_value(&mut self, value: &Expression, expected: TypeId) {
+        let Some(source) = self.check(value, expected) else {
+            return;
+        };
+        if self.is_recovery(source.type_id) || self.is_divergence(source.type_id) {
+            return;
+        }
+
+        let semantic = self
+            .types
+            .types()
+            .get(source.type_id)
+            .expect("return type belongs to the program type store");
+        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
+        {
+            Some(ValueTransfer::ReuseGarbageCollected)
+        } else {
+            match semantic.copy_semantics() {
+                Some(CopySemantics::Trivial) => Some(ValueTransfer::TrivialCopy),
+                Some(CopySemantics::Recursive) => Some(
+                    if source.category == ValueCategory::FreshTemporary {
+                        ValueTransfer::MoveTemporary
+                    } else {
+                        ValueTransfer::RecursiveCopy
+                    },
+                ),
+                Some(CopySemantics::NonEscapingErasedView)
+                    if matches!(semantic, SemanticType::Callable { .. })
+                        && source.category != ValueCategory::BorrowedPlace =>
+                {
+                    Some(ValueTransfer::MoveTemporary)
+                }
+                Some(CopySemantics::NonEscapingErasedView) | None => None,
+                Some(CopySemantics::GarbageCollectedPayload) => {
+                    unreachable!("GC return storage was handled above")
+                }
+            }
+        };
+        if let Some(transfer) = transfer {
+            self.checking.transfers.insert(value.id, transfer);
+            return;
+        }
+
+        self.checking.errors.push(ExpressionCheckingError {
+            kind: ExpressionCheckingErrorKind::InvalidReturnSource {
+                found: source.type_id,
+                category: source.category,
+            },
+            span: value.span,
+        });
+        self.checking.expressions.insert(
+            value.id,
+            TypedExpression {
+                type_id: self.types.types().recovery(),
+                category: source.category,
+            },
+        );
+    }
+
+    /// Checks an implicit unit result, such as a bare return or a callable body
+    /// that reaches its closing brace without a final expression.
+    fn check_absent_value(&mut self, expected: TypeId, span: Span) {
+        if self.is_recovery(expected) {
+            return;
+        }
+        let unit = self
+            .types
+            .types_mut()
+            .primitive(PrimitiveType::Unit, AccessCapability::Const);
+        if self
+            .types
+            .types()
+            .has_same_shape(unit, expected)
+            .expect("return types belong to the program type store")
+        {
+            return;
+        }
+        self.checking.errors.push(ExpressionCheckingError {
+            kind: ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: unit,
+            },
+            span,
+        });
     }
 
     fn synthesize(&mut self, expression: &Expression) -> Option<TypedExpression> {
@@ -330,7 +465,10 @@ impl<'semantic> Analyzer<'semantic> {
         expected: TypeId,
         found: TypedExpression,
     ) -> Option<TypedExpression> {
-        if self.is_recovery(expected) || self.is_recovery(found.type_id) {
+        if self.is_recovery(expected)
+            || self.is_recovery(found.type_id)
+            || self.is_divergence(found.type_id)
+        {
             return Some(found);
         }
         if self
@@ -835,6 +973,10 @@ impl<'semantic> Analyzer<'semantic> {
     fn is_recovery(&self, type_id: TypeId) -> bool {
         type_id == self.types.types().recovery()
     }
+
+    fn is_divergence(&self, type_id: TypeId) -> bool {
+        type_id == self.types.types().divergence()
+    }
 }
 
 #[cfg(test)]
@@ -918,6 +1060,21 @@ mod tests {
     fn garbage_collected(expression: &Expression) -> &Expression {
         let ExpressionKind::GarbageCollect(value) = &expression.kind else {
             panic!("expected garbage-collection expression")
+        };
+        value
+    }
+
+    fn body_value(function: &Function) -> &Expression {
+        function
+            .body
+            .value
+            .as_deref()
+            .expect("function should have a final value")
+    }
+
+    fn return_value(statement: &Statement) -> &Expression {
+        let StatementKind::Return(Some(value)) = &statement.kind else {
+            panic!("expected return statement with a value")
         };
         value
     }
@@ -1561,6 +1718,235 @@ mod tests {
     }
 
     #[test]
+    fn checks_callable_completion_returns_and_sequential_fallthrough() {
+        let source = concat!(
+            "fn tail() -> int { 1 }\n",
+            "fn explicit() -> int { return 1; }\n",
+            "fn unit() {}\n",
+            "fn bare() { return; }\n",
+            "fn missing() -> int {}\n",
+            "fn wrong_tail() -> int { false }\n",
+            "fn wrong_return() -> int { return false; }\n",
+            "fn unexpected() { return 1; }\n",
+            "fn recovered() -> int { return 9223372036854775808; }\n",
+            "fn unreachable() -> int { return 1; false + true; false }\n",
+            "fn divergent() -> int { panic(\"stop\") }\n",
+            "fn missing_bare() -> int { return; }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let missing = function(&program.declarations[4]);
+        let wrong_tail = body_value(function(&program.declarations[5]));
+        let wrong_return = return_value(&function(&program.declarations[6]).body.statements[0]);
+        let unexpected = return_value(&function(&program.declarations[7]).body.statements[0]);
+        let recovered = return_value(&function(&program.declarations[8]).body.statements[0]);
+        let unreachable = function(&program.declarations[9]);
+        let unreachable_error = expression(&unreachable.body.statements[1]);
+        let ExpressionKind::Binary {
+            left: unreachable_error_left,
+            ..
+        } = &unreachable_error.kind
+        else {
+            panic!("expected invalid binary expression")
+        };
+
+        let missing_bare = function(&program.declarations[11]);
+        assert_eq!(checking.errors.len(), 7);
+        assert_eq!(checking.errors[0].span, missing.body.span);
+        for (error, value) in [
+            (&checking.errors[1], wrong_tail),
+            (&checking.errors[2], wrong_return),
+            (&checking.errors[3], unexpected),
+        ] {
+            assert_eq!(error.span, value.span);
+            assert!(matches!(
+                error.kind,
+                ExpressionCheckingErrorKind::TypeMismatch { .. }
+            ));
+        }
+        assert_eq!(checking.errors[4].span, recovered.span);
+        assert_eq!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::IntegerLiteralOutOfRange
+        );
+        assert_eq!(checking.errors[5].span, unreachable_error_left.span);
+        assert!(matches!(
+            checking.errors[5].kind,
+            ExpressionCheckingErrorKind::InvalidBinaryOperand { .. }
+        ));
+        assert_eq!(checking.errors[6].span, missing_bare.body.statements[0].span);
+        assert!(matches!(
+            checking.errors[6].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+
+        let tail = body_value(function(&program.declarations[0]));
+        let explicit = return_value(&function(&program.declarations[1]).body.statements[0]);
+        let unreachable_return = return_value(&unreachable.body.statements[0]);
+        for value in [tail, explicit, unreachable_return] {
+            assert_eq!(
+                checking.transfers.get(&value.id),
+                Some(&ValueTransfer::TrivialCopy)
+            );
+        }
+        let unreachable_tail = body_value(unreachable);
+        assert!(checking.expressions.contains_key(&unreachable_tail.id));
+        assert!(!checking.transfers.contains_key(&unreachable_tail.id));
+        let divergent = body_value(function(&program.declarations[10]));
+        assert_eq!(
+            checking.expressions[&divergent.id].type_id,
+            types.types().divergence()
+        );
+        assert!(!checking.transfers.contains_key(&divergent.id));
+    }
+
+    #[test]
+    fn records_value_semantic_return_transfers() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn make() -> Item { Item {} }\n",
+            "fn primitive(value: int) -> int { value }\n",
+            "fn fresh() -> string { \"fresh\" }\n",
+            "fn copied(value: Item) -> Item { value }\n",
+            "fn copied_local() -> Item { const local = make(); local }\n",
+            "fn allocated() -> &Item { &make() }\n",
+            "fn helper() {}\n",
+            "fn callable() -> fn() -> () { helper }\n",
+            "fn callable_local() -> fn() -> () { const value = helper; value }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let returned = [
+            (body_value(function(&program.declarations[2])), ValueTransfer::TrivialCopy),
+            (body_value(function(&program.declarations[3])), ValueTransfer::MoveTemporary),
+            (body_value(function(&program.declarations[4])), ValueTransfer::RecursiveCopy),
+            (body_value(function(&program.declarations[5])), ValueTransfer::RecursiveCopy),
+            (
+                body_value(function(&program.declarations[6])),
+                ValueTransfer::ReuseGarbageCollected,
+            ),
+            (body_value(function(&program.declarations[8])), ValueTransfer::MoveTemporary),
+            (body_value(function(&program.declarations[9])), ValueTransfer::MoveTemporary),
+        ];
+        assert_eq!(returned.len(), 7);
+        for (value, transfer) in returned {
+            assert_eq!(checking.transfers.get(&value.id), Some(&transfer));
+        }
+        let allocated = body_value(function(&program.declarations[6]));
+        let allocation_source = garbage_collected(allocated);
+        assert_eq!(
+            checking.transfers.get(&allocation_source.id),
+            Some(&ValueTransfer::AllocateGarbageCollected)
+        );
+        assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn rejects_non_escaping_erased_return_sources() {
+        let source = concat!(
+            "interface Reader { fn read(self); }\n",
+            "interface Writer { fn write(self); }\n",
+            "fn return_interface(value: Reader) -> Reader { value }\n",
+            "fn return_intersection(value: Reader & Writer) -> Reader & Writer { value }\n",
+            "fn return_callable(value: fn() -> ()) -> fn() -> () { value }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let returned = [
+            body_value(function(&program.declarations[2])),
+            body_value(function(&program.declarations[3])),
+            body_value(function(&program.declarations[4])),
+        ];
+        assert_eq!(checking.errors.len(), returned.len());
+        for (error, value) in checking.errors.iter().zip(returned) {
+            assert_eq!(error.span, value.span);
+            assert!(matches!(
+                error.kind,
+                ExpressionCheckingErrorKind::InvalidReturnSource {
+                    category: ValueCategory::BorrowedPlace,
+                    ..
+                }
+            ));
+            assert_eq!(
+                checking.expressions[&value.id].type_id,
+                types.types().recovery()
+            );
+            assert!(!checking.transfers.contains_key(&value.id));
+        }
+    }
+
+    #[test]
+    fn checks_nested_function_and_named_method_results() {
+        let source = concat!(
+            "struct Item {\n",
+            "    fn duplicate(self) -> Item { return self; }\n",
+            "}\n",
+            "fn outer() -> int {\n",
+            "    fn nested(value: int) -> int { value }\n",
+            "    nested(1)\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let StructMember::Function(method) = &structure(&program.declarations[0]).members[0]
+        else {
+            panic!("expected method")
+        };
+        let outer = function(&program.declarations[1]);
+        let StatementKind::Function(nested) = &outer.body.statements[0].kind else {
+            panic!("expected nested function")
+        };
+        let returned = [
+            (
+                return_value(&method.body.statements[0]),
+                ValueTransfer::RecursiveCopy,
+            ),
+            (body_value(nested), ValueTransfer::TrivialCopy),
+            (body_value(outer), ValueTransfer::TrivialCopy),
+        ];
+        assert_eq!(returned.len(), 3);
+        for (value, transfer) in returned {
+            assert_eq!(
+                checking.transfers.get(&value.id),
+                Some(&transfer)
+            );
+        }
+        assert!(checking.errors.is_empty());
+    }
+
+    #[test]
     fn synthesizes_calls_through_ordinary_callable_values() {
         let source = concat!(
             "fn first(value: int) -> bool { second(value); true }\n",
@@ -1613,9 +1999,9 @@ mod tests {
     fn assigns_call_result_categories_from_return_storage() {
         let source = concat!(
             "struct User {}\n",
-            "fn count() -> int {}\n",
-            "fn user() -> User {}\n",
-            "fn shared() -> &User {}\n",
+            "fn count() -> int { 0 }\n",
+            "fn user() -> User { User {} }\n",
+            "fn shared() -> &User { &User {} }\n",
             "fn main() { count(); user(); shared(); }\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
@@ -1684,8 +2070,8 @@ mod tests {
     fn allocates_fresh_values_and_reuses_gc_references() {
         let source = concat!(
             "struct Item {}\n",
-            "fn make() -> Item {}\n",
-            "fn shared() -> &Item {}\n",
+            "fn make() -> Item { Item {} }\n",
+            "fn shared() -> &Item { &Item {} }\n",
             "fn main() {\n",
             "    const number = &1;\n",
             "    const text = &\"text\";\n",
@@ -1795,7 +2181,7 @@ mod tests {
     fn rejects_plain_places_as_gc_allocation_sources_without_cascades() {
         let source = concat!(
             "struct Item {}\n",
-            "fn make() -> Item {}\n",
+            "fn make() -> Item { Item {} }\n",
             "fn inspect(parameter: Item) {\n",
             "    const local = make();\n",
             "    const recovered: bool = &local;\n",
@@ -1873,7 +2259,7 @@ mod tests {
     #[test]
     fn diagnoses_invalid_calls_and_recovers_without_parent_errors() {
         let source = concat!(
-            "fn target(left: int, right: float) -> int {}\n",
+            "fn target(left: int, right: float) -> int { 0 }\n",
             "fn main() {\n",
             "    const recovered: bool = target(true, 9223372036854775808);\n",
             "    1(9223372036854775808);\n",
