@@ -69,7 +69,7 @@ fn apply(value: int, operation: fn(int) -> int) -> int {
     operation(value)
 }
 
-fn main() -> Summary {
+fn main() {
     const initial = 3;
     mut summary: Summary = Summary::new("language tour");
     const vmut shared_summary = summary;
@@ -194,7 +194,7 @@ fn main() -> Summary {
         println(scoped);
     };
 
-    summary
+    summary;
 }
 "#;
 

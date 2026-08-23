@@ -9,14 +9,14 @@
 // until the core-expression phase covers every expression form in its scope.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
-        BinaryOperator, BindingQualifiers, Block, ConditionalElse, Declaration, Expression,
-        ExpressionKind, Function, FunctionParameterKind, LiteralKind, NodeId, PrimitiveType,
-        Program, ReceiverStorage, Statement, StatementKind, StructMember, UnaryOperator,
-        ValueCapability,
+        AnonymousStructMember, BinaryOperator, BindingMutability, BindingQualifiers, Block,
+        ConditionalElse, Declaration, Expression, ExpressionKind, Function, FunctionParameter,
+        FunctionParameterKind, LiteralKind, NodeId, PrimitiveType, Program, ReceiverStorage,
+        Statement, StatementKind, StructMember, UnaryOperator, ValueCapability,
     },
     context_resolution::ContextResolution,
     name_resolution::NameResolution,
@@ -26,7 +26,7 @@ use crate::{
     },
     signature_collection::SignatureCollection,
     source::{SourceModule, Span},
-    symbol_table::SymbolId,
+    symbol_table::{SymbolId, SymbolKind},
     type_resolution::TypeResolution,
 };
 
@@ -109,6 +109,23 @@ struct BindingSemantics {
     category: ValueCategory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LambdaCaptureSource {
+    Symbol(SymbolId),
+    SelfValue { method: NodeId },
+}
+
+/// The type-facing portion of a lambda capture.
+///
+/// This deliberately records only the source and its two capabilities. The
+/// later capture-analysis pass still decides environment layout, recursive
+/// copies, shared mutable cells, tracing, and escape validity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LambdaCapture {
+    source: LambdaCaptureSource,
+    qualifiers: BindingQualifiers,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpressionCheckingError {
     kind: ExpressionCheckingErrorKind,
@@ -148,7 +165,223 @@ struct ExpressionChecking {
     bindings: HashMap<SymbolId, BindingSemantics>,
     transfers: HashMap<NodeId, ValueTransfer>,
     union_injections: HashMap<NodeId, UnionInjection>,
+    lambda_captures: HashMap<NodeId, Vec<LambdaCapture>>,
     errors: Vec<ExpressionCheckingError>,
+}
+
+#[derive(Debug, Default)]
+struct LexicalIndex {
+    callable_parents: HashMap<NodeId, Option<NodeId>>,
+    symbol_owners: HashMap<SymbolId, NodeId>,
+    receiver_qualifiers: HashMap<NodeId, BindingQualifiers>,
+}
+
+impl LexicalIndex {
+    fn build(program: &Program, names: &NameResolution) -> Self {
+        let mut index = Self::default();
+        for declaration in &program.declarations {
+            match declaration {
+                Declaration::Function(function) => index.visit_function(function, None, names),
+                Declaration::Struct(structure) => {
+                    for member in &structure.members {
+                        if let StructMember::Function(function) = member {
+                            index.visit_function(function, None, names);
+                        }
+                    }
+                }
+                Declaration::Interface(_) => {}
+            }
+        }
+        index
+    }
+
+    fn visit_function(
+        &mut self,
+        function: &Function,
+        parent: Option<NodeId>,
+        names: &NameResolution,
+    ) {
+        self.callable_parents.insert(function.id, parent);
+        self.record_parameters(function.id, &function.parameters, names);
+        if let Some(receiver) = function.parameters.iter().find(|parameter| {
+            matches!(&parameter.kind, FunctionParameterKind::Receiver { .. })
+        }) {
+            self.receiver_qualifiers
+                .insert(function.id, receiver.qualifiers);
+        }
+        self.visit_block(&function.body, function.id, names);
+    }
+
+    fn record_parameters(
+        &mut self,
+        callable: NodeId,
+        parameters: &[FunctionParameter],
+        names: &NameResolution,
+    ) {
+        for parameter in parameters {
+            if matches!(&parameter.kind, FunctionParameterKind::Named { .. }) {
+                let symbol = names
+                    .symbol_for_declaration(parameter.id)
+                    .expect("named parameter must have a semantic symbol");
+                self.symbol_owners.insert(symbol, callable);
+            }
+        }
+    }
+
+    fn visit_block(&mut self, block: &Block, callable: NodeId, names: &NameResolution) {
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::Binding { initializer, .. } => {
+                    self.visit_expression(initializer, callable, names);
+                    let symbol = names
+                        .symbol_for_declaration(statement.id)
+                        .expect("ordinary binding must have a semantic symbol");
+                    self.symbol_owners.insert(symbol, callable);
+                }
+                StatementKind::Expression(expression)
+                | StatementKind::Defer(expression)
+                | StatementKind::Coroutine(expression) => {
+                    self.visit_expression(expression, callable, names);
+                }
+                StatementKind::Function(function) => {
+                    self.visit_function(function, Some(callable), names);
+                }
+                StatementKind::Break(value) | StatementKind::Return(value) => {
+                    if let Some(value) = value {
+                        self.visit_expression(value, callable, names);
+                    }
+                }
+                StatementKind::Continue => {}
+            }
+        }
+        if let Some(value) = &block.value {
+            self.visit_expression(value, callable, names);
+        }
+    }
+
+    fn visit_expression(
+        &mut self,
+        expression: &Expression,
+        callable: NodeId,
+        names: &NameResolution,
+    ) {
+        match &expression.kind {
+            ExpressionKind::Identifier
+            | ExpressionKind::SelfValue
+            | ExpressionKind::Literal(_)
+            | ExpressionKind::AssociatedAccess { .. } => {}
+            ExpressionKind::Group(inner)
+            | ExpressionKind::PrimitiveConversion { value: inner, .. }
+            | ExpressionKind::GarbageCollect(inner)
+            | ExpressionKind::MemberAccess { object: inner, .. }
+            | ExpressionKind::Try { expression: inner }
+            | ExpressionKind::TypeTest { value: inner, .. }
+            | ExpressionKind::Unary { operand: inner, .. } => {
+                self.visit_expression(inner, callable, names);
+            }
+            ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
+                self.visit_block(block, callable, names);
+            }
+            ExpressionKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.visit_expression(condition, callable, names);
+                self.visit_block(then_branch, callable, names);
+                if let Some(else_branch) = else_branch {
+                    match else_branch {
+                        ConditionalElse::Block(block) => self.visit_block(block, callable, names),
+                        ConditionalElse::If(expression) => {
+                            self.visit_expression(expression, callable, names);
+                        }
+                    }
+                }
+            }
+            ExpressionKind::While {
+                condition,
+                body,
+                else_branch,
+            } => {
+                self.visit_expression(condition, callable, names);
+                self.visit_block(body, callable, names);
+                if let Some(block) = else_branch {
+                    self.visit_block(block, callable, names);
+                }
+            }
+            ExpressionKind::RangeFor {
+                start,
+                end,
+                body,
+                else_branch,
+                ..
+            } => {
+                self.visit_expression(start, callable, names);
+                self.visit_expression(end, callable, names);
+                let symbol = names
+                    .symbol_for_declaration(expression.id)
+                    .expect("range binding must have a semantic symbol");
+                self.symbol_owners.insert(symbol, callable);
+                self.visit_block(body, callable, names);
+                if let Some(block) = else_branch {
+                    self.visit_block(block, callable, names);
+                }
+            }
+            ExpressionKind::Lambda {
+                parameters, body, ..
+            } => {
+                self.callable_parents.insert(expression.id, Some(callable));
+                self.record_parameters(expression.id, parameters, names);
+                self.visit_block(body, expression.id, names);
+            }
+            ExpressionKind::StructConstruction { fields, .. } => {
+                for field in fields {
+                    self.visit_expression(&field.value, callable, names);
+                }
+            }
+            ExpressionKind::AnonymousStruct { members } => {
+                for member in members {
+                    match member {
+                        AnonymousStructMember::Field(field) => {
+                            self.visit_expression(&field.initializer, callable, names);
+                        }
+                        AnonymousStructMember::Method(method) => {
+                            self.visit_function(method, Some(callable), names);
+                        }
+                    }
+                }
+            }
+            ExpressionKind::Call { callee, arguments } => {
+                self.visit_expression(callee, callable, names);
+                for argument in arguments {
+                    self.visit_expression(argument, callable, names);
+                }
+            }
+            ExpressionKind::Index { object, index }
+            | ExpressionKind::Binary {
+                left: object,
+                right: index,
+                ..
+            }
+            | ExpressionKind::Assignment {
+                target: object,
+                value: index,
+                ..
+            } => {
+                self.visit_expression(object, callable, names);
+                self.visit_expression(index, callable, names);
+            }
+            ExpressionKind::Slice { object, start, end } => {
+                self.visit_expression(object, callable, names);
+                if let Some(start) = start {
+                    self.visit_expression(start, callable, names);
+                }
+                if let Some(end) = end {
+                    self.visit_expression(end, callable, names);
+                }
+            }
+        }
+    }
 }
 
 struct Analyzer<'semantic> {
@@ -158,6 +391,9 @@ struct Analyzer<'semantic> {
     signatures: &'semantic SignatureCollection,
     types: &'semantic mut TypeResolution,
     method_owners: HashMap<NodeId, TypeId>,
+    callable_parents: HashMap<NodeId, Option<NodeId>>,
+    symbol_owners: HashMap<SymbolId, NodeId>,
+    receiver_qualifiers: HashMap<NodeId, BindingQualifiers>,
     checking: ExpressionChecking,
 }
 
@@ -188,6 +424,11 @@ impl<'semantic> Analyzer<'semantic> {
         types: &'semantic mut TypeResolution,
         program: &Program,
     ) -> Self {
+        let LexicalIndex {
+            callable_parents,
+            symbol_owners,
+            receiver_qualifiers,
+        } = LexicalIndex::build(program, names);
         let mut method_owners = HashMap::new();
         for declaration in &program.declarations {
             let Declaration::Struct(structure) = declaration else {
@@ -215,6 +456,9 @@ impl<'semantic> Analyzer<'semantic> {
             signatures,
             types,
             method_owners,
+            callable_parents,
+            symbol_owners,
+            receiver_qualifiers,
             checking: ExpressionChecking::default(),
         }
     }
@@ -241,7 +485,7 @@ impl<'semantic> Analyzer<'semantic> {
     }
 
     fn visit_function(&mut self, function: &Function) {
-        self.seed_parameters(function);
+        self.seed_callable_parameters(function.id, &function.parameters);
         let return_type = self
             .signatures
             .callable(function.id)
@@ -250,19 +494,24 @@ impl<'semantic> Analyzer<'semantic> {
         self.visit_callable_body(&function.body, return_type);
     }
 
-    /// Makes a function's named parameters available while checking its body.
+    /// Makes a named function's or lambda's parameters available while checking
+    /// its body.
     ///
     /// Each parameter's collected semantic type, source qualifiers, and value
     /// category are recorded against its resolved symbol. Receivers are not
     /// included because `self` is typed separately from receiver metadata.
-    fn seed_parameters(&mut self, function: &Function) {
+    fn seed_callable_parameters(
+        &mut self,
+        callable: NodeId,
+        parameters: &[FunctionParameter],
+    ) {
         let signature = self
             .signatures
-            .callable(function.id)
-            .expect("function signature must have been collected");
+            .callable(callable)
+            .expect("callable signature must have been collected");
         let mut semantic_parameters = signature.parameters.clone().into_iter();
 
-        for parameter in &function.parameters {
+        for parameter in parameters {
             let FunctionParameterKind::Named { .. } = &parameter.kind else {
                 continue;
             };
@@ -403,17 +652,35 @@ impl<'semantic> Analyzer<'semantic> {
             Some(expected) => self.check(initializer, expected),
             None => self.synthesize(initializer),
         };
-        let Some(source) = source else {
+        let Some(mut source) = source else {
             return None;
         };
 
-        let stored_type = if self.is_recovery(source.type_id) {
+        let mut stored_type = if self.is_recovery(source.type_id) {
             source.type_id
         } else {
             expected.unwrap_or_else(|| {
                 self.with_value_capability(source.type_id, qualifiers.value)
             })
         };
+        if expected.is_none()
+            && !self.is_recovery(source.type_id)
+            && !self.callable_capability_is_compatible(source.type_id, stored_type)
+        {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::TypeMismatch {
+                    expected: stored_type,
+                    found: source.type_id,
+                },
+                span: initializer.span,
+            });
+            source = TypedExpression {
+                type_id: self.types.types().recovery(),
+                category: source.category,
+            };
+            stored_type = source.type_id;
+            self.checking.expressions.insert(initializer.id, source);
+        }
         let (category, transfer) = self.binding_transfer(source);
         if let Some(transfer) = transfer {
             self.checking.transfers.insert(initializer.id, transfer);
@@ -980,6 +1247,9 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::If { .. } => self
                 .synthesize_conditional_expression(expression, ConditionalUse::Value)?
                 .typed,
+            ExpressionKind::Lambda {
+                parameters, body, ..
+            } => self.synthesize_lambda(expression, parameters, body)?,
             ExpressionKind::PrimitiveConversion { target, value } => {
                 self.synthesize_primitive_conversion(*target, value)?
             }
@@ -1002,6 +1272,284 @@ impl<'semantic> Analyzer<'semantic> {
         self.checking.expressions.insert(expression.id, typed);
         self.checking.explicit_values.entry(expression.id).or_insert(true);
         Some(typed)
+    }
+
+    fn synthesize_lambda(
+        &mut self,
+        expression: &Expression,
+        parameters: &[FunctionParameter],
+        body: &Block,
+    ) -> Option<TypedExpression> {
+        let signature = self
+            .signatures
+            .callable(expression.id)
+            .expect("lambda signature must have been collected")
+            .clone();
+        let captures = self.lambda_captures(expression.id, body);
+        let capability = if captures.iter().any(|capture| {
+            capture.qualifiers.binding == BindingMutability::Mut
+                || capture.qualifiers.value == ValueCapability::Mut
+        }) {
+            AccessCapability::Mut
+        } else {
+            AccessCapability::Const
+        };
+        self.checking.lambda_captures.insert(expression.id, captures);
+
+        let first_body_error = self.checking.errors.len();
+        self.seed_callable_parameters(expression.id, parameters);
+        self.visit_callable_body(body, signature.return_type);
+        if self.checking.errors.len() != first_body_error {
+            return Some(self.recovery_temporary());
+        }
+
+        Some(TypedExpression {
+            type_id: self.types.types_mut().callable(
+                signature.parameters,
+                signature.return_type,
+                capability,
+            ),
+            category: ValueCategory::FreshTemporary,
+        })
+    }
+
+    /// Discovers only the free sources needed to infer a lambda's callable
+    /// capability. The post-type capture pass remains responsible for deciding
+    /// how these sources are represented and whether they may escape.
+    fn lambda_captures(&self, lambda: NodeId, body: &Block) -> Vec<LambdaCapture> {
+        let mut sources = Vec::new();
+        let mut seen = HashSet::new();
+        self.collect_captures_from_block(lambda, body, &mut sources, &mut seen);
+        sources
+            .into_iter()
+            .map(|source| {
+                let qualifiers = match source {
+                    LambdaCaptureSource::Symbol(symbol) => self
+                        .checking
+                        .bindings
+                        .get(&symbol)
+                        .expect("captured binding must be available before the lambda")
+                        .qualifiers,
+                    LambdaCaptureSource::SelfValue { method } => *self
+                        .receiver_qualifiers
+                        .get(&method)
+                        .expect("captured self must have receiver qualifiers"),
+                };
+                LambdaCapture { source, qualifiers }
+            })
+            .collect()
+    }
+
+    fn collect_captures_from_block(
+        &self,
+        lambda: NodeId,
+        block: &Block,
+        captures: &mut Vec<LambdaCaptureSource>,
+        seen: &mut HashSet<LambdaCaptureSource>,
+    ) {
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::Binding { initializer, .. }
+                | StatementKind::Expression(initializer)
+                | StatementKind::Defer(initializer)
+                | StatementKind::Coroutine(initializer) => {
+                    self.collect_captures_from_expression(
+                        lambda, initializer, captures, seen,
+                    );
+                }
+                // Named functions never capture, and illegal references from
+                // their bodies must not make an enclosing lambda capturing.
+                StatementKind::Function(_) | StatementKind::Continue => {}
+                StatementKind::Break(value) | StatementKind::Return(value) => {
+                    if let Some(value) = value {
+                        self.collect_captures_from_expression(lambda, value, captures, seen);
+                    }
+                }
+            }
+        }
+        if let Some(value) = &block.value {
+            self.collect_captures_from_expression(lambda, value, captures, seen);
+        }
+    }
+
+    fn collect_captures_from_expression(
+        &self,
+        lambda: NodeId,
+        expression: &Expression,
+        captures: &mut Vec<LambdaCaptureSource>,
+        seen: &mut HashSet<LambdaCaptureSource>,
+    ) {
+        match &expression.kind {
+            ExpressionKind::Identifier => {
+                let symbol = self
+                    .names
+                    .symbol_for_reference(expression.id)
+                    .expect("identifier must have a resolved semantic symbol");
+                let Some(symbol_data) = self.names.symbols().symbol(symbol) else {
+                    return;
+                };
+                if !matches!(
+                    symbol_data.kind,
+                    SymbolKind::Binding | SymbolKind::Parameter | SymbolKind::RangeBinding
+                ) {
+                    return;
+                }
+                let Some(owner) = self.symbol_owners.get(&symbol).copied() else {
+                    return;
+                };
+                if !self.callable_is_within(owner, lambda) {
+                    push_unique_capture(
+                        LambdaCaptureSource::Symbol(symbol),
+                        captures,
+                        seen,
+                    );
+                }
+            }
+            ExpressionKind::SelfValue => {
+                let method = self
+                    .context
+                    .method_for_self(expression.id)
+                    .expect("self expression must have a resolved method target");
+                if !self.callable_is_within(method, lambda) {
+                    push_unique_capture(
+                        LambdaCaptureSource::SelfValue { method },
+                        captures,
+                        seen,
+                    );
+                }
+            }
+            ExpressionKind::Literal(_) | ExpressionKind::AssociatedAccess { .. } => {}
+            ExpressionKind::Group(inner)
+            | ExpressionKind::PrimitiveConversion { value: inner, .. }
+            | ExpressionKind::GarbageCollect(inner)
+            | ExpressionKind::MemberAccess { object: inner, .. }
+            | ExpressionKind::Try { expression: inner }
+            | ExpressionKind::TypeTest { value: inner, .. }
+            | ExpressionKind::Unary { operand: inner, .. } => {
+                self.collect_captures_from_expression(lambda, inner, captures, seen);
+            }
+            ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
+                self.collect_captures_from_block(lambda, block, captures, seen);
+            }
+            ExpressionKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.collect_captures_from_expression(lambda, condition, captures, seen);
+                self.collect_captures_from_block(lambda, then_branch, captures, seen);
+                if let Some(else_branch) = else_branch {
+                    match else_branch {
+                        ConditionalElse::Block(block) => {
+                            self.collect_captures_from_block(lambda, block, captures, seen);
+                        }
+                        ConditionalElse::If(expression) => {
+                            self.collect_captures_from_expression(
+                                lambda, expression, captures, seen,
+                            );
+                        }
+                    }
+                }
+            }
+            ExpressionKind::While {
+                condition,
+                body,
+                else_branch,
+            } => {
+                self.collect_captures_from_expression(lambda, condition, captures, seen);
+                self.collect_captures_from_block(lambda, body, captures, seen);
+                if let Some(block) = else_branch {
+                    self.collect_captures_from_block(lambda, block, captures, seen);
+                }
+            }
+            ExpressionKind::RangeFor {
+                start,
+                end,
+                body,
+                else_branch,
+                ..
+            } => {
+                self.collect_captures_from_expression(lambda, start, captures, seen);
+                self.collect_captures_from_expression(lambda, end, captures, seen);
+                self.collect_captures_from_block(lambda, body, captures, seen);
+                if let Some(block) = else_branch {
+                    self.collect_captures_from_block(lambda, block, captures, seen);
+                }
+            }
+            ExpressionKind::Lambda { body, .. } => {
+                self.collect_captures_from_block(lambda, body, captures, seen);
+            }
+            ExpressionKind::StructConstruction { fields, .. } => {
+                for field in fields {
+                    self.collect_captures_from_expression(
+                        lambda, &field.value, captures, seen,
+                    );
+                }
+            }
+            ExpressionKind::AnonymousStruct { members } => {
+                for member in members {
+                    match member {
+                        AnonymousStructMember::Field(field) => {
+                            self.collect_captures_from_expression(
+                                lambda,
+                                &field.initializer,
+                                captures,
+                                seen,
+                            );
+                        }
+                        AnonymousStructMember::Method(method) => {
+                            self.collect_captures_from_block(
+                                lambda,
+                                &method.body,
+                                captures,
+                                seen,
+                            );
+                        }
+                    }
+                }
+            }
+            ExpressionKind::Call { callee, arguments } => {
+                self.collect_captures_from_expression(lambda, callee, captures, seen);
+                for argument in arguments {
+                    self.collect_captures_from_expression(lambda, argument, captures, seen);
+                }
+            }
+            ExpressionKind::Index { object, index }
+            | ExpressionKind::Binary {
+                left: object,
+                right: index,
+                ..
+            }
+            | ExpressionKind::Assignment {
+                target: object,
+                value: index,
+                ..
+            } => {
+                self.collect_captures_from_expression(lambda, object, captures, seen);
+                self.collect_captures_from_expression(lambda, index, captures, seen);
+            }
+            ExpressionKind::Slice { object, start, end } => {
+                self.collect_captures_from_expression(lambda, object, captures, seen);
+                if let Some(start) = start {
+                    self.collect_captures_from_expression(lambda, start, captures, seen);
+                }
+                if let Some(end) = end {
+                    self.collect_captures_from_expression(lambda, end, captures, seen);
+                }
+            }
+        }
+    }
+
+    fn callable_is_within(&self, mut callable: NodeId, outer: NodeId) -> bool {
+        loop {
+            if callable == outer {
+                return true;
+            }
+            let Some(Some(parent)) = self.callable_parents.get(&callable) else {
+                return false;
+            };
+            callable = *parent;
+        }
     }
 
     fn check(&mut self, expression: &Expression, expected: TypeId) -> Option<TypedExpression> {
@@ -1068,7 +1616,10 @@ impl<'semantic> Analyzer<'semantic> {
             .has_same_shape(found.type_id, expected)
             .expect("checked types must belong to the program type store")
         {
-            return Some(found);
+            if self.callable_capability_is_compatible(found.type_id, expected) {
+                return Some(found);
+            }
+            return Some(self.report_type_mismatch(expression, expected, found));
         }
         let union_member = match self.types.types().get(expected) {
             Some(SemanticType::Union { members, .. }) => members.iter().copied().find(|member| {
@@ -1076,6 +1627,7 @@ impl<'semantic> Analyzer<'semantic> {
                     .types()
                     .has_same_shape(found.type_id, *member)
                     .expect("union members belong to the program type store")
+                    && self.callable_capability_is_compatible(found.type_id, *member)
             }),
             _ => None,
         };
@@ -1107,6 +1659,15 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(injected);
         }
 
+        Some(self.report_type_mismatch(expression, expected, found))
+    }
+
+    fn report_type_mismatch(
+        &mut self,
+        expression: &Expression,
+        expected: TypeId,
+        found: TypedExpression,
+    ) -> TypedExpression {
         self.checking.errors.push(ExpressionCheckingError {
             kind: ExpressionCheckingErrorKind::TypeMismatch {
                 expected,
@@ -1119,7 +1680,32 @@ impl<'semantic> Analyzer<'semantic> {
             category: found.category,
         };
         self.checking.expressions.insert(expression.id, recovered);
-        Some(recovered)
+        recovered
+    }
+
+    /// Callable capability is behavioral: a const callable can satisfy a
+    /// mutable-capability destination, but a callable that may mutate captures
+    /// cannot satisfy a const-callable guarantee.
+    fn callable_capability_is_compatible(&self, found: TypeId, expected: TypeId) -> bool {
+        let found = self.callable_capability(found);
+        let expected = self.callable_capability(expected);
+        match (found, expected) {
+            (Some(AccessCapability::Mut), Some(AccessCapability::Const)) => false,
+            _ => true,
+        }
+    }
+
+    fn callable_capability(&self, type_id: TypeId) -> Option<AccessCapability> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Callable { capability, .. } => Some(*capability),
+            SemanticType::GarbageCollected { target, .. } => {
+                match self.types.types().get(*target)? {
+                    SemanticType::Callable { capability, .. } => Some(*capability),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn synthesize_primitive_conversion(
@@ -1606,6 +2192,16 @@ impl<'semantic> Analyzer<'semantic> {
     }
 }
 
+fn push_unique_capture(
+    source: LambdaCaptureSource,
+    captures: &mut Vec<LambdaCaptureSource>,
+    seen: &mut HashSet<LambdaCaptureSource>,
+) {
+    if seen.insert(source) {
+        captures.push(source);
+    }
+}
+
 fn collect_conditional_arms<'expression>(
     expression: &'expression Expression,
     arms: &mut Vec<(
@@ -1734,6 +2330,16 @@ mod tests {
             panic!("expected garbage-collection expression")
         };
         value
+    }
+
+    fn lambda(expression: &Expression) -> (&[FunctionParameter], &Block) {
+        let ExpressionKind::Lambda {
+            parameters, body, ..
+        } = &expression.kind
+        else {
+            panic!("expected lambda expression")
+        };
+        (parameters, body)
     }
 
     fn body_value(function: &Function) -> &Expression {
@@ -3384,5 +3990,271 @@ mod tests {
             .contains_key(&mismatched_arguments[0].id));
         let (_, surplus_arguments) = call(expression(&main.body.statements[3]));
         assert!(!checking.transfers.contains_key(&surplus_arguments[2].id));
+    }
+
+    #[test]
+    fn synthesizes_lambda_signatures_parameters_calls_and_transfers() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const offset = 1;\n",
+            "    const add = lambda(value: int) -> int { value + offset };\n",
+            "    const called = add(2);\n",
+            "    const immediate = lambda(value: int) -> int { value }(3);\n",
+            "    const heap = &lambda(value: int) -> int { value };\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let main = function(&program.declarations[0]);
+        let add = binding_initializer(&main.body.statements[1]);
+        let (parameters, add_body) = lambda(add);
+        let add_type = checking.expressions[&add.id];
+        assert_eq!(add_type.category, ValueCategory::FreshTemporary);
+        assert!(matches!(
+            types.types().get(add_type.type_id),
+            Some(SemanticType::Callable {
+                parameters,
+                capability: AccessCapability::Const,
+                ..
+            }) if parameters.len() == 1
+        ));
+        assert_eq!(checking.lambda_captures[&add.id].len(), 1);
+        let offset_symbol = names
+            .symbol_for_declaration(main.body.statements[0].id)
+            .expect("offset should have a symbol");
+        assert_eq!(
+            checking.lambda_captures[&add.id][0].source,
+            LambdaCaptureSource::Symbol(offset_symbol)
+        );
+        let parameter_symbol = names
+            .symbol_for_declaration(parameters[0].id)
+            .expect("lambda parameter should have a symbol");
+        assert_eq!(
+            checking.bindings[&parameter_symbol].category,
+            ValueCategory::OwnedInlinePlace
+        );
+        let ExpressionKind::Binary { left, .. } = &add_body
+            .value
+            .as_deref()
+            .expect("lambda should have a result")
+            .kind
+        else {
+            panic!("expected binary lambda result")
+        };
+        assert_eq!(
+            checking.expressions[&left.id].type_id,
+            checking.bindings[&parameter_symbol].type_id
+        );
+        assert_eq!(checking.transfers[&add.id], ValueTransfer::MoveTemporary);
+
+        let immediate = binding_initializer(&main.body.statements[3]);
+        let (immediate_lambda, _) = call(immediate);
+        assert!(checking.lambda_captures[&immediate_lambda.id].is_empty());
+        let heap = binding_initializer(&main.body.statements[4]);
+        let heap_lambda = garbage_collected(heap);
+        assert_eq!(
+            checking.transfers[&heap_lambda.id],
+            ValueTransfer::AllocateGarbageCollected
+        );
+    }
+
+    #[test]
+    fn infers_mutable_lambda_capability_and_enforces_its_direction() {
+        let source = concat!(
+            "fn accepts_const(callback: fn() -> int) {}\n",
+            "fn accepts_mut(const vmut callback: fn() -> int) {}\n",
+            "fn invalid_return(mut value: int) -> fn() -> int {\n",
+            "    lambda() -> int { value }\n",
+            "}\n",
+            "fn main() {\n",
+            "    mut vconst count = 0;\n",
+            "    const vmut shared = 0;\n",
+            "    const invalid = lambda() -> int { count };\n",
+            "    const vmut valid = lambda() -> int { count };\n",
+            "    const vmut valid_shared = lambda() -> int { shared };\n",
+            "    accepts_mut(lambda() -> int { 1 });\n",
+            "    accepts_const(lambda() -> int { count });\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 3);
+        assert!(checking.errors.iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        )));
+        let invalid_return = body_value(function(&program.declarations[2]));
+        assert_eq!(checking.errors[0].span, invalid_return.span);
+        let main = function(&program.declarations[3]);
+        let invalid = binding_initializer(&main.body.statements[2]);
+        let valid = binding_initializer(&main.body.statements[3]);
+        let valid_shared = binding_initializer(&main.body.statements[4]);
+        assert_eq!(checking.errors[1].span, invalid.span);
+        assert_eq!(checking.expressions[&invalid.id].type_id, types.types().recovery());
+        for closure in [valid, valid_shared] {
+            assert!(matches!(
+                types.types().get(checking.expressions[&closure.id].type_id),
+                Some(SemanticType::Callable {
+                    capability: AccessCapability::Mut,
+                    ..
+                })
+            ));
+        }
+        let rejected_call = expression(&main.body.statements[6]);
+        let (_, rejected_arguments) = call(rejected_call);
+        assert_eq!(checking.errors[2].span, rejected_arguments[0].span);
+        assert_eq!(
+            checking.expressions[&rejected_call.id].type_id,
+            types.types().recovery()
+        );
+    }
+
+    #[test]
+    fn discovers_deduplicated_shadowed_and_transitive_lambda_captures() {
+        let source = concat!(
+            "fn inspect(value: int) {\n",
+            "    mut changing = 1;\n",
+            "    const duplicate = lambda() -> int { value; value };\n",
+            "    const shadowed = lambda(value: int) -> int { value };\n",
+            "    const vmut outer = lambda() {\n",
+            "        const vmut inner = lambda() -> int { changing };\n",
+            "    };\n",
+            "    const boundary = lambda() {\n",
+            "        fn nested() { value; }\n",
+            "    };\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let inspect = function(&program.declarations[0]);
+        let duplicate = binding_initializer(&inspect.body.statements[1]);
+        let shadowed = binding_initializer(&inspect.body.statements[2]);
+        let outer = binding_initializer(&inspect.body.statements[3]);
+        let (_, outer_body) = lambda(outer);
+        let inner = binding_initializer(&outer_body.statements[0]);
+        let boundary = binding_initializer(&inspect.body.statements[4]);
+        assert_eq!(checking.lambda_captures[&duplicate.id].len(), 1);
+        assert!(checking.lambda_captures[&shadowed.id].is_empty());
+        assert_eq!(checking.lambda_captures[&outer.id].len(), 1);
+        assert_eq!(checking.lambda_captures[&inner.id].len(), 1);
+        assert!(checking.lambda_captures[&boundary.id].is_empty());
+        for closure in [outer, inner] {
+            assert!(matches!(
+                types.types().get(checking.expressions[&closure.id].type_id),
+                Some(SemanticType::Callable {
+                    capability: AccessCapability::Mut,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn derives_lambda_capability_from_captured_self_qualifiers() {
+        let source = concat!(
+            "struct Item {\n",
+            "    fn readonly(self) { const closure = lambda() { self; }; }\n",
+            "    fn writable(mut self) { const vmut closure = lambda() { self; }; }\n",
+            "    fn shared(&mut self) { const vmut closure = lambda() { self; }; }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let item = structure(&program.declarations[0]);
+        let methods: Vec<_> = item
+            .members
+            .iter()
+            .filter_map(|member| match member {
+                StructMember::Function(function) => Some(function),
+                StructMember::Field(_) => None,
+            })
+            .collect();
+        for (method, expected) in methods.into_iter().zip([
+            AccessCapability::Const,
+            AccessCapability::Mut,
+            AccessCapability::Mut,
+        ]) {
+            let closure = binding_initializer(&method.body.statements[0]);
+            assert_eq!(checking.lambda_captures[&closure.id].len(), 1);
+            assert_eq!(
+                checking.lambda_captures[&closure.id][0].source,
+                LambdaCaptureSource::SelfValue { method: method.id }
+            );
+            assert!(matches!(
+                types.types().get(checking.expressions[&closure.id].type_id),
+                Some(SemanticType::Callable { capability, .. }) if *capability == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn recovers_lambda_body_errors_without_parent_diagnostics_or_transfers() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const returned = lambda(value: int) -> int { return value; };\n",
+            "    const missing = lambda() -> int {};\n",
+            "    const invalid: fn() -> int = lambda() -> int { true };\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 2);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        let main = function(&program.declarations[0]);
+        let returned = binding_initializer(&main.body.statements[0]);
+        let missing = binding_initializer(&main.body.statements[1]);
+        let invalid = binding_initializer(&main.body.statements[2]);
+        assert_eq!(checking.transfers[&returned.id], ValueTransfer::MoveTemporary);
+        assert_eq!(checking.expressions[&missing.id].type_id, types.types().recovery());
+        assert_eq!(checking.expressions[&invalid.id].type_id, types.types().recovery());
+        assert!(!checking.transfers.contains_key(&missing.id));
+        assert!(!checking.transfers.contains_key(&invalid.id));
     }
 }
