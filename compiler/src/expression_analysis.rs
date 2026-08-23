@@ -1,9 +1,9 @@
 //! Internal foundation for core expression type checking.
 //!
 //! This module intentionally has no public whole-program entry point yet. It
-//! records the expression, binding, call, and callable-result facts needed by
-//! later increments without treating not-yet-implemented expression forms as
-//! source errors.
+//! records expression, binding, call, callable-result, control-flow, and
+//! contextual union facts needed by later increments without treating
+//! not-yet-implemented expression forms as source errors.
 
 // The whole-program entry point remains intentionally private and unconnected
 // until the core-expression phase covers every expression form in its scope.
@@ -13,9 +13,10 @@ use std::collections::HashMap;
 
 use crate::{
     ast::{
-        BinaryOperator, BindingQualifiers, Declaration, Expression, ExpressionKind, Function,
-        FunctionParameterKind, LiteralKind, NodeId, PrimitiveType, Program, ReceiverStorage,
-        Statement, StatementKind, StructMember, UnaryOperator, ValueCapability,
+        BinaryOperator, BindingQualifiers, Block, ConditionalElse, Declaration, Expression,
+        ExpressionKind, Function, FunctionParameterKind, LiteralKind, NodeId, PrimitiveType,
+        Program, ReceiverStorage, Statement, StatementKind, StructMember, UnaryOperator,
+        ValueCapability,
     },
     context_resolution::ContextResolution,
     name_resolution::NameResolution,
@@ -33,6 +34,72 @@ use crate::{
 struct TypedExpression {
     type_id: TypeId,
     category: ValueCategory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpressionOutcome {
+    typed: TypedExpression,
+    explicitly_produces_value: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockOutcome {
+    typed: TypedExpression,
+    explicit_value: Option<NodeId>,
+}
+
+/// Records that an expression of one member type must be materialized as an
+/// explicitly expected union.
+///
+/// For example, `const value: int | float = 10;` injects the `int` expression
+/// into `int | float`. Lowering uses this fact to construct the union with the
+/// `int` tag and `10` as its payload. Each branch in
+/// `if ready { 10 } else { 3.142 }` is injected separately when the conditional
+/// is expected to have type `int | float`.
+///
+/// An expression that already has the expected union type needs no injection;
+/// for example, passing an existing `int | float` binding to an `int | float`
+/// parameter preserves the existing tag and payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnionInjection {
+    member_type: TypeId,
+    union_type: TypeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Describes how the surrounding syntax consumes a conditional expression.
+///
+/// This is separate from the conditional's type because explicit `()` and
+/// semicolon-ended completion both have unit type, but only the former
+/// explicitly generates a branch value and therefore requires a complete
+/// `else` chain.
+enum ConditionalUse {
+    /// The conditional must produce a value for a binding, argument, return,
+    /// operand, or another value position.
+    ///
+    /// For example, `const value = if ready { 1 } else { 2 };` requires the
+    /// final `else` because the initializer consumes the conditional's value.
+    Value,
+    /// The conditional is an expression statement whose result is ignored.
+    ///
+    /// For example, `if ready { notify(); }` may omit `else` because the call
+    /// is semicolon-ended and the conditional does not explicitly produce a
+    /// value. Writing `{ () }` instead would explicitly produce unit and would
+    /// require `else` even though the result is discarded.
+    Discarded,
+    /// The conditional supplies the completion of another conditional branch.
+    ///
+    /// In `if outer { if inner { notify(); } } else { wait(); }`, the inner
+    /// conditional may complete the outer branch implicitly without needing
+    /// its own `else`; the outer chain decides whether branch values are
+    /// required.
+    BranchCompletion,
+    /// The conditional is the syntactic final expression of a callable body.
+    ///
+    /// For example, `fn run() { if ready { notify(); } }` may complete a unit
+    /// callable implicitly. A callable returning `int` cannot use the same
+    /// missing-`else` form because its false path would produce no result.
+    CallableCompletion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,13 +137,17 @@ enum ExpressionCheckingErrorKind {
     },
     NotCallable { found: TypeId },
     ArgumentCountMismatch { expected: usize, found: usize },
+    ConditionalElseRequired,
+    ConditionalBranchValueRequired,
 }
 
 #[derive(Debug, Default)]
 struct ExpressionChecking {
     expressions: HashMap<NodeId, TypedExpression>,
+    explicit_values: HashMap<NodeId, bool>,
     bindings: HashMap<SymbolId, BindingSemantics>,
     transfers: HashMap<NodeId, ValueTransfer>,
+    union_injections: HashMap<NodeId, UnionInjection>,
     errors: Vec<ExpressionCheckingError>,
 }
 
@@ -88,6 +159,24 @@ struct Analyzer<'semantic> {
     types: &'semantic mut TypeResolution,
     method_owners: HashMap<NodeId, TypeId>,
     checking: ExpressionChecking,
+}
+
+#[cfg(test)]
+pub(super) fn assert_program_checks(
+    module: &SourceModule,
+    program: &Program,
+    names: &NameResolution,
+    context: &ContextResolution,
+    signatures: &SignatureCollection,
+    types: &mut TypeResolution,
+) {
+    let checking = Analyzer::new(module, names, context, signatures, types, program)
+        .check_program(program);
+    assert!(
+        checking.errors.is_empty(),
+        "the complex program should pass implemented expression checking: {:#?}",
+        checking.errors
+    );
 }
 
 impl<'semantic> Analyzer<'semantic> {
@@ -209,15 +298,23 @@ impl<'semantic> Analyzer<'semantic> {
     fn visit_callable_body(&mut self, block: &crate::ast::Block, expected: TypeId) {
         // A return or diverging statement prevents execution from reaching the
         // body's final value or implicit unit result.
-        let mut can_reach_body_end = true;
-        for statement in &block.statements {
-            let statement_can_complete = self.visit_statement(statement);
-            can_reach_body_end &= statement_can_complete;
-        }
+        let can_reach_body_end = self.visit_block_statements(block);
         match (&block.value, can_reach_body_end) {
+            (Some(value), true) if matches!(&value.kind, ExpressionKind::If { .. }) => {
+                let outcome = self.check_conditional_expression(
+                    value,
+                    expected,
+                    ConditionalUse::CallableCompletion,
+                );
+                if let Some(outcome) = outcome
+                    && outcome.explicitly_produces_value
+                {
+                    self.record_return_transfer(value, outcome.typed);
+                }
+            }
             (Some(value), true) => self.analyze_return_value(value, expected),
             (Some(value), false) => {
-                let _ = self.synthesize(value);
+                let _ = self.synthesize_discarded(value);
             }
             (None, true) => self.check_absent_value(expected, block.span),
             (None, false) => {}
@@ -241,7 +338,7 @@ impl<'semantic> Analyzer<'semantic> {
                 source.map_or(true, |typed| !self.is_divergence(typed.type_id))
             }
             StatementKind::Expression(expression) => self
-                .synthesize(expression)
+                .synthesize_discarded(expression)
                 .map_or(true, |typed| !self.is_divergence(typed.type_id)),
             StatementKind::Function(function) => {
                 self.visit_function(function);
@@ -269,6 +366,17 @@ impl<'semantic> Analyzer<'semantic> {
             | StatementKind::Break(_)
             | StatementKind::Continue => true,
         }
+    }
+
+    /// Analyzes every statement in source order and reports whether sequential
+    /// execution can reach the block's final expression or closing brace.
+    fn visit_block_statements(&mut self, block: &Block) -> bool {
+        let mut can_reach_block_end = true;
+        for statement in &block.statements {
+            let statement_can_complete = self.visit_statement(statement);
+            can_reach_block_end &= statement_can_complete;
+        }
+        can_reach_block_end
     }
 
     /// Types an ordinary binding initializer and records the resulting binding.
@@ -331,6 +439,10 @@ impl<'semantic> Analyzer<'semantic> {
         let Some(source) = self.check(value, expected) else {
             return;
         };
+        self.record_return_transfer(value, source);
+    }
+
+    fn record_return_transfer(&mut self, value: &Expression, source: TypedExpression) {
         if self.is_recovery(source.type_id) || self.is_divergence(source.type_id) {
             return;
         }
@@ -413,6 +525,429 @@ impl<'semantic> Analyzer<'semantic> {
         });
     }
 
+    /// Analyzes one executable block while preserving the distinction between
+    /// an explicit final value and implicit unit completion.
+    fn analyze_block(
+        &mut self,
+        block: &Block,
+        expected: Option<TypeId>,
+        tail_use: ConditionalUse,
+    ) -> Option<BlockOutcome> {
+        let can_reach_block_end = self.visit_block_statements(block);
+
+        if !can_reach_block_end {
+            if let Some(value) = &block.value {
+                let _ = self.synthesize_discarded(value);
+            }
+            return Some(BlockOutcome {
+                typed: TypedExpression {
+                    type_id: self.types.types().divergence(),
+                    category: ValueCategory::FreshTemporary,
+                },
+                explicit_value: None,
+            });
+        }
+
+        let Some(value) = &block.value else {
+            return Some(BlockOutcome {
+                typed: self.fresh_primitive(PrimitiveType::Unit),
+                explicit_value: None,
+            });
+        };
+        let outcome = if let ExpressionKind::If { .. } = &value.kind {
+            match expected {
+                Some(expected) => {
+                    self.check_conditional_expression(value, expected, tail_use)?
+                }
+                None => self.synthesize_conditional_expression(value, tail_use)?,
+            }
+        } else {
+            let typed = match expected {
+                Some(expected) => self.check(value, expected)?,
+                None => self.synthesize(value)?,
+            };
+            ExpressionOutcome {
+                typed,
+                explicitly_produces_value: self
+                    .checking
+                    .explicit_values
+                    .get(&value.id)
+                    .copied()
+                    .unwrap_or(true),
+            }
+        };
+        Some(BlockOutcome {
+            typed: outcome.typed,
+            explicit_value: outcome
+                .explicitly_produces_value
+                .then_some(value.id),
+        })
+    }
+
+    /// Analyzes an expression whose result is discarded by its containing
+    /// statement, allowing a non-value-producing conditional to omit `else`.
+    fn synthesize_discarded(&mut self, expression: &Expression) -> Option<TypedExpression> {
+        let outcome = match &expression.kind {
+            ExpressionKind::Group(inner) => {
+                let typed = self.synthesize_discarded(inner)?;
+                let explicitly_produces_value = self
+                    .checking
+                    .explicit_values
+                    .get(&inner.id)
+                    .copied()
+                    .unwrap_or(true);
+                ExpressionOutcome {
+                    typed,
+                    explicitly_produces_value,
+                }
+            }
+            ExpressionKind::Block(block) => {
+                let block = self.analyze_block(block, None, ConditionalUse::Discarded)?;
+                ExpressionOutcome {
+                    typed: block.typed,
+                    explicitly_produces_value: block.explicit_value.is_some(),
+                }
+            }
+            ExpressionKind::If { .. } => {
+                self.synthesize_conditional_expression(expression, ConditionalUse::Discarded)?
+            }
+            _ => ExpressionOutcome {
+                typed: self.synthesize(expression)?,
+                explicitly_produces_value: true,
+            },
+        };
+        self.checking
+            .expressions
+            .insert(expression.id, outcome.typed);
+        self.checking
+            .explicit_values
+            .insert(expression.id, outcome.explicitly_produces_value);
+        Some(outcome.typed)
+    }
+
+    fn synthesize_conditional_expression(
+        &mut self,
+        expression: &Expression,
+        usage: ConditionalUse,
+    ) -> Option<ExpressionOutcome> {
+        self.analyze_conditional_expression(expression, None, usage)
+    }
+
+    fn check_conditional_expression(
+        &mut self,
+        expression: &Expression,
+        expected: TypeId,
+        usage: ConditionalUse,
+    ) -> Option<ExpressionOutcome> {
+        self.analyze_conditional_expression(expression, Some(expected), usage)
+    }
+
+    /// Checks a complete `if`/`else if`/`else` chain as one expression.
+    fn analyze_conditional_expression(
+        &mut self,
+        expression: &Expression,
+        expected: Option<TypeId>,
+        usage: ConditionalUse,
+    ) -> Option<ExpressionOutcome> {
+        let first_error = self.checking.errors.len();
+        let mut arms = Vec::new();
+        let final_else = collect_conditional_arms(expression, &mut arms);
+        let bool_type = self
+            .types
+            .types_mut()
+            .primitive(PrimitiveType::Bool, AccessCapability::Const);
+        let unit_type = self
+            .types
+            .types_mut()
+            .primitive(PrimitiveType::Unit, AccessCapability::Const);
+        let mut condition_invalid = false;
+        let mut branches = Vec::with_capacity(
+            arms.len() + if final_else.is_some() { 1 } else { 0 },
+        );
+        let conditional_nodes: Vec<_> = arms.iter().map(|(conditional, _, _)| *conditional).collect();
+        for (_, condition, branch) in arms {
+            let checked_condition = self.check(condition, bool_type)?;
+            condition_invalid |= self.is_recovery(checked_condition.type_id);
+            branches.push((
+                branch,
+                self.analyze_block(branch, expected, ConditionalUse::BranchCompletion)?,
+            ));
+        }
+        if let Some(branch) = final_else {
+            branches.push((
+                branch,
+                self.analyze_block(branch, expected, ConditionalUse::BranchCompletion)?,
+            ));
+        }
+
+        let has_else = final_else.is_some();
+        let branch_invalid = branches
+            .iter()
+            .any(|(_, branch)| self.is_recovery(branch.typed.type_id));
+        let any_explicit = branches.iter().any(|(_, branch)| {
+            !self.is_divergence(branch.typed.type_id) && branch.explicit_value.is_some()
+        });
+        let mut invalid = condition_invalid || branch_invalid;
+        let missing_else_allowed = match usage {
+            ConditionalUse::Discarded | ConditionalUse::BranchCompletion => true,
+            ConditionalUse::CallableCompletion => expected.is_some_and(|expected| {
+                self.is_recovery(expected)
+                    || self
+                        .types
+                        .types()
+                        .has_same_shape(expected, unit_type)
+                        .expect("callable result types belong to the program type store")
+            }),
+            ConditionalUse::Value => false,
+        };
+        if (any_explicit || !missing_else_allowed) && !has_else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ConditionalElseRequired,
+                span: expression.span,
+            });
+            invalid = true;
+        }
+        if any_explicit {
+            for (block, branch) in &branches {
+                if !self.is_divergence(branch.typed.type_id) && branch.explicit_value.is_none() {
+                    self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::ConditionalBranchValueRequired,
+                        span: block.span,
+                    });
+                    invalid = true;
+                }
+            }
+        }
+
+        let normally_completing: Vec<_> = branches
+            .iter()
+            .filter(|(_, branch)| !self.is_divergence(branch.typed.type_id))
+            .copied()
+            .collect();
+        if has_else && normally_completing.is_empty() {
+            let outcome = ExpressionOutcome {
+                typed: TypedExpression {
+                    type_id: if invalid {
+                        self.types.types().recovery()
+                    } else {
+                        self.types.types().divergence()
+                    },
+                    category: ValueCategory::FreshTemporary,
+                },
+                explicitly_produces_value: false,
+            };
+            for conditional in conditional_nodes {
+                self.record_expression_outcome(conditional, outcome);
+            }
+            self.checking.errors[first_error..]
+                .sort_by_key(|error| (error.span.start, error.span.end));
+            return Some(outcome);
+        }
+
+        let mut typed = if any_explicit {
+            let mut values = normally_completing
+                .iter()
+                .filter_map(|(block, branch)| {
+                    branch
+                        .explicit_value
+                        .map(|id| (*block, id, branch.typed))
+                });
+            let (_, _, first) = values
+                .next()
+                .expect("an explicit conditional has a normally completing value path");
+            let result_type = expected.unwrap_or(first.type_id);
+            if expected.is_none() && !self.is_recovery(first.type_id) {
+                for (block, _, value) in values {
+                    if self.is_recovery(value.type_id) {
+                        invalid = true;
+                        continue;
+                    }
+                    let matches = self
+                        .types
+                        .types()
+                        .has_same_shape(value.type_id, result_type)
+                        .expect("conditional result types belong to the program type store");
+                    if !matches {
+                        self.checking.errors.push(ExpressionCheckingError {
+                            kind: ExpressionCheckingErrorKind::TypeMismatch {
+                                expected: result_type,
+                                found: value.type_id,
+                            },
+                            span: block
+                                .value
+                                .as_deref()
+                                .map_or(block.span, |value| value.span),
+                        });
+                        invalid = true;
+                    }
+                }
+            }
+            if invalid {
+                self.recovery_temporary()
+            } else {
+                self.merge_conditional_values(result_type, &normally_completing)
+            }
+        } else {
+            self.fresh_primitive(PrimitiveType::Unit)
+        };
+
+        if !has_else {
+            typed = self.fresh_primitive(PrimitiveType::Unit);
+        }
+        if let Some(expected) = expected
+            && !any_explicit
+            && !invalid
+            && usage != ConditionalUse::BranchCompletion
+        {
+            typed = self.check_typed(expression, expected, typed)?;
+            invalid |= self.is_recovery(typed.type_id);
+        }
+        if invalid {
+            typed = self.recovery_temporary();
+        }
+        let outcome = ExpressionOutcome {
+            typed,
+            explicitly_produces_value: any_explicit,
+        };
+        self.record_conditional_suffix_outcomes(
+            &conditional_nodes,
+            &branches,
+            outcome,
+            invalid,
+            has_else,
+        );
+        self.checking.errors[first_error..]
+            .sort_by_key(|error| (error.span.start, error.span.end));
+        Some(outcome)
+    }
+
+    /// Selects one category for the conditional result and records how each
+    /// explicit branch value reaches that merged result.
+    fn merge_conditional_values(
+        &mut self,
+        result_type: TypeId,
+        branches: &[(&Block, BlockOutcome)],
+    ) -> TypedExpression {
+        let values: Vec<_> = branches
+            .iter()
+            .filter_map(|(_, branch)| branch.explicit_value.map(|id| (id, branch.typed)))
+            .collect();
+        if values.len() == 1 {
+            return values[0].1;
+        }
+        let semantic = self
+            .types
+            .types()
+            .get(result_type)
+            .expect("conditional result type belongs to the program type store");
+        let (category, transfers): (ValueCategory, Vec<_>) =
+            if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+                (
+                    ValueCategory::GarbageCollectedReference,
+                    values
+                        .iter()
+                        .map(|(id, _)| (*id, ValueTransfer::ReuseGarbageCollected))
+                        .collect(),
+                )
+            } else if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
+                (
+                    ValueCategory::FreshTemporary,
+                    values
+                        .iter()
+                        .map(|(id, _)| (*id, ValueTransfer::TrivialCopy))
+                        .collect(),
+                )
+            } else {
+                let all_fresh = values
+                    .iter()
+                    .all(|(_, value)| value.category == ValueCategory::FreshTemporary);
+                let category = if all_fresh {
+                    ValueCategory::FreshTemporary
+                } else {
+                    ValueCategory::BorrowedPlace
+                };
+                let transfers = values
+                    .iter()
+                    .map(|(id, value)| {
+                        let transfer = if value.category == ValueCategory::FreshTemporary {
+                            ValueTransfer::MoveTemporary
+                        } else {
+                            ValueTransfer::Borrow
+                        };
+                        (*id, transfer)
+                    })
+                    .collect();
+                (category, transfers)
+            };
+        for (id, transfer) in transfers {
+            self.checking.transfers.insert(id, transfer);
+        }
+        TypedExpression {
+            type_id: result_type,
+            category,
+        }
+    }
+
+    /// Records each `else if` node from the result paths belonging to that
+    /// suffix rather than copying the outer conditional's category blindly.
+    fn record_conditional_suffix_outcomes(
+        &mut self,
+        conditionals: &[&Expression],
+        branches: &[(&Block, BlockOutcome)],
+        outer: ExpressionOutcome,
+        invalid: bool,
+        has_else: bool,
+    ) {
+        for (index, conditional) in conditionals.iter().enumerate() {
+            if invalid {
+                self.record_expression_outcome(conditional, outer);
+                continue;
+            }
+            let normally_completing: Vec<_> = branches[index..]
+                .iter()
+                .filter(|(_, branch)| !self.is_divergence(branch.typed.type_id))
+                .copied()
+                .collect();
+            let outcome = if normally_completing.is_empty() && has_else {
+                ExpressionOutcome {
+                    typed: TypedExpression {
+                        type_id: self.types.types().divergence(),
+                        category: ValueCategory::FreshTemporary,
+                    },
+                    explicitly_produces_value: false,
+                }
+            } else if normally_completing
+                .iter()
+                .any(|(_, branch)| branch.explicit_value.is_some())
+            {
+                ExpressionOutcome {
+                    typed: self.merge_conditional_values(
+                        outer.typed.type_id,
+                        &normally_completing,
+                    ),
+                    explicitly_produces_value: true,
+                }
+            } else {
+                ExpressionOutcome {
+                    typed: self.fresh_primitive(PrimitiveType::Unit),
+                    explicitly_produces_value: false,
+                }
+            };
+            self.record_expression_outcome(conditional, outcome);
+        }
+    }
+
+    fn record_expression_outcome(
+        &mut self,
+        expression: &Expression,
+        outcome: ExpressionOutcome,
+    ) {
+        self.checking.expressions.insert(expression.id, outcome.typed);
+        self.checking
+            .explicit_values
+            .insert(expression.id, outcome.explicitly_produces_value);
+    }
+
     fn synthesize(&mut self, expression: &Expression) -> Option<TypedExpression> {
         if let Some(typed) = self.checking.expressions.get(&expression.id).copied() {
             return Some(typed);
@@ -422,7 +957,29 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::Literal(literal) => self.synthesize_literal(expression, *literal),
             ExpressionKind::Identifier => self.synthesize_identifier(expression)?,
             ExpressionKind::SelfValue => self.synthesize_self(expression),
-            ExpressionKind::Group(inner) => self.synthesize(inner)?,
+            ExpressionKind::Group(inner) => {
+                let typed = self.synthesize(inner)?;
+                let explicitly_produces_value = self
+                    .checking
+                    .explicit_values
+                    .get(&inner.id)
+                    .copied()
+                    .unwrap_or(true);
+                self.checking
+                    .explicit_values
+                    .insert(expression.id, explicitly_produces_value);
+                typed
+            }
+            ExpressionKind::Block(block) => {
+                let outcome = self.analyze_block(block, None, ConditionalUse::Value)?;
+                self.checking
+                    .explicit_values
+                    .insert(expression.id, outcome.explicit_value.is_some());
+                outcome.typed
+            }
+            ExpressionKind::If { .. } => self
+                .synthesize_conditional_expression(expression, ConditionalUse::Value)?
+                .typed,
             ExpressionKind::PrimitiveConversion { target, value } => {
                 self.synthesize_primitive_conversion(*target, value)?
             }
@@ -443,15 +1000,49 @@ impl<'semantic> Analyzer<'semantic> {
             _ => return None,
         };
         self.checking.expressions.insert(expression.id, typed);
+        self.checking.explicit_values.entry(expression.id).or_insert(true);
         Some(typed)
     }
 
     fn check(&mut self, expression: &Expression, expected: TypeId) -> Option<TypedExpression> {
+        if let ExpressionKind::Block(block) = &expression.kind
+            && !self.checking.expressions.contains_key(&expression.id)
+        {
+            let outcome = self.analyze_block(block, Some(expected), ConditionalUse::Value)?;
+            let typed = if outcome.explicit_value.is_none()
+                && !self.is_divergence(outcome.typed.type_id)
+            {
+                self.check_typed(expression, expected, outcome.typed)?
+            } else {
+                outcome.typed
+            };
+            self.checking.expressions.insert(expression.id, typed);
+            self.checking
+                .explicit_values
+                .insert(expression.id, outcome.explicit_value.is_some());
+            return Some(typed);
+        }
+        if matches!(&expression.kind, ExpressionKind::If { .. })
+            && !self.checking.expressions.contains_key(&expression.id)
+        {
+            return self
+                .check_conditional_expression(expression, expected, ConditionalUse::Value)
+                .map(|outcome| outcome.typed);
+        }
         if let ExpressionKind::Group(inner) = &expression.kind
             && !self.checking.expressions.contains_key(&expression.id)
         {
             let typed = self.check(inner, expected)?;
             self.checking.expressions.insert(expression.id, typed);
+            let explicitly_produces_value = self
+                .checking
+                .explicit_values
+                .get(&inner.id)
+                .copied()
+                .unwrap_or(true);
+            self.checking
+                .explicit_values
+                .insert(expression.id, explicitly_produces_value);
             return Some(typed);
         }
 
@@ -478,6 +1069,42 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("checked types must belong to the program type store")
         {
             return Some(found);
+        }
+        let union_member = match self.types.types().get(expected) {
+            Some(SemanticType::Union { members, .. }) => members.iter().copied().find(|member| {
+                self.types
+                    .types()
+                    .has_same_shape(found.type_id, *member)
+                    .expect("union members belong to the program type store")
+            }),
+            _ => None,
+        };
+        if let Some(member_type) = union_member {
+            self.checking.union_injections.insert(
+                expression.id,
+                UnionInjection {
+                    member_type,
+                    union_type: expected,
+                },
+            );
+            let borrowed_erased_view = found.category == ValueCategory::BorrowedPlace
+                && self
+                    .types
+                    .types()
+                    .get(found.type_id)
+                    .is_some_and(|semantic| {
+                        semantic.copy_semantics() == Some(CopySemantics::NonEscapingErasedView)
+                    });
+            let injected = TypedExpression {
+                type_id: expected,
+                category: if borrowed_erased_view {
+                    ValueCategory::BorrowedPlace
+                } else {
+                    ValueCategory::FreshTemporary
+                },
+            };
+            self.checking.expressions.insert(expression.id, injected);
+            return Some(injected);
         }
 
         self.checking.errors.push(ExpressionCheckingError {
@@ -979,6 +1606,32 @@ impl<'semantic> Analyzer<'semantic> {
     }
 }
 
+fn collect_conditional_arms<'expression>(
+    expression: &'expression Expression,
+    arms: &mut Vec<(
+        &'expression Expression,
+        &'expression Expression,
+        &'expression Block,
+    )>,
+) -> Option<&'expression Block> {
+    let ExpressionKind::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = &expression.kind
+    else {
+        unreachable!("conditional chains contain only if expressions")
+    };
+    arms.push((expression, condition, then_branch));
+    match else_branch {
+        Some(ConditionalElse::Block(block)) => Some(block),
+        Some(ConditionalElse::If(conditional)) => {
+            collect_conditional_arms(conditional, arms)
+        }
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,6 +1703,25 @@ mod tests {
         expression
     }
 
+    fn binding_initializer(statement: &Statement) -> &Expression {
+        let StatementKind::Binding { initializer, .. } = &statement.kind else {
+            panic!("expected binding statement")
+        };
+        initializer
+    }
+
+    fn conditional_branches(expression: &Expression) -> (&Block, &Block) {
+        let ExpressionKind::If {
+            then_branch,
+            else_branch: Some(ConditionalElse::Block(else_branch)),
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected conditional with a final else block")
+        };
+        (then_branch, else_branch)
+    }
+
     fn call(expression: &Expression) -> (&Expression, &[Expression]) {
         let ExpressionKind::Call { callee, arguments } = &expression.kind else {
             panic!("expected call expression")
@@ -1109,6 +1781,378 @@ mod tests {
                 capability: found_capability,
             }) if *found_primitive == primitive && *found_capability == capability
         ));
+    }
+
+    #[test]
+    fn checks_block_values_and_preserves_explicit_value_information() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn inspect(item: Item) {\n",
+            "    const borrowed = { item };\n",
+            "    const explicit_unit = { () };\n",
+            "    const implicit_unit = { (); };\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let inspect = function(&program.declarations[1]);
+        let borrowed = binding_initializer(&inspect.body.statements[0]);
+        let explicit_unit = binding_initializer(&inspect.body.statements[1]);
+        let implicit_unit = binding_initializer(&inspect.body.statements[2]);
+        assert_eq!(checking.expressions[&borrowed.id].category, ValueCategory::BorrowedPlace);
+        assert_eq!(checking.transfers[&borrowed.id], ValueTransfer::Borrow);
+        assert_eq!(checking.explicit_values[&borrowed.id], true);
+        assert_eq!(checking.explicit_values[&explicit_unit.id], true);
+        assert_eq!(checking.explicit_values[&implicit_unit.id], false);
+        assert_primitive_expression(
+            &types,
+            &checking,
+            explicit_unit,
+            PrimitiveType::Unit,
+            AccessCapability::Const,
+        );
+        assert_primitive_expression(
+            &types,
+            &checking,
+            implicit_unit,
+            PrimitiveType::Unit,
+            AccessCapability::Const,
+        );
+    }
+
+    #[test]
+    fn checks_implicit_block_unit_against_its_expected_type() {
+        let source = concat!(
+            "fn wrong() -> int {\n",
+            "    { (); }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 1);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        let value = body_value(function(&program.declarations[0]));
+        assert_eq!(checking.errors[0].span, value.span);
+        assert_eq!(checking.expressions[&value.id].type_id, types.types().recovery());
+    }
+
+    #[test]
+    fn distinguishes_statement_and_value_conditionals() {
+        let source = concat!(
+            "fn action() {}\n",
+            "fn run(condition: bool) {\n",
+            "    if condition { action(); }\n",
+            "    const implicit = if condition { action(); } else { action(); };\n",
+            "    const explicit = if condition { () } else { () };\n",
+            "    const nested = if condition { if condition { action(); } } else { action(); };\n",
+            "}\n",
+            "fn final_statement(condition: bool) {\n",
+            "    if condition { action(); }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let run = function(&program.declarations[1]);
+        let statement = expression(&run.body.statements[0]);
+        let implicit = binding_initializer(&run.body.statements[1]);
+        let explicit = binding_initializer(&run.body.statements[2]);
+        let nested = binding_initializer(&run.body.statements[3]);
+        assert_eq!(checking.explicit_values[&statement.id], false);
+        assert_eq!(checking.explicit_values[&implicit.id], false);
+        assert_eq!(checking.explicit_values[&explicit.id], true);
+        assert_eq!(checking.explicit_values[&nested.id], false);
+        let final_statement = body_value(function(&program.declarations[2]));
+        assert_eq!(checking.explicit_values[&final_statement.id], false);
+        assert_primitive_expression(
+            &types,
+            &checking,
+            final_statement,
+            PrimitiveType::Unit,
+            AccessCapability::Const,
+        );
+    }
+
+    #[test]
+    fn diagnoses_non_exhaustive_and_mixed_value_conditionals() {
+        let source = concat!(
+            "fn action() {}\n",
+            "fn consume(value: ()) {}\n",
+            "fn inspect(condition: bool) {\n",
+            "    const missing = if condition { action(); };\n",
+            "    if condition { () };\n",
+            "    if condition { () } else { action(); };\n",
+            "    consume(if condition { action(); });\n",
+            "}\n",
+            "fn missing_result(condition: bool) -> int {\n",
+            "    if condition { return 1; }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let expected = [
+            ExpressionCheckingErrorKind::ConditionalElseRequired,
+            ExpressionCheckingErrorKind::ConditionalElseRequired,
+            ExpressionCheckingErrorKind::ConditionalBranchValueRequired,
+            ExpressionCheckingErrorKind::ConditionalElseRequired,
+            ExpressionCheckingErrorKind::ConditionalElseRequired,
+        ];
+        assert_eq!(checking.errors.len(), expected.len());
+        for (error, expected) in checking.errors.iter().zip(expected) {
+            assert_eq!(error.kind, expected);
+        }
+    }
+
+    #[test]
+    fn checks_expected_union_conditionals_without_inferring_unions() {
+        let source = concat!(
+            "fn choose(condition: bool) {\n",
+            "    const exact: int | float = if condition { 10 } else { 3.142 };\n",
+            "    const inferred = if condition { 10 } else { 3.142 };\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let choose = function(&program.declarations[0]);
+        let exact = binding_initializer(&choose.body.statements[0]);
+        let (then_branch, else_branch) = conditional_branches(exact);
+        let then_value = then_branch.value.as_deref().expect("then value should exist");
+        let else_value = else_branch.value.as_deref().expect("else value should exist");
+        assert_eq!(checking.union_injections.len(), 2);
+        assert_eq!(
+            checking.union_injections[&then_value.id].union_type,
+            checking.expressions[&exact.id].type_id
+        );
+        assert_eq!(
+            checking.union_injections[&else_value.id].union_type,
+            checking.expressions[&exact.id].type_id
+        );
+        assert_ne!(
+            checking.union_injections[&then_value.id].member_type,
+            checking.union_injections[&else_value.id].member_type
+        );
+        assert_eq!(checking.errors.len(), 1);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        let inferred = binding_initializer(&choose.body.statements[1]);
+        let (_, inferred_else) = conditional_branches(inferred);
+        assert_eq!(
+            checking.errors[0].span,
+            inferred_else
+                .value
+                .as_deref()
+                .expect("else value should exist")
+                .span
+        );
+        assert_eq!(checking.expressions[&inferred.id].type_id, types.types().recovery());
+    }
+
+    #[test]
+    fn injects_exact_union_members_without_reinjecting_union_values() {
+        let source = concat!(
+            "fn consume(value: int | float) {}\n",
+            "fn main() {\n",
+            "    const value: int | float = 1;\n",
+            "    consume(value);\n",
+            "    const invalid: int | float = true;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        let main = function(&program.declarations[1]);
+        let injected = binding_initializer(&main.body.statements[0]);
+        let called = expression(&main.body.statements[1]);
+        let (_, arguments) = call(called);
+        let invalid = binding_initializer(&main.body.statements[2]);
+        assert_eq!(checking.union_injections.len(), 1);
+        assert!(checking.union_injections.contains_key(&injected.id));
+        assert!(!checking.union_injections.contains_key(&arguments[0].id));
+        assert_eq!(checking.errors.len(), 1);
+        assert_eq!(checking.errors[0].span, invalid.span);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn merges_conditional_categories_and_records_path_transfers() {
+        let source = concat!(
+            "fn inspect(condition: bool) {\n",
+            "    const original = \"original\";\n",
+            "    const mixed = if condition { original } else { \"fresh\" };\n",
+            "    const fresh = if condition { \"left\" } else { \"right\" };\n",
+            "    const left = &\"left\";\n",
+            "    const right = &\"right\";\n",
+            "    const shared = if condition { left } else { right };\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let inspect = function(&program.declarations[0]);
+        let mixed = binding_initializer(&inspect.body.statements[1]);
+        let fresh = binding_initializer(&inspect.body.statements[2]);
+        let shared = binding_initializer(&inspect.body.statements[5]);
+        assert_eq!(checking.expressions[&mixed.id].category, ValueCategory::BorrowedPlace);
+        assert_eq!(checking.expressions[&fresh.id].category, ValueCategory::FreshTemporary);
+        assert_eq!(
+            checking.expressions[&shared.id].category,
+            ValueCategory::GarbageCollectedReference
+        );
+        let (mixed_then, mixed_else) = conditional_branches(mixed);
+        let mixed_values = [
+            mixed_then.value.as_deref().expect("then value should exist"),
+            mixed_else.value.as_deref().expect("else value should exist"),
+        ];
+        assert_eq!(checking.transfers[&mixed_values[0].id], ValueTransfer::Borrow);
+        assert_eq!(checking.transfers[&mixed_values[1].id], ValueTransfer::MoveTemporary);
+        let (shared_then, shared_else) = conditional_branches(shared);
+        let shared_values = [
+            shared_then.value.as_deref().expect("then value should exist"),
+            shared_else.value.as_deref().expect("else value should exist"),
+        ];
+        assert_eq!(shared_values.len(), 2);
+        for value in shared_values {
+            assert_eq!(
+                checking.transfers[&value.id],
+                ValueTransfer::ReuseGarbageCollected
+            );
+        }
+    }
+
+    #[test]
+    fn propagates_conditional_divergence_through_else_if_chains() {
+        let source = concat!(
+            "fn choose(first: bool, second: bool) -> int {\n",
+            "    if first { 1 } else if second { return 2; } else { 3 }\n",
+            "}\n",
+            "fn finish(condition: bool) -> int {\n",
+            "    if condition { return 1; } else { panic(\"stop\"); }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let choose = body_value(function(&program.declarations[0]));
+        let ExpressionKind::If {
+            else_branch: Some(ConditionalElse::If(nested)),
+            ..
+        } = &choose.kind
+        else {
+            panic!("expected else-if chain")
+        };
+        assert_eq!(checking.explicit_values[&choose.id], true);
+        assert_eq!(checking.expressions[&nested.id], checking.expressions[&choose.id]);
+        assert_eq!(checking.transfers[&choose.id], ValueTransfer::TrivialCopy);
+        let finish = body_value(function(&program.declarations[1]));
+        assert_eq!(
+            checking.expressions[&finish.id].type_id,
+            types.types().divergence()
+        );
+        assert!(!checking.transfers.contains_key(&finish.id));
+    }
+
+    #[test]
+    fn recovers_from_invalid_conditions_without_parent_diagnostics() {
+        let source = concat!(
+            "fn action() {}\n",
+            "fn inspect() {\n",
+            "    const invalid = 1 + if 1 { 2 } else { 3 };\n",
+            "    if 9223372036854775808 { action(); }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 2);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::IntegerLiteralOutOfRange
+        );
+        let inspect = function(&program.declarations[1]);
+        let invalid = binding_initializer(&inspect.body.statements[0]);
+        assert_eq!(checking.expressions[&invalid.id].type_id, types.types().recovery());
     }
 
     #[test]

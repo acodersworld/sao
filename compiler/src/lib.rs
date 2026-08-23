@@ -15,10 +15,13 @@ pub mod type_resolution;
 mod tests {
     use crate::{
         context_resolution::resolve_program_context,
+        expression_analysis::assert_program_checks,
         lexer::Lexer,
         name_resolution::resolve_program,
         parser::{ParseContext, parse_program},
+        signature_collection::collect_signatures,
         source::SourceModuleRegistry,
+        type_resolution::resolve_types,
     };
 
     static COMPLEX_PROGRAM: &str = r#"
@@ -118,6 +121,12 @@ fn main() -> Summary {
     const integer = int(1.5);
     const decimal = float(integer);
     const truth: bool = decimal != 0.0;
+    const numeric: int | float = if truth {
+        integer
+    } else {
+        decimal
+    };
+    const grouped_initial = { initial };
     const character = char(65);
     const text = string(character);
     const middle = text[0..1];
@@ -134,6 +143,7 @@ fn main() -> Summary {
 
     defer cleanup(summary);
     co worker(initial);
+    announce(grouped_initial);
     announce(indexed);
     formatter.format(middle);
     heap_formatter.format(text);
@@ -195,9 +205,28 @@ fn main() -> Summary {
         let program = parse_program(&mut parse_context, Lexer::new(&module))
             .expect("the complex program should lex and parse");
 
-        resolve_program(&module, &program)
+        let names = resolve_program(&module, &program)
             .expect("every value and type name in the complex program should resolve");
-        resolve_program_context(&program)
+        let context = resolve_program_context(&program)
             .expect("every callable and control-flow context should be valid");
+        let mut types = resolve_types(&module, &program, &names)
+            .expect("every source type in the complex program should resolve");
+        let signatures = collect_signatures(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+        )
+        .expect("every declaration signature in the complex program should collect");
+
+        assert_program_checks(
+            &module,
+            &program,
+            &names,
+            &context,
+            &signatures,
+            &mut types,
+        );
     }
 }
