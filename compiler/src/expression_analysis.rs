@@ -13,10 +13,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
-        AnonymousStructMember, BinaryOperator, BindingMutability, BindingQualifiers, Block,
-        ConditionalElse, Declaration, Expression, ExpressionKind, Function, FunctionParameter,
-        FunctionParameterKind, LiteralKind, NodeId, PrimitiveType, Program, ReceiverStorage,
-        Statement, StatementKind, StructMember, UnaryOperator, ValueCapability,
+        AnonymousStructMember, AssignmentOperator, BinaryOperator, BindingMutability,
+        BindingQualifiers, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
+        Function, FunctionParameter, FunctionParameterKind, LiteralKind, NodeId, PrimitiveType,
+        Program, ReceiverStorage, Statement, StatementKind, StructMember, UnaryOperator,
+        ValueCapability,
     },
     context_resolution::ContextResolution,
     name_resolution::NameResolution,
@@ -109,6 +110,20 @@ struct BindingSemantics {
     category: ValueCategory,
 }
 
+/// The assignable root denoted by an identifier or `self` expression.
+///
+/// A plain object root is semantically a reference to frame-owned or borrowed
+/// storage. Its binding mutability controls whether that reference can be
+/// redirected, while the value capability controls mutation through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootPlace {
+    symbol: Option<SymbolId>,
+    type_id: TypeId,
+    category: ValueCategory,
+    binding_mutability: Option<BindingMutability>,
+    value_capability: ValueCapability,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LambdaCaptureSource {
     Symbol(SymbolId),
@@ -156,6 +171,13 @@ enum ExpressionCheckingErrorKind {
     ArgumentCountMismatch { expected: usize, found: usize },
     ConditionalElseRequired,
     ConditionalBranchValueRequired,
+    InvalidAssignmentTarget,
+    ImmutableBinding,
+    ImmutableValue,
+    InvalidAssignmentOperand {
+        operator: AssignmentOperator,
+        found: TypeId,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -166,6 +188,11 @@ struct ExpressionChecking {
     transfers: HashMap<NodeId, ValueTransfer>,
     union_injections: HashMap<NodeId, UnionInjection>,
     lambda_captures: HashMap<NodeId, Vec<LambdaCapture>>,
+    root_places: HashMap<NodeId, RootPlace>,
+    /// Bindings written by assignment. For object-like locals, lowering uses
+    /// this to decide when the source-level reference needs indirection in
+    /// addition to any frame-owned backing storage.
+    reassigned_bindings: HashSet<SymbolId>,
     errors: Vec<ExpressionCheckingError>,
 }
 
@@ -394,6 +421,9 @@ struct Analyzer<'semantic> {
     callable_parents: HashMap<NodeId, Option<NodeId>>,
     symbol_owners: HashMap<SymbolId, NodeId>,
     receiver_qualifiers: HashMap<NodeId, BindingQualifiers>,
+    /// Flow-sensitive provenance of the storage currently denoted by each
+    /// binding. Declared type and qualifiers remain in `checking.bindings`.
+    current_binding_categories: HashMap<SymbolId, ValueCategory>,
     checking: ExpressionChecking,
 }
 
@@ -459,6 +489,7 @@ impl<'semantic> Analyzer<'semantic> {
             callable_parents,
             symbol_owners,
             receiver_qualifiers,
+            current_binding_categories: HashMap::new(),
             checking: ExpressionChecking::default(),
         }
     }
@@ -485,6 +516,7 @@ impl<'semantic> Analyzer<'semantic> {
     }
 
     fn visit_function(&mut self, function: &Function) {
+        let enclosing_categories = self.current_binding_categories.clone();
         self.seed_callable_parameters(function.id, &function.parameters);
         let return_type = self
             .signatures
@@ -492,6 +524,7 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("function signature must have been collected")
             .return_type;
         self.visit_callable_body(&function.body, return_type);
+        self.current_binding_categories = enclosing_categories;
     }
 
     /// Makes a named function's or lambda's parameters available while checking
@@ -531,6 +564,7 @@ impl<'semantic> Analyzer<'semantic> {
                     category,
                 },
             );
+            self.current_binding_categories.insert(symbol, category);
         }
         assert!(
             semantic_parameters.next().is_none(),
@@ -550,10 +584,11 @@ impl<'semantic> Analyzer<'semantic> {
         let can_reach_body_end = self.visit_block_statements(block);
         match (&block.value, can_reach_body_end) {
             (Some(value), true) if matches!(&value.kind, ExpressionKind::If { .. }) => {
-                let outcome = self.check_conditional_expression(
+                let outcome = self.analyze_conditional_expression(
                     value,
-                    expected,
+                    Some(expected),
                     ConditionalUse::CallableCompletion,
+                    true,
                 );
                 if let Some(outcome) = outcome
                     && outcome.explicitly_produces_value
@@ -665,7 +700,7 @@ impl<'semantic> Analyzer<'semantic> {
         };
         if expected.is_none()
             && !self.is_recovery(source.type_id)
-            && !self.callable_capability_is_compatible(source.type_id, stored_type)
+            && !self.value_capability_is_compatible(source, stored_type, false)
         {
             self.checking.errors.push(ExpressionCheckingError {
                 kind: ExpressionCheckingErrorKind::TypeMismatch {
@@ -697,13 +732,14 @@ impl<'semantic> Analyzer<'semantic> {
                 category,
             },
         );
+        self.current_binding_categories.insert(symbol, category);
         Some(source)
     }
 
     /// Checks a returned expression and records how its value enters the
     /// caller-owned result location.
     fn analyze_return_value(&mut self, value: &Expression, expected: TypeId) {
-        let Some(source) = self.check(value, expected) else {
+        let Some(source) = self.check_with_capability(value, expected, true) else {
             return;
         };
         self.record_return_transfer(value, source);
@@ -799,6 +835,7 @@ impl<'semantic> Analyzer<'semantic> {
         block: &Block,
         expected: Option<TypeId>,
         tail_use: ConditionalUse,
+        allow_recursive_copy: bool,
     ) -> Option<BlockOutcome> {
         let can_reach_block_end = self.visit_block_statements(block);
 
@@ -823,14 +860,19 @@ impl<'semantic> Analyzer<'semantic> {
         };
         let outcome = if let ExpressionKind::If { .. } = &value.kind {
             match expected {
-                Some(expected) => {
-                    self.check_conditional_expression(value, expected, tail_use)?
-                }
+                Some(expected) => self.analyze_conditional_expression(
+                    value,
+                    Some(expected),
+                    tail_use,
+                    allow_recursive_copy,
+                )?,
                 None => self.synthesize_conditional_expression(value, tail_use)?,
             }
         } else {
             let typed = match expected {
-                Some(expected) => self.check(value, expected)?,
+                Some(expected) => {
+                    self.check_with_capability(value, expected, allow_recursive_copy)?
+                }
                 None => self.synthesize(value)?,
             };
             ExpressionOutcome {
@@ -869,7 +911,7 @@ impl<'semantic> Analyzer<'semantic> {
                 }
             }
             ExpressionKind::Block(block) => {
-                let block = self.analyze_block(block, None, ConditionalUse::Discarded)?;
+                let block = self.analyze_block(block, None, ConditionalUse::Discarded, false)?;
                 ExpressionOutcome {
                     typed: block.typed,
                     explicitly_produces_value: block.explicit_value.is_some(),
@@ -897,7 +939,7 @@ impl<'semantic> Analyzer<'semantic> {
         expression: &Expression,
         usage: ConditionalUse,
     ) -> Option<ExpressionOutcome> {
-        self.analyze_conditional_expression(expression, None, usage)
+        self.analyze_conditional_expression(expression, None, usage, false)
     }
 
     fn check_conditional_expression(
@@ -906,7 +948,7 @@ impl<'semantic> Analyzer<'semantic> {
         expected: TypeId,
         usage: ConditionalUse,
     ) -> Option<ExpressionOutcome> {
-        self.analyze_conditional_expression(expression, Some(expected), usage)
+        self.analyze_conditional_expression(expression, Some(expected), usage, false)
     }
 
     /// Checks a complete `if`/`else if`/`else` chain as one expression.
@@ -915,6 +957,7 @@ impl<'semantic> Analyzer<'semantic> {
         expression: &Expression,
         expected: Option<TypeId>,
         usage: ConditionalUse,
+        allow_recursive_copy: bool,
     ) -> Option<ExpressionOutcome> {
         let first_error = self.checking.errors.len();
         let mut arms = Vec::new();
@@ -928,26 +971,60 @@ impl<'semantic> Analyzer<'semantic> {
             .types_mut()
             .primitive(PrimitiveType::Unit, AccessCapability::Const);
         let mut condition_invalid = false;
+        let incoming_categories = self.current_binding_categories.clone();
+        let mut fallthrough_categories = incoming_categories.clone();
         let mut branches = Vec::with_capacity(
+            arms.len() + if final_else.is_some() { 1 } else { 0 },
+        );
+        let mut branch_categories = Vec::with_capacity(
             arms.len() + if final_else.is_some() { 1 } else { 0 },
         );
         let conditional_nodes: Vec<_> = arms.iter().map(|(conditional, _, _)| *conditional).collect();
         for (_, condition, branch) in arms {
+            self.current_binding_categories = fallthrough_categories;
             let checked_condition = self.check(condition, bool_type)?;
             condition_invalid |= self.is_recovery(checked_condition.type_id);
+            fallthrough_categories = self.current_binding_categories.clone();
+            self.current_binding_categories = fallthrough_categories.clone();
             branches.push((
                 branch,
-                self.analyze_block(branch, expected, ConditionalUse::BranchCompletion)?,
+                self.analyze_block(
+                    branch,
+                    expected,
+                    ConditionalUse::BranchCompletion,
+                    allow_recursive_copy,
+                )?,
             ));
+            branch_categories.push(self.current_binding_categories.clone());
         }
         if let Some(branch) = final_else {
+            self.current_binding_categories = fallthrough_categories.clone();
             branches.push((
                 branch,
-                self.analyze_block(branch, expected, ConditionalUse::BranchCompletion)?,
+                self.analyze_block(
+                    branch,
+                    expected,
+                    ConditionalUse::BranchCompletion,
+                    allow_recursive_copy,
+                )?,
             ));
+            branch_categories.push(self.current_binding_categories.clone());
         }
 
         let has_else = final_else.is_some();
+        let mut completing_categories: Vec<_> = branches
+            .iter()
+            .zip(&branch_categories)
+            .filter(|((_, outcome), _)| !self.is_divergence(outcome.typed.type_id))
+            .map(|(_, categories)| categories)
+            .collect();
+        if !has_else {
+            completing_categories.push(&fallthrough_categories);
+        }
+        self.current_binding_categories = self.merge_binding_categories(
+            &incoming_categories,
+            &completing_categories,
+        );
         let branch_invalid = branches
             .iter()
             .any(|(_, branch)| self.is_recovery(branch.typed.type_id));
@@ -1066,7 +1143,7 @@ impl<'semantic> Analyzer<'semantic> {
             && !invalid
             && usage != ConditionalUse::BranchCompletion
         {
-            typed = self.check_typed(expression, expected, typed)?;
+            typed = self.check_typed(expression, expected, typed, allow_recursive_copy)?;
             invalid |= self.is_recovery(typed.type_id);
         }
         if invalid {
@@ -1155,6 +1232,41 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
+    /// Merges the provenance of bindings that existed before a conditional.
+    /// Branch-local declarations do not escape their block, and a possible
+    /// borrow wins over frame-owned provenance on mixed paths.
+    fn merge_binding_categories(
+        &self,
+        incoming: &HashMap<SymbolId, ValueCategory>,
+        completing: &[&HashMap<SymbolId, ValueCategory>],
+    ) -> HashMap<SymbolId, ValueCategory> {
+        if completing.is_empty() {
+            return incoming.clone();
+        }
+        incoming
+            .iter()
+            .map(|(symbol, incoming_category)| {
+                let mut merged = *incoming_category;
+                for categories in completing {
+                    let category = categories.get(symbol).copied().unwrap_or(*incoming_category);
+                    if merged != category {
+                        merged = match (merged, category) {
+                            (ValueCategory::GarbageCollectedReference, _)
+                            | (_, ValueCategory::GarbageCollectedReference) => {
+                                ValueCategory::GarbageCollectedReference
+                            }
+                            (ValueCategory::OwnedInlinePlace, ValueCategory::OwnedInlinePlace) => {
+                                ValueCategory::OwnedInlinePlace
+                            }
+                            _ => ValueCategory::BorrowedPlace,
+                        };
+                    }
+                }
+                (*symbol, merged)
+            })
+            .collect()
+    }
+
     /// Records each `else if` node from the result paths belonging to that
     /// suffix rather than copying the outer conditional's category blindly.
     fn record_conditional_suffix_outcomes(
@@ -1238,7 +1350,7 @@ impl<'semantic> Analyzer<'semantic> {
                 typed
             }
             ExpressionKind::Block(block) => {
-                let outcome = self.analyze_block(block, None, ConditionalUse::Value)?;
+                let outcome = self.analyze_block(block, None, ConditionalUse::Value, false)?;
                 self.checking
                     .explicit_values
                     .insert(expression.id, outcome.explicit_value.is_some());
@@ -1266,6 +1378,13 @@ impl<'semantic> Analyzer<'semantic> {
             } => self.synthesize_binary(left, *operator, right)?,
             ExpressionKind::Call { callee, arguments } => {
                 self.synthesize_call(expression, callee, arguments)?
+            }
+            ExpressionKind::Assignment {
+                target,
+                operator,
+                value,
+            } if matches!(&target.kind, ExpressionKind::Identifier) => {
+                self.synthesize_root_assignment(target, *operator, value)?
             }
             _ => return None,
         };
@@ -1297,8 +1416,10 @@ impl<'semantic> Analyzer<'semantic> {
         self.checking.lambda_captures.insert(expression.id, captures);
 
         let first_body_error = self.checking.errors.len();
+        let enclosing_categories = self.current_binding_categories.clone();
         self.seed_callable_parameters(expression.id, parameters);
         self.visit_callable_body(body, signature.return_type);
+        self.current_binding_categories = enclosing_categories;
         if self.checking.errors.len() != first_body_error {
             return Some(self.recovery_temporary());
         }
@@ -1553,14 +1674,33 @@ impl<'semantic> Analyzer<'semantic> {
     }
 
     fn check(&mut self, expression: &Expression, expected: TypeId) -> Option<TypedExpression> {
+        self.check_with_capability(expression, expected, false)
+    }
+
+    fn check_with_capability(
+        &mut self,
+        expression: &Expression,
+        expected: TypeId,
+        allow_recursive_copy: bool,
+    ) -> Option<TypedExpression> {
         if let ExpressionKind::Block(block) = &expression.kind
             && !self.checking.expressions.contains_key(&expression.id)
         {
-            let outcome = self.analyze_block(block, Some(expected), ConditionalUse::Value)?;
+            let outcome = self.analyze_block(
+                block,
+                Some(expected),
+                ConditionalUse::Value,
+                allow_recursive_copy,
+            )?;
             let typed = if outcome.explicit_value.is_none()
                 && !self.is_divergence(outcome.typed.type_id)
             {
-                self.check_typed(expression, expected, outcome.typed)?
+                self.check_typed(
+                    expression,
+                    expected,
+                    outcome.typed,
+                    allow_recursive_copy,
+                )?
             } else {
                 outcome.typed
             };
@@ -1574,13 +1714,18 @@ impl<'semantic> Analyzer<'semantic> {
             && !self.checking.expressions.contains_key(&expression.id)
         {
             return self
-                .check_conditional_expression(expression, expected, ConditionalUse::Value)
+                .analyze_conditional_expression(
+                    expression,
+                    Some(expected),
+                    ConditionalUse::Value,
+                    allow_recursive_copy,
+                )
                 .map(|outcome| outcome.typed);
         }
         if let ExpressionKind::Group(inner) = &expression.kind
             && !self.checking.expressions.contains_key(&expression.id)
         {
-            let typed = self.check(inner, expected)?;
+            let typed = self.check_with_capability(inner, expected, allow_recursive_copy)?;
             self.checking.expressions.insert(expression.id, typed);
             let explicitly_produces_value = self
                 .checking
@@ -1595,7 +1740,7 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         let found = self.synthesize(expression)?;
-        self.check_typed(expression, expected, found)
+        self.check_typed(expression, expected, found, allow_recursive_copy)
     }
 
     fn check_typed(
@@ -1603,6 +1748,7 @@ impl<'semantic> Analyzer<'semantic> {
         expression: &Expression,
         expected: TypeId,
         found: TypedExpression,
+        allow_recursive_copy: bool,
     ) -> Option<TypedExpression> {
         if self.is_recovery(expected)
             || self.is_recovery(found.type_id)
@@ -1616,7 +1762,7 @@ impl<'semantic> Analyzer<'semantic> {
             .has_same_shape(found.type_id, expected)
             .expect("checked types must belong to the program type store")
         {
-            if self.callable_capability_is_compatible(found.type_id, expected) {
+            if self.value_capability_is_compatible(found, expected, allow_recursive_copy) {
                 return Some(found);
             }
             return Some(self.report_type_mismatch(expression, expected, found));
@@ -1627,7 +1773,11 @@ impl<'semantic> Analyzer<'semantic> {
                     .types()
                     .has_same_shape(found.type_id, *member)
                     .expect("union members belong to the program type store")
-                    && self.callable_capability_is_compatible(found.type_id, *member)
+                    && self.value_capability_is_compatible(
+                        found,
+                        *member,
+                        allow_recursive_copy,
+                    )
             }),
             _ => None,
         };
@@ -1691,6 +1841,37 @@ impl<'semantic> Analyzer<'semantic> {
         let expected = self.callable_capability(expected);
         match (found, expected) {
             (Some(AccessCapability::Mut), Some(AccessCapability::Const)) => false,
+            _ => true,
+        }
+    }
+
+    /// Checks whether a value may acquire the access capability required by a
+    /// destination. Copies and fresh storage choose capability independently;
+    /// borrowed and GC references may only preserve or reduce access.
+    fn value_capability_is_compatible(
+        &self,
+        found: TypedExpression,
+        expected: TypeId,
+        allow_recursive_copy: bool,
+    ) -> bool {
+        if self.callable_capability(found.type_id).is_some()
+            && self.callable_capability(expected).is_some()
+        {
+            return self.callable_capability_is_compatible(found.type_id, expected);
+        }
+        let Some(found_semantic) = self.types.types().get(found.type_id) else {
+            return false;
+        };
+        let Some(expected_semantic) = self.types.types().get(expected) else {
+            return false;
+        };
+        match (found_semantic.capability(), expected_semantic.capability()) {
+            (Some(AccessCapability::Const), Some(AccessCapability::Mut)) => {
+                found.category == ValueCategory::FreshTemporary
+                    || found_semantic.copy_semantics() == Some(CopySemantics::Trivial)
+                    || (allow_recursive_copy
+                        && found_semantic.copy_semantics() == Some(CopySemantics::Recursive))
+            }
             _ => true,
         }
     }
@@ -1891,7 +2072,12 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         };
 
-        let typed_right = self.check(right, typed_left.type_id)?;
+        let operand_type = self
+            .types
+            .types_mut()
+            .with_capability(typed_left.type_id, AccessCapability::Const)
+            .expect("primitive operand type belongs to the program type store");
+        let typed_right = self.check(right, operand_type)?;
         if self.is_recovery(typed_right.type_id) {
             return Some(self.recovery_temporary());
         }
@@ -1905,6 +2091,124 @@ impl<'semantic> Analyzer<'semantic> {
             });
         }
         Some(self.fresh_primitive(result))
+    }
+
+    /// Checks assignment to an identifier root. Plain assignment redirects the
+    /// root's reference slot; it never overwrites or recursively copies the
+    /// object denoted by that slot.
+    fn synthesize_root_assignment(
+        &mut self,
+        target: &Expression,
+        operator: AssignmentOperator,
+        value: &Expression,
+    ) -> Option<TypedExpression> {
+        let typed_target = self.synthesize(target)?;
+        let Some(place) = self.checking.root_places.get(&target.id).copied() else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidAssignmentTarget,
+                span: target.span,
+            });
+            let _ = self.synthesize(value);
+            return Some(self.recovery_temporary());
+        };
+        let symbol = place
+            .symbol
+            .expect("an identifier root place must have a symbol");
+
+        if operator == AssignmentOperator::Assign {
+            let mutable = place.binding_mutability == Some(BindingMutability::Mut);
+            if !mutable {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::ImmutableBinding,
+                    span: target.span,
+                });
+            }
+            let checked = self.check(value, place.type_id)?;
+            let valid_value = !self.is_recovery(checked.type_id);
+            if mutable && valid_value {
+                let (category, transfer) = self.assignment_transfer(checked);
+                self.current_binding_categories.insert(symbol, category);
+                self.checking.reassigned_bindings.insert(symbol);
+                self.checking.transfers.insert(value.id, transfer);
+                return Some(self.fresh_primitive(PrimitiveType::Unit));
+            }
+            return Some(self.recovery_temporary());
+        }
+
+        let primitive = self.primitive_kind(typed_target.type_id);
+        let string_append = operator == AssignmentOperator::Add
+            && primitive == Some(PrimitiveType::String);
+        let mutable_destination = if string_append {
+            place.value_capability == ValueCapability::Mut
+        } else {
+            place.binding_mutability == Some(BindingMutability::Mut)
+        };
+        if !mutable_destination {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: if string_append {
+                    ExpressionCheckingErrorKind::ImmutableValue
+                } else {
+                    ExpressionCheckingErrorKind::ImmutableBinding
+                },
+                span: target.span,
+            });
+        }
+
+        let valid_operator = matches!(
+            (operator, primitive),
+            (
+                AssignmentOperator::Add
+                    | AssignmentOperator::Subtract
+                    | AssignmentOperator::Multiply
+                    | AssignmentOperator::Divide,
+                Some(PrimitiveType::Int | PrimitiveType::Float)
+            )
+                | (AssignmentOperator::Add, Some(PrimitiveType::String))
+                | (
+                    AssignmentOperator::Remainder
+                        | AssignmentOperator::BitwiseAnd
+                        | AssignmentOperator::BitwiseXor
+                        | AssignmentOperator::BitwiseOr
+                        | AssignmentOperator::ShiftLeft
+                        | AssignmentOperator::ShiftRight,
+                    Some(PrimitiveType::Int)
+                )
+        );
+        if !valid_operator {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidAssignmentOperand {
+                    operator,
+                    found: typed_target.type_id,
+                },
+                span: target.span,
+            });
+            let _ = self.synthesize(value);
+            return Some(self.recovery_temporary());
+        }
+
+        let expected_value = if string_append {
+            self.types
+                .types_mut()
+                .with_capability(typed_target.type_id, AccessCapability::Const)
+                .expect("string assignment type belongs to the program type store")
+        } else {
+            typed_target.type_id
+        };
+        let checked = self.check(value, expected_value)?;
+        if !mutable_destination || self.is_recovery(checked.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        if string_append {
+            self.checking.transfers.insert(value.id, ValueTransfer::Borrow);
+        } else {
+            self.checking
+                .transfers
+                .insert(value.id, ValueTransfer::TrivialCopy);
+            self.current_binding_categories
+                .insert(symbol, ValueCategory::OwnedInlinePlace);
+            self.checking.reassigned_bindings.insert(symbol);
+        }
+        Some(self.fresh_primitive(PrimitiveType::Unit))
     }
 
     fn synthesize_call(
@@ -1921,12 +2225,25 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         }
 
-        let Some(SemanticType::Callable {
-            parameters,
-            return_type,
-            ..
-        }) = self.types.types().get(typed_callee.type_id).cloned()
-        else {
+        let callable = match self.types.types().get(typed_callee.type_id).cloned() {
+            Some(SemanticType::Callable {
+                parameters,
+                return_type,
+                ..
+            }) => Some((parameters, return_type)),
+            Some(SemanticType::GarbageCollected { target, .. }) => {
+                match self.types.types().get(target).cloned() {
+                    Some(SemanticType::Callable {
+                        parameters,
+                        return_type,
+                        ..
+                    }) => Some((parameters, return_type)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((parameters, return_type)) = callable else {
             self.checking.errors.push(ExpressionCheckingError {
                 kind: ExpressionCheckingErrorKind::NotCallable {
                     found: typed_callee.type_id,
@@ -2055,16 +2372,32 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
-    fn synthesize_identifier(&self, expression: &Expression) -> Option<TypedExpression> {
+    fn synthesize_identifier(&mut self, expression: &Expression) -> Option<TypedExpression> {
         let symbol = self
             .names
             .symbol_for_reference(expression.id)
             .expect("identifier must have a resolved semantic symbol");
-        if let Some(binding) = self.checking.bindings.get(&symbol) {
-            return Some(TypedExpression {
+        if let Some(binding) = self.checking.bindings.get(&symbol).copied() {
+            let category = self
+                .current_binding_categories
+                .get(&symbol)
+                .copied()
+                .unwrap_or(binding.category);
+            let typed = TypedExpression {
                 type_id: binding.type_id,
-                category: binding.category,
-            });
+                category,
+            };
+            self.checking.root_places.insert(
+                expression.id,
+                RootPlace {
+                    symbol: Some(symbol),
+                    type_id: typed.type_id,
+                    category,
+                    binding_mutability: Some(binding.qualifiers.binding),
+                    value_capability: binding.qualifiers.value,
+                },
+            );
+            return Some(typed);
         }
         let type_id = self.signatures.callable_value_type(symbol)?;
         Some(TypedExpression {
@@ -2092,7 +2425,7 @@ impl<'semantic> Analyzer<'semantic> {
             .types_mut()
             .with_capability(owner, receiver.capability)
             .expect("method owner type belongs to the program type store");
-        match receiver.storage {
+        let typed = match receiver.storage {
             ReceiverStorage::Plain => TypedExpression {
                 type_id: owner,
                 category: ValueCategory::BorrowedPlace,
@@ -2105,7 +2438,21 @@ impl<'semantic> Analyzer<'semantic> {
                     .expect("method owner is a value type"),
                 category: ValueCategory::GarbageCollectedReference,
             },
-        }
+        };
+        self.checking.root_places.insert(
+            expression.id,
+            RootPlace {
+                symbol: None,
+                type_id: typed.type_id,
+                category: typed.category,
+                binding_mutability: None,
+                value_capability: match receiver.capability {
+                    AccessCapability::Const => ValueCapability::Const,
+                    AccessCapability::Mut => ValueCapability::Mut,
+                },
+            },
+        );
+        typed
     }
 
     fn parameter_category(&self, type_id: TypeId) -> ValueCategory {
@@ -2156,6 +2503,33 @@ impl<'semantic> Analyzer<'semantic> {
             );
         }
         (ValueCategory::BorrowedPlace, Some(ValueTransfer::Borrow))
+    }
+
+    fn assignment_transfer(&self, source: TypedExpression) -> (ValueCategory, ValueTransfer) {
+        let semantic = self
+            .types
+            .types()
+            .get(source.type_id)
+            .expect("assigned type belongs to the program type store");
+        if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+            return (
+                ValueCategory::GarbageCollectedReference,
+                ValueTransfer::ReuseGarbageCollected,
+            );
+        }
+        if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
+            return (
+                ValueCategory::OwnedInlinePlace,
+                ValueTransfer::TrivialCopy,
+            );
+        }
+        if source.category == ValueCategory::FreshTemporary {
+            return (
+                ValueCategory::OwnedInlinePlace,
+                ValueTransfer::MoveTemporary,
+            );
+        }
+        (source.category, ValueTransfer::Borrow)
     }
 
     fn argument_transfer(&self, source: TypedExpression) -> Option<ValueTransfer> {
@@ -4001,6 +4375,7 @@ mod tests {
             "    const called = add(2);\n",
             "    const immediate = lambda(value: int) -> int { value }(3);\n",
             "    const heap = &lambda(value: int) -> int { value };\n",
+            "    const heap_called = heap(4);\n",
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
@@ -4064,6 +4439,16 @@ mod tests {
             checking.transfers[&heap_lambda.id],
             ValueTransfer::AllocateGarbageCollected
         );
+        let heap_called = binding_initializer(&main.body.statements[5]);
+        let (_, arguments) = call(heap_called);
+        assert_primitive_expression(
+            &types,
+            &checking,
+            heap_called,
+            PrimitiveType::Int,
+            AccessCapability::Const,
+        );
+        assert_eq!(checking.transfers[&arguments[0].id], ValueTransfer::TrivialCopy);
     }
 
     #[test]
@@ -4256,5 +4641,243 @@ mod tests {
         assert_eq!(checking.expressions[&invalid.id].type_id, types.types().recovery());
         assert!(!checking.transfers.contains_key(&missing.id));
         assert!(!checking.transfers.contains_key(&invalid.id));
+    }
+
+    #[test]
+    fn records_binding_parameter_and_self_root_places() {
+        let source = concat!(
+            "struct Item { fn inspect(mut self) { self; } }\n",
+            "fn named() {}\n",
+            "fn roots(mut vconst item: Item) { const local = item; item; local; named; }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let item = structure(&program.declarations[0]);
+        let StructMember::Function(method) = &item.members[0] else {
+            panic!("expected method")
+        };
+        let self_value = expression(&method.body.statements[0]);
+        let roots = function(&program.declarations[2]);
+        let parameter = expression(&roots.body.statements[1]);
+        let local = expression(&roots.body.statements[2]);
+        let named = expression(&roots.body.statements[3]);
+        let parameter_place = checking.root_places[&parameter.id];
+        assert_eq!(parameter_place.binding_mutability, Some(BindingMutability::Mut));
+        assert_eq!(parameter_place.value_capability, ValueCapability::Const);
+        assert_eq!(parameter_place.category, ValueCategory::BorrowedPlace);
+        let local_place = checking.root_places[&local.id];
+        assert_eq!(local_place.binding_mutability, Some(BindingMutability::Const));
+        assert_eq!(local_place.value_capability, ValueCapability::Const);
+        assert_eq!(local_place.category, ValueCategory::BorrowedPlace);
+        let self_place = checking.root_places[&self_value.id];
+        assert_eq!(self_place.symbol, None);
+        assert_eq!(self_place.binding_mutability, None);
+        assert_eq!(self_place.value_capability, ValueCapability::Mut);
+        assert!(!checking.root_places.contains_key(&named.id));
+    }
+
+    #[test]
+    fn rebinds_plain_roots_and_moves_fresh_call_results() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn produce(item: Item) -> Item { item }\n",
+            "fn inspect(mut vconst current: Item, other: Item) {\n",
+            "    current = other;\n",
+            "    current;\n",
+            "    current = produce(other);\n",
+            "    current;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let inspect = function(&program.declarations[2]);
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::Assignment { value: borrowed, .. },
+            ..
+        }) = &inspect.body.statements[0].kind
+        else {
+            panic!("expected plain assignment")
+        };
+        let after_borrow = expression(&inspect.body.statements[1]);
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::Assignment { value: fresh, .. },
+            ..
+        }) = &inspect.body.statements[2].kind
+        else {
+            panic!("expected fresh assignment")
+        };
+        let after_fresh = expression(&inspect.body.statements[3]);
+        assert_eq!(checking.transfers[&borrowed.id], ValueTransfer::Borrow);
+        assert_eq!(checking.transfers[&fresh.id], ValueTransfer::MoveTemporary);
+        assert_eq!(
+            checking.root_places[&after_borrow.id].category,
+            ValueCategory::BorrowedPlace
+        );
+        assert_eq!(
+            checking.root_places[&after_fresh.id].category,
+            ValueCategory::OwnedInlinePlace
+        );
+        let symbol = names
+            .symbol_for_declaration(named_parameter(inspect, 0).id)
+            .expect("parameter should have a symbol");
+        assert!(checking.reassigned_bindings.contains(&symbol));
+    }
+
+    #[test]
+    fn merges_plain_root_provenance_after_conditional_rebinding() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn produce(item: Item) -> Item { item }\n",
+            "fn choose(mut vconst current: Item, other: Item, condition: bool) {\n",
+            "    if condition { current = produce(other); } else { current = other; };\n",
+            "    current;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let choose = function(&program.declarations[2]);
+        let current = expression(&choose.body.statements[1]);
+        assert_eq!(
+            checking.root_places[&current.id].category,
+            ValueCategory::BorrowedPlace
+        );
+    }
+
+    #[test]
+    fn checks_root_compound_assignment_mutability_and_operands() {
+        let source = concat!(
+            "fn inspect() {\n",
+            "    mut vconst number = 1; number += 2; number <<= 1;\n",
+            "    const vmut text = \"a\"; text += \"b\";\n",
+            "    mut vconst readonly_text = \"a\"; readonly_text += \"b\";\n",
+            "    const fixed = 1; fixed += 2;\n",
+            "    mut flag = true; flag += false;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 3);
+        assert_eq!(checking.errors[0].kind, ExpressionCheckingErrorKind::ImmutableValue);
+        assert_eq!(checking.errors[1].kind, ExpressionCheckingErrorKind::ImmutableBinding);
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::InvalidAssignmentOperand {
+                operator: AssignmentOperator::Add,
+                ..
+            }
+        ));
+        let inspect = function(&program.declarations[0]);
+        for index in [1, 2, 4] {
+            let assignment = expression(&inspect.body.statements[index]);
+            assert_primitive_expression(
+                &types,
+                &checking,
+                assignment,
+                PrimitiveType::Unit,
+                AccessCapability::Const,
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_fixed_and_non_place_identifier_assignment_targets() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn named() {}\n",
+            "fn inspect(item: Item, other: Item) { item = other; named = named; }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 2);
+        assert_eq!(checking.errors[0].kind, ExpressionCheckingErrorKind::ImmutableBinding);
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::InvalidAssignmentTarget
+        );
+    }
+
+    #[test]
+    fn enforces_view_capabilities_but_allows_recursive_return_copies() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn mutate(const vmut item: Item) {}\n",
+            "fn copied(item: Item) -> mut Item { item }\n",
+            "fn inspect(item: Item) { mutate(item); }\n",
+            "fn redirect(mut vconst current: &Item, other: &Item) { current = other; }\n",
+            "fn reject_redirect(mut current: &mut Item, other: &Item) { current = other; }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 2);
+        assert!(checking.errors.iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        )));
+        let copied = function(&program.declarations[2]);
+        let returned = body_value(copied);
+        assert_eq!(checking.transfers[&returned.id], ValueTransfer::RecursiveCopy);
+        let redirect = function(&program.declarations[4]);
+        let StatementKind::Expression(Expression {
+            kind: ExpressionKind::Assignment { value, .. },
+            ..
+        }) = &redirect.body.statements[0].kind
+        else {
+            panic!("expected GC assignment")
+        };
+        assert_eq!(
+            checking.transfers[&value.id],
+            ValueTransfer::ReuseGarbageCollected
+        );
     }
 }
