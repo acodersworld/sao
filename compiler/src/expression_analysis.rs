@@ -16,8 +16,8 @@ use crate::{
         AnonymousStructMember, AssignmentOperator, BinaryOperator, BindingMutability,
         BindingQualifiers, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
         Function, FunctionParameter, FunctionParameterKind, LiteralKind, NodeId, PrimitiveType,
-        Program, ReceiverStorage, Statement, StatementKind, StructMember, UnaryOperator,
-        ValueCapability,
+        Program, ReceiverStorage, Statement, StatementKind, StructFieldInitializer, StructMember,
+        TypeSyntax, UnaryOperator, ValueCapability,
     },
     context_resolution::ContextResolution,
     name_resolution::NameResolution,
@@ -25,7 +25,9 @@ use crate::{
         AccessCapability, CopySemantics, SemanticType, StorageSemantics, TypeId, ValueCategory,
         ValueTransfer,
     },
-    signature_collection::SignatureCollection,
+    signature_collection::{
+        MethodId, ReceiverSignature, SignatureCollection, StructMemberSignatureKind,
+    },
     source::{SourceModule, Span},
     symbol_table::{SymbolId, SymbolKind},
     type_resolution::TypeResolution,
@@ -110,18 +112,34 @@ struct BindingSemantics {
     category: ValueCategory,
 }
 
-/// The assignable root denoted by an identifier or `self` expression.
+/// An assignable location denoted by an identifier, `self`, or a field access.
 ///
 /// A plain object root is semantically a reference to frame-owned or borrowed
-/// storage. Its binding mutability controls whether that reference can be
-/// redirected, while the value capability controls mutation through it.
+/// storage. Root binding mutability controls whether that reference can be
+/// redirected. A field has no independently reassignable binding; mutation of
+/// either kind of place is governed by its effective value capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RootPlace {
+struct Place {
     symbol: Option<SymbolId>,
     type_id: TypeId,
     category: ValueCategory,
     binding_mutability: Option<BindingMutability>,
     value_capability: ValueCapability,
+}
+
+/// The declaration selected by a named-struct member expression. Typed IR
+/// consumes this identity directly instead of repeating source-name lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedMember {
+    /// A source or construction field mapped to its declared field identity.
+    Field { declaration: NodeId },
+    /// A receiverless function selected through `Type::function`.
+    AssociatedFunction { declaration: NodeId },
+    /// A method invoked directly through a value. Methods are never emitted as
+    /// first-class bound callable values.
+    Method { declaration: NodeId, method_id: MethodId },
+    /// The compiler-provided recursive copy operation and its source type.
+    Copy { source_type: TypeId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -178,6 +196,24 @@ enum ExpressionCheckingErrorKind {
         operator: AssignmentOperator,
         found: TypeId,
     },
+    InvalidConstructionOwner,
+    UnknownConstructionField,
+    DuplicateConstructionField,
+    MissingConstructionField { declaration: NodeId },
+    InvalidOwningSource {
+        found: TypeId,
+        category: ValueCategory,
+    },
+    UnknownMember,
+    InvalidMemberOwner { found: TypeId },
+    FieldRequiresValue,
+    AssociatedFunctionRequiresType,
+    MethodRequiresValue,
+    MethodRequiresCall,
+    CopyRequiresCall,
+    CopyRequiresValue,
+    ReceiverStorageMismatch,
+    ReceiverCapabilityMismatch,
 }
 
 #[derive(Debug, Default)]
@@ -188,7 +224,12 @@ struct ExpressionChecking {
     transfers: HashMap<NodeId, ValueTransfer>,
     union_injections: HashMap<NodeId, UnionInjection>,
     lambda_captures: HashMap<NodeId, Vec<LambdaCapture>>,
-    root_places: HashMap<NodeId, RootPlace>,
+    /// Assignable roots and fields, including the access capability that
+    /// controls rebinding or mutation through each place.
+    places: HashMap<NodeId, Place>,
+    /// Final declaration identities selected by member lookup. Later typed IR
+    /// can consume these without repeating lookup from source names.
+    resolved_members: HashMap<NodeId, ResolvedMember>,
     /// Bindings written by assignment. For object-like locals, lowering uses
     /// this to decide when the source-level reference needs indirection in
     /// addition to any frame-owned backing storage.
@@ -418,6 +459,9 @@ struct Analyzer<'semantic> {
     signatures: &'semantic SignatureCollection,
     types: &'semantic mut TypeResolution,
     method_owners: HashMap<NodeId, TypeId>,
+    /// Connects the type symbol resolved on `Name { ... }` to the declaration
+    /// whose collected field signature must be checked.
+    named_struct_symbols: HashMap<SymbolId, NodeId>,
     callable_parents: HashMap<NodeId, Option<NodeId>>,
     symbol_owners: HashMap<SymbolId, NodeId>,
     receiver_qualifiers: HashMap<NodeId, BindingQualifiers>,
@@ -460,10 +504,15 @@ impl<'semantic> Analyzer<'semantic> {
             receiver_qualifiers,
         } = LexicalIndex::build(program, names);
         let mut method_owners = HashMap::new();
+        let mut named_struct_symbols = HashMap::new();
         for declaration in &program.declarations {
             let Declaration::Struct(structure) = declaration else {
                 continue;
             };
+            let symbol = names
+                .symbol_for_declaration(structure.id)
+                .expect("named struct must have a semantic symbol");
+            named_struct_symbols.insert(symbol, structure.id);
             let owner = signatures
                 .named_struct(structure.id)
                 .expect("named struct signature must have been collected")
@@ -486,6 +535,7 @@ impl<'semantic> Analyzer<'semantic> {
             signatures,
             types,
             method_owners,
+            named_struct_symbols,
             callable_parents,
             symbol_owners,
             receiver_qualifiers,
@@ -1368,6 +1418,15 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::GarbageCollect(value) => {
                 self.synthesize_garbage_collection(value)?
             }
+            ExpressionKind::StructConstruction { fields, .. } => {
+                self.synthesize_named_struct_construction(expression, fields)?
+            }
+            ExpressionKind::MemberAccess { object, member } => {
+                self.synthesize_named_member_access(expression, object, *member)?
+            }
+            ExpressionKind::AssociatedAccess { owner, member } => {
+                self.synthesize_named_associated_access(expression, owner, *member)?
+            }
             ExpressionKind::Unary { operator, operand } => {
                 self.synthesize_unary(*operator, operand)?
             }
@@ -1383,8 +1442,11 @@ impl<'semantic> Analyzer<'semantic> {
                 target,
                 operator,
                 value,
-            } if matches!(&target.kind, ExpressionKind::Identifier) => {
-                self.synthesize_root_assignment(target, *operator, value)?
+            } if matches!(
+                &target.kind,
+                ExpressionKind::Identifier | ExpressionKind::MemberAccess { .. }
+            ) => {
+                self.synthesize_place_assignment(target, *operator, value)?
             }
             _ => return None,
         };
@@ -2093,6 +2155,569 @@ impl<'semantic> Analyzer<'semantic> {
         Some(self.fresh_primitive(result))
     }
 
+    /// Checks a complete named-struct construction as an owning boundary.
+    ///
+    /// Labels are resolved against collected fields while initializers are
+    /// analyzed in source order. Successful values must be independently
+    /// storable: primitives copy, fresh plain values move, and GC references
+    /// are reused. Named plain values therefore require an explicit `.copy()`.
+    fn synthesize_named_struct_construction(
+        &mut self,
+        expression: &Expression,
+        fields: &[StructFieldInitializer],
+    ) -> Option<TypedExpression> {
+        let symbol = self
+            .names
+            .symbol_for_reference(expression.id)
+            .expect("named construction must have a resolved type symbol");
+        let Some(declaration) = self.named_struct_symbols.get(&symbol).copied() else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidConstructionOwner,
+                span: expression.span,
+            });
+            for field in fields {
+                let _ = self.synthesize(&field.value);
+            }
+            return Some(self.recovery_temporary());
+        };
+        let signature = self
+            .signatures
+            .named_struct(declaration)
+            .expect("named struct signature must have been collected")
+            .clone();
+
+        let mut seen = HashSet::new();
+        let mut valid = true;
+        let mut all_supported = true;
+        for field in fields {
+            let name = self
+                .module
+                .text(field.name)
+                .expect("field label belongs to the source module")
+                .to_string();
+            let Some(member) = signature.member(&name).copied() else {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::UnknownConstructionField,
+                    span: field.name,
+                });
+                valid = false;
+                all_supported &= self.synthesize(&field.value).is_some();
+                continue;
+            };
+            if !seen.insert(name) {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::DuplicateConstructionField,
+                    span: field.name,
+                });
+                valid = false;
+                all_supported &= self.synthesize(&field.value).is_some();
+                continue;
+            }
+            let StructMemberSignatureKind::Field(field_signature) = member.kind else {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::UnknownConstructionField,
+                    span: field.name,
+                });
+                valid = false;
+                all_supported &= self.synthesize(&field.value).is_some();
+                continue;
+            };
+            self.checking.resolved_members.insert(
+                field.id,
+                ResolvedMember::Field {
+                    declaration: field_signature.declaration,
+                },
+            );
+            let expected = field_signature
+                .type_id
+                .expect("named struct fields always have declared types");
+            let Some(checked) = self.check(&field.value, expected) else {
+                all_supported = false;
+                continue;
+            };
+            if self.is_recovery(checked.type_id) {
+                valid = false;
+                continue;
+            }
+            valid &= self.validate_owning_transfer(&field.value, checked, true);
+        }
+
+        for name in signature.field_order() {
+            if seen.contains(name) {
+                continue;
+            }
+            let member = signature
+                .member(name)
+                .expect("ordered field must remain in the member table");
+            let StructMemberSignatureKind::Field(field) = member.kind else {
+                unreachable!("field order contains only fields")
+            };
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::MissingConstructionField {
+                    declaration: field.declaration,
+                },
+                span: expression.span,
+            });
+            valid = false;
+        }
+
+        if !all_supported {
+            return None;
+        }
+        if !valid {
+            return Some(self.recovery_temporary());
+        }
+        let type_id = self
+            .types
+            .types_mut()
+            .with_capability(signature.type_id, AccessCapability::Mut)
+            .expect("named struct type belongs to the program type store");
+        Some(TypedExpression {
+            type_id,
+            category: ValueCategory::FreshTemporary,
+        })
+    }
+
+    /// Synthesizes field access on a named struct and records the resulting
+    /// place. Methods and `.copy` deliberately fail here because they are only
+    /// meaningful when the member access is immediately used as a call callee.
+    fn synthesize_named_member_access(
+        &mut self,
+        expression: &Expression,
+        object: &Expression,
+        member: Span,
+    ) -> Option<TypedExpression> {
+        let typed_object = self.synthesize(object)?;
+        if self.is_recovery(typed_object.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        let Some((declaration, object_capability, is_gc)) =
+            self.named_struct_parts(typed_object.type_id)
+        else {
+            if self.member_owner_is_definitively_invalid(typed_object.type_id) {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::InvalidMemberOwner {
+                        found: typed_object.type_id,
+                    },
+                    span: object.span,
+                });
+                return Some(self.recovery_temporary());
+            }
+            return None;
+        };
+        let name = self
+            .module
+            .text(member)
+            .expect("member name belongs to the source module");
+        if name == "copy" {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::CopyRequiresCall,
+                span: member,
+            });
+            return Some(self.recovery_temporary());
+        }
+        let Some(selected) = self
+            .signatures
+            .named_struct(declaration)
+            .and_then(|signature| signature.member(name))
+            .copied()
+        else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::UnknownMember,
+                span: member,
+            });
+            return Some(self.recovery_temporary());
+        };
+        match selected.kind {
+            StructMemberSignatureKind::Field(field) => {
+                let declared = field
+                    .type_id
+                    .expect("named struct fields always have declared types");
+                let object_capability = if !is_gc
+                    && typed_object.category == ValueCategory::FreshTemporary
+                {
+                    AccessCapability::Mut
+                } else {
+                    object_capability
+                };
+                let type_id = self.field_access_type(declared, object_capability);
+                let category = self.field_category(typed_object, type_id);
+                let capability = self
+                    .types
+                    .types()
+                    .get(type_id)
+                    .and_then(SemanticType::capability)
+                    .expect("field type has a value capability");
+                self.checking.places.insert(
+                    expression.id,
+                    Place {
+                        symbol: None,
+                        type_id,
+                        category,
+                        binding_mutability: None,
+                        value_capability: match capability {
+                            AccessCapability::Const => ValueCapability::Const,
+                            AccessCapability::Mut => ValueCapability::Mut,
+                        },
+                    },
+                );
+                self.checking.resolved_members.insert(
+                    expression.id,
+                    ResolvedMember::Field {
+                        declaration: field.declaration,
+                    },
+                );
+                Some(TypedExpression { type_id, category })
+            }
+            StructMemberSignatureKind::Method { .. } => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::MethodRequiresCall,
+                    span: member,
+                });
+                Some(self.recovery_temporary())
+            }
+            StructMemberSignatureKind::AssociatedFunction { .. } => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::AssociatedFunctionRequiresType,
+                    span: member,
+                });
+                Some(self.recovery_temporary())
+            }
+        }
+    }
+
+    /// Selects a receiverless named-struct function through `Type::function`.
+    ///
+    /// Unlike instance methods, associated functions are ordinary first-class
+    /// callable values because they carry no hidden receiver.
+    fn synthesize_named_associated_access(
+        &mut self,
+        expression: &Expression,
+        owner: &TypeSyntax,
+        member: Span,
+    ) -> Option<TypedExpression> {
+        let owner_type = self.types.type_for_syntax(owner.id)?;
+        let Some(SemanticType::NamedStruct { declaration, .. }) =
+            self.types.types().get(owner_type).cloned()
+        else {
+            return None;
+        };
+        let name = self
+            .module
+            .text(member)
+            .expect("associated member name belongs to the source module");
+        if name == "copy" {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::CopyRequiresValue,
+                span: member,
+            });
+            return Some(self.recovery_temporary());
+        }
+        let Some(selected) = self
+            .signatures
+            .named_struct(declaration)
+            .and_then(|signature| signature.member(name))
+            .copied()
+        else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::UnknownMember,
+                span: member,
+            });
+            return Some(self.recovery_temporary());
+        };
+        let declaration = match selected.kind {
+            StructMemberSignatureKind::AssociatedFunction { declaration } => declaration,
+            StructMemberSignatureKind::Field(_) => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::FieldRequiresValue,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            }
+            StructMemberSignatureKind::Method { .. } => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::MethodRequiresValue,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            }
+        };
+        let signature = self
+            .signatures
+            .callable(declaration)
+            .expect("associated function signature must have been collected");
+        let type_id = self.types.types_mut().callable(
+            signature.parameters.clone(),
+            signature.return_type,
+            AccessCapability::Const,
+        );
+        self.checking.resolved_members.insert(
+            expression.id,
+            ResolvedMember::AssociatedFunction { declaration },
+        );
+        Some(TypedExpression {
+            type_id,
+            category: ValueCategory::FreshTemporary,
+        })
+    }
+
+    /// Peels a plain or GC-qualified named struct into the information shared
+    /// by field and method lookup. The boolean distinguishes GC receivers so
+    /// receiver checking can enforce `self` versus `&self` storage.
+    fn named_struct_parts(&self, type_id: TypeId) -> Option<(NodeId, AccessCapability, bool)> {
+        match self.types.types().get(type_id)? {
+            SemanticType::NamedStruct {
+                declaration,
+                capability,
+            } => Some((*declaration, *capability, false)),
+            SemanticType::GarbageCollected { target, capability } => {
+                match self.types.types().get(*target)? {
+                    SemanticType::NamedStruct { declaration, .. } => {
+                        Some((*declaration, *capability, true))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Identifies owners that cannot gain a member family in a later increment.
+    /// Strings, bytes, built-ins, interfaces, and anonymous structs are omitted
+    /// because their member checking is intentionally still deferred.
+    fn member_owner_is_definitively_invalid(&self, type_id: TypeId) -> bool {
+        matches!(
+            self.types.types().get(type_id),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Unit
+                    | PrimitiveType::None
+                    | PrimitiveType::Int
+                    | PrimitiveType::Float
+                    | PrimitiveType::Bool
+                    | PrimitiveType::Char,
+                ..
+            })
+        )
+    }
+
+    /// Applies transitive access capability to a field reached through an
+    /// object. Inline fields inherit the object's access. GC-valued fields also
+    /// retain the capability stored in their reference, so neither route can
+    /// turn const access back into mutable access.
+    fn field_access_type(
+        &mut self,
+        declared: TypeId,
+        object_capability: AccessCapability,
+    ) -> TypeId {
+        let declared_semantic = self
+            .types
+            .types()
+            .get(declared)
+            .expect("field type belongs to the program type store");
+        let capability = if declared_semantic.storage_semantics()
+            == Some(StorageSemantics::GarbageCollected)
+        {
+            match (object_capability, declared_semantic.capability()) {
+                (AccessCapability::Const, _) | (_, Some(AccessCapability::Const)) => {
+                    AccessCapability::Const
+                }
+                _ => AccessCapability::Mut,
+            }
+        } else {
+            object_capability
+        };
+        self.types
+            .types_mut()
+            .with_capability(declared, capability)
+            .expect("field type belongs to the program type store")
+    }
+
+    /// Determines the storage provenance observed through a field access.
+    ///
+    /// Inline ownership is preserved through owned or fresh objects. Access
+    /// through a borrowed or GC-backed object is borrowed, while a GC-valued
+    /// field remains a GC reference regardless of its containing object.
+    fn field_category(
+        &self,
+        object: TypedExpression,
+        field_type: TypeId,
+    ) -> ValueCategory {
+        if self
+            .types
+            .types()
+            .get(field_type)
+            .is_some_and(|semantic| {
+                semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
+            })
+        {
+            return ValueCategory::GarbageCollectedReference;
+        }
+        match object.category {
+            ValueCategory::FreshTemporary => ValueCategory::FreshTemporary,
+            ValueCategory::OwnedInlinePlace => ValueCategory::OwnedInlinePlace,
+            ValueCategory::BorrowedPlace | ValueCategory::GarbageCollectedReference => {
+                ValueCategory::BorrowedPlace
+            }
+        }
+    }
+
+    /// Validates a value entering owned aggregate storage and optionally
+    /// records the selected transfer once the destination itself is valid.
+    ///
+    /// The `record` switch lets an immutable field still report an independent
+    /// invalid-source diagnostic without claiming that assignment occurred.
+    fn validate_owning_transfer(
+        &mut self,
+        source_expression: &Expression,
+        source: TypedExpression,
+        record: bool,
+    ) -> bool {
+        let semantic = self
+            .types
+            .types()
+            .get(source.type_id)
+            .expect("owning source type belongs to the program type store");
+        let transfer = if semantic.storage_semantics()
+            == Some(StorageSemantics::GarbageCollected)
+        {
+            Some(ValueTransfer::ReuseGarbageCollected)
+        } else if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
+            Some(ValueTransfer::TrivialCopy)
+        } else if source.category == ValueCategory::FreshTemporary {
+            Some(ValueTransfer::MoveTemporary)
+        } else {
+            None
+        };
+        if let Some(transfer) = transfer {
+            if record {
+                self.checking.transfers.insert(source_expression.id, transfer);
+            }
+            return true;
+        }
+        self.checking.errors.push(ExpressionCheckingError {
+            kind: ExpressionCheckingErrorKind::InvalidOwningSource {
+                found: source.type_id,
+                category: source.category,
+            },
+            span: source_expression.span,
+        });
+        self.checking.expressions.insert(
+            source_expression.id,
+            TypedExpression {
+                type_id: self.types.types().recovery(),
+                category: source.category,
+            },
+        );
+        false
+    }
+
+    /// Dispatches assignment according to the semantic kind of place. Root
+    /// identifiers redirect bindings, whereas fields replace or mutate storage
+    /// owned by their containing aggregate.
+    fn synthesize_place_assignment(
+        &mut self,
+        target: &Expression,
+        operator: AssignmentOperator,
+        value: &Expression,
+    ) -> Option<TypedExpression> {
+        match &target.kind {
+            ExpressionKind::Identifier => self.synthesize_root_assignment(target, operator, value),
+            ExpressionKind::MemberAccess { .. } => {
+                self.synthesize_field_assignment(target, operator, value)
+            }
+            _ => unreachable!("place assignment dispatch accepts only implemented places"),
+        }
+    }
+
+    /// Checks assignment through a direct field place.
+    ///
+    /// Field replacement is controlled by value access rather than the root
+    /// binding's mutability. Simple assignment is an owning boundary; compound
+    /// assignment mutates the existing primitive or string value in place.
+    fn synthesize_field_assignment(
+        &mut self,
+        target: &Expression,
+        operator: AssignmentOperator,
+        value: &Expression,
+    ) -> Option<TypedExpression> {
+        let typed_target = self.synthesize(target)?;
+        let Some(place) = self.checking.places.get(&target.id).copied() else {
+            let _ = self.synthesize(value);
+            return Some(self.recovery_temporary());
+        };
+        let mutable = place.value_capability == ValueCapability::Mut;
+        if !mutable {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ImmutableValue,
+                span: target.span,
+            });
+        }
+
+        if operator == AssignmentOperator::Assign {
+            let checked = self.check(value, place.type_id)?;
+            if self.is_recovery(checked.type_id) {
+                return Some(self.recovery_temporary());
+            }
+            if !self.validate_owning_transfer(value, checked, mutable) || !mutable {
+                return Some(self.recovery_temporary());
+            }
+            return Some(self.fresh_primitive(PrimitiveType::Unit));
+        }
+
+        let primitive = self.primitive_kind(typed_target.type_id);
+        let string_append = operator == AssignmentOperator::Add
+            && primitive == Some(PrimitiveType::String);
+        let valid_operator = matches!(
+            (operator, primitive),
+            (
+                AssignmentOperator::Add
+                    | AssignmentOperator::Subtract
+                    | AssignmentOperator::Multiply
+                    | AssignmentOperator::Divide,
+                Some(PrimitiveType::Int | PrimitiveType::Float)
+            )
+                | (AssignmentOperator::Add, Some(PrimitiveType::String))
+                | (
+                    AssignmentOperator::Remainder
+                        | AssignmentOperator::BitwiseAnd
+                        | AssignmentOperator::BitwiseXor
+                        | AssignmentOperator::BitwiseOr
+                        | AssignmentOperator::ShiftLeft
+                        | AssignmentOperator::ShiftRight,
+                    Some(PrimitiveType::Int)
+                )
+        );
+        if !valid_operator {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidAssignmentOperand {
+                    operator,
+                    found: typed_target.type_id,
+                },
+                span: target.span,
+            });
+            let _ = self.synthesize(value);
+            return Some(self.recovery_temporary());
+        }
+        let expected = self
+            .types
+            .types_mut()
+            .with_capability(typed_target.type_id, AccessCapability::Const)
+            .expect("compound-assignment type belongs to the program type store");
+        let checked = self.check(value, expected)?;
+        if !mutable || self.is_recovery(checked.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        self.checking.transfers.insert(
+            value.id,
+            if string_append {
+                ValueTransfer::Borrow
+            } else {
+                ValueTransfer::TrivialCopy
+            },
+        );
+        Some(self.fresh_primitive(PrimitiveType::Unit))
+    }
+
     /// Checks assignment to an identifier root. Plain assignment redirects the
     /// root's reference slot; it never overwrites or recursively copies the
     /// object denoted by that slot.
@@ -2103,7 +2728,7 @@ impl<'semantic> Analyzer<'semantic> {
         value: &Expression,
     ) -> Option<TypedExpression> {
         let typed_target = self.synthesize(target)?;
-        let Some(place) = self.checking.root_places.get(&target.id).copied() else {
+        let Some(place) = self.checking.places.get(&target.id).copied() else {
             self.checking.errors.push(ExpressionCheckingError {
                 kind: ExpressionCheckingErrorKind::InvalidAssignmentTarget,
                 span: target.span,
@@ -2217,6 +2842,9 @@ impl<'semantic> Analyzer<'semantic> {
         callee: &Expression,
         arguments: &[Expression],
     ) -> Option<TypedExpression> {
+        if let Some(result) = self.synthesize_named_member_call(expression, callee, arguments) {
+            return result;
+        }
         let typed_callee = self.synthesize(callee)?;
         if self.is_recovery(typed_callee.type_id) {
             for argument in arguments {
@@ -2256,6 +2884,215 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         };
 
+        let arguments_valid = self.analyze_call_arguments(expression, arguments, &parameters)?;
+        if !arguments_valid || self.is_recovery(return_type) {
+            return Some(self.recovery_temporary());
+        }
+        Some(self.call_result(return_type))
+    }
+
+    /// Handles compiler-provided copies and named instance methods before an
+    /// ordinary call attempts to synthesize its callee as a first-class value.
+    /// Returning `None` means the member is a field (possibly callable) or
+    /// belongs to a member family deferred to a later increment.
+    fn synthesize_named_member_call(
+        &mut self,
+        call: &Expression,
+        callee: &Expression,
+        arguments: &[Expression],
+    ) -> Option<Option<TypedExpression>> {
+        let ExpressionKind::MemberAccess { object, member } = &callee.kind else {
+            return None;
+        };
+        let typed_object = match self.synthesize(object) {
+            Some(typed) => typed,
+            None => return None,
+        };
+        if self.is_recovery(typed_object.type_id) {
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(Some(self.recovery_temporary()));
+        }
+        let Some((owner, object_capability, is_gc)) =
+            self.named_struct_parts(typed_object.type_id)
+        else {
+            return None;
+        };
+        let name = self
+            .module
+            .text(*member)
+            .expect("member name belongs to the source module");
+        if name == "copy" {
+            let valid_arity = arguments.is_empty();
+            if !valid_arity {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                        expected: 0,
+                        found: arguments.len(),
+                    },
+                    span: call.span,
+                });
+            }
+            let mut all_supported = true;
+            for argument in arguments {
+                all_supported &= self.synthesize(argument).is_some();
+            }
+            if !all_supported {
+                return Some(None);
+            }
+            self.checking.resolved_members.insert(
+                callee.id,
+                ResolvedMember::Copy {
+                    source_type: typed_object.type_id,
+                },
+            );
+            if !valid_arity {
+                return Some(Some(self.recovery_temporary()));
+            }
+            self.checking
+                .transfers
+                .insert(object.id, ValueTransfer::RecursiveCopy);
+            let plain = self
+                .signatures
+                .named_struct(owner)
+                .expect("copy owner has a named struct signature")
+                .type_id;
+            let type_id = self
+                .types
+                .types_mut()
+                .with_capability(plain, AccessCapability::Mut)
+                .expect("copied struct type belongs to the program type store");
+            return Some(Some(TypedExpression {
+                type_id,
+                category: ValueCategory::FreshTemporary,
+            }));
+        }
+
+        let Some(selected) = self
+            .signatures
+            .named_struct(owner)
+            .and_then(|signature| signature.member(name))
+            .copied()
+        else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::UnknownMember,
+                span: *member,
+            });
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(Some(self.recovery_temporary()));
+        };
+        let StructMemberSignatureKind::Method {
+            declaration,
+            method_id,
+        } = selected.kind
+        else {
+            if matches!(
+                selected.kind,
+                StructMemberSignatureKind::AssociatedFunction { .. }
+            ) {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::AssociatedFunctionRequiresType,
+                    span: *member,
+                });
+                for argument in arguments {
+                    let _ = self.synthesize(argument);
+                }
+                return Some(Some(self.recovery_temporary()));
+            }
+            return None;
+        };
+        let signature = self
+            .signatures
+            .callable(declaration)
+            .expect("method signature must have been collected")
+            .clone();
+        let receiver = signature
+            .receiver
+            .expect("instance method must have a receiver signature");
+        let receiver_valid = self.check_method_receiver(
+            object,
+            typed_object,
+            receiver,
+            object_capability,
+            is_gc,
+        );
+        self.checking.resolved_members.insert(
+            callee.id,
+            ResolvedMember::Method {
+                declaration,
+                method_id,
+            },
+        );
+        let arguments_valid = match self.analyze_call_arguments(
+            call,
+            arguments,
+            &signature.parameters,
+        ) {
+            Some(valid) => valid,
+            None => return Some(None),
+        };
+        if !receiver_valid || !arguments_valid || self.is_recovery(signature.return_type) {
+            return Some(Some(self.recovery_temporary()));
+        }
+        Some(Some(self.call_result(signature.return_type)))
+    }
+
+    /// Validates the hidden receiver supplied by a direct method call and
+    /// records how it is passed. Plain methods borrow; borrowing from a GC
+    /// object retains its hidden owner root; `&self` methods reuse the GC
+    /// reference. A fresh plain temporary may independently select mut access.
+    fn check_method_receiver(
+        &mut self,
+        object: &Expression,
+        typed_object: TypedExpression,
+        receiver: ReceiverSignature,
+        object_capability: AccessCapability,
+        is_gc: bool,
+    ) -> bool {
+        let storage_valid = receiver.storage == ReceiverStorage::Plain || is_gc;
+        if !storage_valid {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ReceiverStorageMismatch,
+                span: object.span,
+            });
+        }
+        let capability_valid = !matches!(
+            (object_capability, receiver.capability),
+            (AccessCapability::Const, AccessCapability::Mut)
+        ) || (!is_gc && typed_object.category == ValueCategory::FreshTemporary);
+        if !capability_valid {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ReceiverCapabilityMismatch,
+                span: object.span,
+            });
+        }
+        if storage_valid && capability_valid {
+            let transfer = match receiver.storage {
+                ReceiverStorage::GarbageCollected => ValueTransfer::ReuseGarbageCollected,
+                ReceiverStorage::Plain if is_gc => ValueTransfer::BorrowFromGarbageCollected {
+                    retain_hidden_owner_root: true,
+                },
+                ReceiverStorage::Plain => ValueTransfer::Borrow,
+            };
+            self.checking.transfers.insert(object.id, transfer);
+        }
+        storage_valid && capability_valid
+    }
+
+    /// Checks call arguments from left to right after callee/receiver lookup.
+    ///
+    /// Arity failure does not stop argument analysis. Transfers are recorded
+    /// only for arguments that correspond to parameters and check successfully;
+    /// surplus arguments are analyzed without receiving transfer metadata.
+    fn analyze_call_arguments(
+        &mut self,
+        call: &Expression,
+        arguments: &[Expression],
+        parameters: &[TypeId],
+    ) -> Option<bool> {
         let arity_matches = parameters.len() == arguments.len();
         if !arity_matches {
             self.checking.errors.push(ExpressionCheckingError {
@@ -2263,11 +3100,10 @@ impl<'semantic> Analyzer<'semantic> {
                     expected: parameters.len(),
                     found: arguments.len(),
                 },
-                span: expression.span,
+                span: call.span,
             });
         }
-
-        let mut arguments_valid = true;
+        let mut valid = arity_matches;
         let mut all_supported = true;
         for (index, argument) in arguments.iter().enumerate() {
             let Some(expected) = parameters.get(index).copied() else {
@@ -2279,21 +3115,20 @@ impl<'semantic> Analyzer<'semantic> {
                 continue;
             };
             if self.is_recovery(checked.type_id) {
-                arguments_valid = false;
+                valid = false;
                 continue;
             }
             if let Some(transfer) = self.argument_transfer(checked) {
                 self.checking.transfers.insert(argument.id, transfer);
             }
         }
+        all_supported.then_some(valid)
+    }
 
-        if !all_supported {
-            return None;
-        }
-        if !arity_matches || !arguments_valid || self.is_recovery(return_type) {
-            return Some(self.recovery_temporary());
-        }
-
+    /// Gives all successful ordinary calls their declared result type. GC
+    /// results preserve reference provenance; other results are fresh values
+    /// supplied by the callee's result storage.
+    fn call_result(&self, return_type: TypeId) -> TypedExpression {
         let category = if self
             .types
             .types()
@@ -2306,10 +3141,10 @@ impl<'semantic> Analyzer<'semantic> {
         } else {
             ValueCategory::FreshTemporary
         };
-        Some(TypedExpression {
+        TypedExpression {
             type_id: return_type,
             category,
-        })
+        }
     }
 
     fn primitive_kind(&self, type_id: TypeId) -> Option<PrimitiveType> {
@@ -2387,9 +3222,9 @@ impl<'semantic> Analyzer<'semantic> {
                 type_id: binding.type_id,
                 category,
             };
-            self.checking.root_places.insert(
+            self.checking.places.insert(
                 expression.id,
-                RootPlace {
+                Place {
                     symbol: Some(symbol),
                     type_id: typed.type_id,
                     category,
@@ -2439,9 +3274,9 @@ impl<'semantic> Analyzer<'semantic> {
                 category: ValueCategory::GarbageCollectedReference,
             },
         };
-        self.checking.root_places.insert(
+        self.checking.places.insert(
             expression.id,
-            RootPlace {
+            Place {
                 symbol: None,
                 type_id: typed.type_id,
                 category: typed.category,
@@ -4644,7 +5479,7 @@ mod tests {
     }
 
     #[test]
-    fn records_binding_parameter_and_self_root_places() {
+    fn records_binding_parameter_and_self_places() {
         let source = concat!(
             "struct Item { fn inspect(mut self) { self; } }\n",
             "fn named() {}\n",
@@ -4670,19 +5505,19 @@ mod tests {
         let parameter = expression(&roots.body.statements[1]);
         let local = expression(&roots.body.statements[2]);
         let named = expression(&roots.body.statements[3]);
-        let parameter_place = checking.root_places[&parameter.id];
+        let parameter_place = checking.places[&parameter.id];
         assert_eq!(parameter_place.binding_mutability, Some(BindingMutability::Mut));
         assert_eq!(parameter_place.value_capability, ValueCapability::Const);
         assert_eq!(parameter_place.category, ValueCategory::BorrowedPlace);
-        let local_place = checking.root_places[&local.id];
+        let local_place = checking.places[&local.id];
         assert_eq!(local_place.binding_mutability, Some(BindingMutability::Const));
         assert_eq!(local_place.value_capability, ValueCapability::Const);
         assert_eq!(local_place.category, ValueCategory::BorrowedPlace);
-        let self_place = checking.root_places[&self_value.id];
+        let self_place = checking.places[&self_value.id];
         assert_eq!(self_place.symbol, None);
         assert_eq!(self_place.binding_mutability, None);
         assert_eq!(self_place.value_capability, ValueCapability::Mut);
-        assert!(!checking.root_places.contains_key(&named.id));
+        assert!(!checking.places.contains_key(&named.id));
     }
 
     #[test]
@@ -4728,11 +5563,11 @@ mod tests {
         assert_eq!(checking.transfers[&borrowed.id], ValueTransfer::Borrow);
         assert_eq!(checking.transfers[&fresh.id], ValueTransfer::MoveTemporary);
         assert_eq!(
-            checking.root_places[&after_borrow.id].category,
+            checking.places[&after_borrow.id].category,
             ValueCategory::BorrowedPlace
         );
         assert_eq!(
-            checking.root_places[&after_fresh.id].category,
+            checking.places[&after_fresh.id].category,
             ValueCategory::OwnedInlinePlace
         );
         let symbol = names
@@ -4765,7 +5600,7 @@ mod tests {
         let choose = function(&program.declarations[2]);
         let current = expression(&choose.body.statements[1]);
         assert_eq!(
-            checking.root_places[&current.id].category,
+            checking.places[&current.id].category,
             ValueCategory::BorrowedPlace
         );
     }
@@ -4879,5 +5714,310 @@ mod tests {
             checking.transfers[&value.id],
             ValueTransfer::ReuseGarbageCollected
         );
+    }
+
+    #[test]
+    fn checks_named_construction_fields_associated_functions_and_methods() {
+        let source = concat!(
+            "fn forward() -> Container { Container::new(0) }\n",
+            "struct Leaf { value: int, }\n",
+            "struct Container {\n",
+            "    total: int,\n",
+            "    leaf: Leaf,\n",
+            "    fn new(value: int) -> Container {\n",
+            "        Container { leaf: Leaf { value: value }, total: value }\n",
+            "    }\n",
+            "    fn read(self) -> int { self.total }\n",
+            "    fn add(mut self, amount: int) { self.total += amount; }\n",
+            "    fn heap_read(&self) -> int { self.total }\n",
+            "}\n",
+            "fn inspect(const vmut container: Container, other: Leaf, shared: &Container) {\n",
+            "    const constructed = Container { total: 1, leaf: Leaf { value: 2 } };\n",
+            "    const associated = Container::new;\n",
+            "    const from_associated = associated(3);\n",
+            "    const total = constructed.total;\n",
+            "    container.total = 4;\n",
+            "    container.leaf = Leaf { value: 5 };\n",
+            "    container.add(6);\n",
+            "    const borrowed_read = shared.read();\n",
+            "    const gc_read = shared.heap_read();\n",
+            "    const copied = other.copy();\n",
+            "    container.leaf = other.copy();\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let inspect = function(&program.declarations[3]);
+        let constructed = binding_initializer(&inspect.body.statements[0]);
+        let ExpressionKind::StructConstruction { fields, .. } = &constructed.kind else {
+            panic!("expected named construction")
+        };
+        assert_eq!(checking.transfers[&fields[0].value.id], ValueTransfer::TrivialCopy);
+        assert_eq!(checking.transfers[&fields[1].value.id], ValueTransfer::MoveTemporary);
+
+        let associated = binding_initializer(&inspect.body.statements[1]);
+        assert!(matches!(
+            checking.resolved_members[&associated.id],
+            ResolvedMember::AssociatedFunction { .. }
+        ));
+
+        let total = binding_initializer(&inspect.body.statements[3]);
+        assert!(matches!(
+            checking.resolved_members[&total.id],
+            ResolvedMember::Field { .. }
+        ));
+        assert_eq!(checking.places[&total.id].category, ValueCategory::OwnedInlinePlace);
+
+        let add = expression(&inspect.body.statements[6]);
+        let (add_callee, _) = call(add);
+        let ExpressionKind::MemberAccess { object: add_object, .. } = &add_callee.kind else {
+            panic!("expected method member")
+        };
+        assert!(matches!(
+            checking.resolved_members[&add_callee.id],
+            ResolvedMember::Method { .. }
+        ));
+        assert_eq!(checking.transfers[&add_object.id], ValueTransfer::Borrow);
+
+        let borrowed_read = binding_initializer(&inspect.body.statements[7]);
+        let (borrowed_callee, _) = call(borrowed_read);
+        let ExpressionKind::MemberAccess { object: borrowed_object, .. } = &borrowed_callee.kind
+        else {
+            panic!("expected method member")
+        };
+        assert_eq!(
+            checking.transfers[&borrowed_object.id],
+            ValueTransfer::BorrowFromGarbageCollected {
+                retain_hidden_owner_root: true,
+            }
+        );
+
+        let gc_read = binding_initializer(&inspect.body.statements[8]);
+        let (gc_callee, _) = call(gc_read);
+        let ExpressionKind::MemberAccess { object: gc_object, .. } = &gc_callee.kind else {
+            panic!("expected method member")
+        };
+        assert_eq!(
+            checking.transfers[&gc_object.id],
+            ValueTransfer::ReuseGarbageCollected
+        );
+
+        let copied = binding_initializer(&inspect.body.statements[9]);
+        let (copy_callee, _) = call(copied);
+        let ExpressionKind::MemberAccess { object: copy_source, .. } = &copy_callee.kind else {
+            panic!("expected copy member")
+        };
+        assert!(matches!(
+            checking.resolved_members[&copy_callee.id],
+            ResolvedMember::Copy { .. }
+        ));
+        assert_eq!(checking.transfers[&copy_source.id], ValueTransfer::RecursiveCopy);
+
+        let fresh_assignment = expression(&inspect.body.statements[5]);
+        let ExpressionKind::Assignment { value, .. } = &fresh_assignment.kind else {
+            panic!("expected field assignment")
+        };
+        assert_eq!(checking.transfers[&value.id], ValueTransfer::MoveTemporary);
+    }
+
+    #[test]
+    fn reports_named_member_and_owning_field_errors_without_cascades() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Container {\n",
+            "    leaf: Leaf,\n",
+            "    count: int,\n",
+            "    fn make() -> Leaf { Leaf {} }\n",
+            "    fn read(self) -> int { self.count }\n",
+            "}\n",
+            "fn bad(mut container: Container, const vmut leaf: Leaf) {\n",
+            "    const broken = Container { leaf: Leaf {}, leaf: Leaf {}, unknown: 1 };\n",
+            "    const borrowed = Container { leaf: leaf, count: 0 };\n",
+            "    container.leaf = leaf;\n",
+            "    const selected = container.read;\n",
+            "    leaf.copy;\n",
+            "    leaf.copy(1);\n",
+            "    container.make();\n",
+            "    Container::leaf;\n",
+            "    Container::read;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 11, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::DuplicateConstructionField
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::UnknownConstructionField
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::MissingConstructionField { .. }
+        ));
+        assert!(matches!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::InvalidOwningSource { .. }
+        ));
+        assert!(matches!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::InvalidOwningSource { .. }
+        ));
+        assert_eq!(
+            checking.errors[5].kind,
+            ExpressionCheckingErrorKind::MethodRequiresCall
+        );
+        assert_eq!(
+            checking.errors[6].kind,
+            ExpressionCheckingErrorKind::CopyRequiresCall
+        );
+        assert_eq!(
+            checking.errors[7].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 0,
+                found: 1,
+            }
+        );
+        assert_eq!(
+            checking.errors[8].kind,
+            ExpressionCheckingErrorKind::AssociatedFunctionRequiresType
+        );
+        assert_eq!(
+            checking.errors[9].kind,
+            ExpressionCheckingErrorKind::FieldRequiresValue
+        );
+        assert_eq!(
+            checking.errors[10].kind,
+            ExpressionCheckingErrorKind::MethodRequiresValue
+        );
+    }
+
+    #[test]
+    fn reuses_gc_references_stored_in_named_fields() {
+        let source = concat!(
+            "struct Item {}\n",
+            "struct Holder { item: &Item, }\n",
+            "fn inspect(item: &Item) {\n",
+            "    const holder = Holder { item: item };\n",
+            "    const read = holder.item;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty());
+        let inspect = function(&program.declarations[2]);
+        let holder = binding_initializer(&inspect.body.statements[0]);
+        let ExpressionKind::StructConstruction { fields, .. } = &holder.kind else {
+            panic!("expected holder construction")
+        };
+        assert_eq!(
+            checking.transfers[&fields[0].value.id],
+            ValueTransfer::ReuseGarbageCollected
+        );
+        let read = binding_initializer(&inspect.body.statements[1]);
+        assert_eq!(
+            checking.expressions[&read.id].category,
+            ValueCategory::GarbageCollectedReference
+        );
+    }
+
+    #[test]
+    fn checks_method_receiver_storage_and_capability() {
+        let source = concat!(
+            "struct Item {\n",
+            "    value: int,\n",
+            "    fn mutate(mut self) {}\n",
+            "    fn retained(&self) {}\n",
+            "}\n",
+            "fn bad(value: Item) {\n",
+            "    value.value = 1;\n",
+            "    value.mutate();\n",
+            "    value.retained();\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 3);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ImmutableValue
+        );
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::ReceiverCapabilityMismatch
+        );
+        assert_eq!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::ReceiverStorageMismatch
+        );
+    }
+
+    #[test]
+    fn checks_method_arguments_after_receiver_selection() {
+        let source = concat!(
+            "struct Item { fn take(self, value: int) {} }\n",
+            "fn bad(item: Item) {\n",
+            "    item.take();\n",
+            "    item.take(1.0);\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 2);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 1,
+                found: 0,
+            }
+        );
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
     }
 }

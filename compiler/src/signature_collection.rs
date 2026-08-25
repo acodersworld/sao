@@ -90,6 +90,9 @@ pub struct StructMemberSignature {
 pub struct StructSignature {
     pub type_id: TypeId,
     members: HashMap<String, StructMemberSignature>,
+    /// Fields retain declaration order separately from hash-based lookup so
+    /// missing-field diagnostics never depend on map iteration order.
+    field_order: Vec<String>,
 }
 
 impl StructSignature {
@@ -101,6 +104,13 @@ impl StructSignature {
     #[must_use]
     pub const fn members(&self) -> &HashMap<String, StructMemberSignature> {
         &self.members
+    }
+
+    /// Field names in declaration order. Member lookup remains hash-based,
+    /// while construction diagnostics use this order deterministically.
+    #[must_use]
+    pub fn field_order(&self) -> &[String] {
+        &self.field_order
     }
 }
 
@@ -638,6 +648,7 @@ pub struct SignatureCollectionError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignatureCollectionErrorKind {
     DuplicateMember { name: String, first: Span },
+    ReservedCopyMember,
     MainMustHaveNoParameters { found: usize },
     MainMustReturnUnit,
 }
@@ -649,6 +660,11 @@ impl fmt::Display for SignatureCollectionError {
                 formatter,
                 "duplicate member `{name}` at {}..{}; first declared at {}..{}",
                 self.span.start, self.span.end, first.start, first.end
+            ),
+            SignatureCollectionErrorKind::ReservedCopyMember => write!(
+                formatter,
+                "`copy` is a compiler-provided member and cannot be declared at {}..{}",
+                self.span.start, self.span.end
             ),
             SignatureCollectionErrorKind::MainMustHaveNoParameters { found } => write!(
                 formatter,
@@ -783,6 +799,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     .expect("resolved interface declaration must have a type");
                 let mut requirements = HashMap::new();
                 for requirement in &interface.requirements {
+                    self.reject_reserved_copy(requirement.name);
                     let signature = self.collect_interface_requirement(requirement);
                     let method_id = self.intern_method(requirement.name, &signature);
                     let name = self.text(requirement.name).to_string();
@@ -810,10 +827,13 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             .type_for_declaration(structure.id)
             .expect("resolved struct declaration must have a type");
         let mut members = HashMap::new();
+        let mut field_order = Vec::new();
         for member in &structure.members {
             match member {
                 StructMember::Field(field) => {
                     let name = self.text(field.name).to_string();
+                    self.reject_reserved_copy(field.name);
+                    field_order.push(name.clone());
                     let entry = StructMemberSignature {
                         kind: StructMemberSignatureKind::Field(FieldSignature {
                             declaration: field.id,
@@ -824,6 +844,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     self.insert_struct_member(&mut members, name, entry);
                 }
                 StructMember::Function(function) => {
+                    self.reject_reserved_copy(function.name);
                     let signature = self.collect_function_header(function);
                     let kind = match self.context.callable_kind(function.id) {
                         Some(CallableKind::NamedStructMethod) => {
@@ -854,7 +875,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             }
         }
         self.named_structs
-            .insert(structure.id, StructSignature { type_id, members });
+            .insert(structure.id, StructSignature { type_id, members, field_order });
     }
 
     fn collect_function(&mut self, function: &Function) -> CallableSignature {
@@ -1133,10 +1154,13 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             .types_mut()
             .anonymous_struct(expression, AccessCapability::Const);
         let mut members = HashMap::new();
+        let mut field_order = Vec::new();
         for member in source_members {
             match member {
                 AnonymousStructMember::Field(field) => {
                     let name = self.text(field.name).to_string();
+                    self.reject_reserved_copy(field.name);
+                    field_order.push(name.clone());
                     let entry = StructMemberSignature {
                         kind: StructMemberSignatureKind::Field(FieldSignature {
                             declaration: field.id,
@@ -1151,6 +1175,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     self.visit_expression(&field.initializer);
                 }
                 AnonymousStructMember::Method(function) => {
+                    self.reject_reserved_copy(function.name);
                     let signature = self.collect_function_header(function);
                     let method_id = self.intern_method(function.name, &signature);
                     let name = self.text(function.name).to_string();
@@ -1170,7 +1195,16 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             }
         }
         self.anonymous_structs
-            .insert(expression, StructSignature { type_id, members });
+            .insert(expression, StructSignature { type_id, members, field_order });
+    }
+
+    /// Reserves `.copy()` for the compiler-defined recursive copy operation in
+    /// every user-defined member namespace, including aggregates whose full
+    /// expression checking remains a later increment.
+    fn reject_reserved_copy(&mut self, name: Span) {
+        if self.text(name) == "copy" {
+            self.error(SignatureCollectionErrorKind::ReservedCopyMember, name);
+        }
     }
 
     fn insert_struct_member(
@@ -1524,6 +1558,22 @@ mod tests {
             errors[5].kind,
             SignatureCollectionErrorKind::DuplicateMember { ref name, .. } if name == "field"
         ));
+        assert!(errors.windows(2).all(|pair| pair[0].span.start < pair[1].span.start));
+    }
+
+    #[test]
+    fn reserves_copy_across_user_member_namespaces() {
+        let (module, program, names, context, mut types) = prepare(concat!(
+            "struct Named { copy: int, }\n",
+            "interface View { fn copy(self); }\n",
+            "fn main() { const value = struct { fn copy(self) {} }; }\n",
+        ));
+        let errors = collect_signatures(&module, &program, &names, &context, &mut types)
+            .expect_err("reserved copy members should be rejected");
+        assert_eq!(errors.len(), 3);
+        assert!(errors.iter().all(|error| {
+            error.kind == SignatureCollectionErrorKind::ReservedCopyMember
+        }));
         assert!(errors.windows(2).all(|pair| pair[0].span.start < pair[1].span.start));
     }
 

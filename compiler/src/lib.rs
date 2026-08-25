@@ -39,7 +39,7 @@ struct Summary {
     next: Summary | none,
 
     fn new(name: string) -> Summary {
-        Summary { name: name, total: 0, next: none }
+        Summary { name: name + "", total: 0, next: none }
     }
 
     fn add(mut self, amount: int) -> int {
@@ -73,6 +73,7 @@ fn main() {
     const initial = 3;
     mut summary: Summary = Summary::new("language tour");
     const vmut shared_summary = summary;
+    const heap_summary = &Summary::new("shared");
     mut vconst stable_seed = initial;
 
     fn fibonacci(value: int) -> int {
@@ -149,7 +150,7 @@ fn main() {
     heap_formatter.format(text);
     heap_scale(initial);
     notify();
-    shared_summary.format("shared: ");
+    heap_summary.format("shared: ");
     capabilities.format("capabilities: ");
     queue.length();
     table.length();
