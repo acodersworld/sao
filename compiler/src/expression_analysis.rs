@@ -52,6 +52,60 @@ struct BlockOutcome {
     explicit_value: Option<NodeId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Describes how control leaves one statement. Blocks only continue through
+/// `Completes`; the other variants retain the reason so loop transfers can be
+/// associated with their resolved target while returns remain callable exits.
+enum StatementFlow {
+    Completes,
+    Returns,
+    Breaks(NodeId),
+    Continues(NodeId),
+    /// Evaluation never completes this statement normally and therefore cannot
+    /// proceed to the following statement. This is the conventional compiler
+    /// and type-theory meaning of "diverges" and corresponds to Rust's `!`
+    /// (never) type. An endless `loop {}` diverges; so does `loop { return; }`
+    /// as an expression, because the loop itself never produces a local result.
+    /// `Returns` is more specific: it records that this statement is the direct
+    /// return transferring control from the callable.
+    Diverges,
+}
+
+impl StatementFlow {
+    const fn can_complete_normally(self) -> bool {
+        matches!(self, Self::Completes)
+    }
+}
+
+#[derive(Debug, Clone)]
+/// One reachable way to leave a loop with a result. A valued break records its
+/// expression node, while a bare break or implicit natural completion has no
+/// expression node but still contributes unit and a post-path binding state.
+struct LoopResultPath {
+    value: Option<NodeId>,
+    span: Span,
+    typed: TypedExpression,
+    categories: HashMap<SymbolId, ValueCategory>,
+}
+
+#[derive(Debug, Clone)]
+/// Accumulates reachable transfers while one loop body is being analyzed.
+/// Context resolution supplies the target identity, so an inner loop cannot
+/// accidentally contribute a break or continue to an outer loop.
+struct ActiveLoop {
+    expression: NodeId,
+    expected_result_type: Option<TypeId>,
+    breaks: Vec<LoopResultPath>,
+    continues: Vec<HashMap<SymbolId, ValueCategory>>,
+}
+
+#[derive(Debug, Clone)]
+struct LoopIterationOutcome {
+    breaks: Vec<LoopResultPath>,
+    natural_categories: Option<HashMap<SymbolId, ValueCategory>>,
+    invalid: bool,
+}
+
 /// Records that an expression of one member type must be materialized as an
 /// explicitly expected union.
 ///
@@ -221,6 +275,7 @@ enum ExpressionCheckingErrorKind {
         expected: usize,
         found: usize,
     },
+    LoopElseRequired,
     ConditionalElseRequired,
     ConditionalBranchValueRequired,
     InvalidAssignmentTarget,
@@ -269,7 +324,7 @@ enum ExpressionCheckingErrorKind {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ExpressionChecking {
     expressions: HashMap<NodeId, TypedExpression>,
     explicit_values: HashMap<NodeId, bool>,
@@ -544,6 +599,13 @@ struct Analyzer<'semantic> {
     /// Flow-sensitive provenance of the storage currently denoted by each
     /// binding. Declared type and qualifiers remain in `checking.bindings`.
     current_binding_categories: HashMap<SymbolId, ValueCategory>,
+    /// Whether the expression currently being analyzed is reachable from the
+    /// beginning of its enclosing block. Unreachable syntax is still checked,
+    /// but its loop transfers cannot contribute runtime exits.
+    current_path_reachable: bool,
+    /// Loops whose bodies are currently being checked. Resolved transfer
+    /// targets select an entry here, so nested-loop breaks never leak outward.
+    active_loops: Vec<ActiveLoop>,
     checking: ExpressionChecking,
 }
 
@@ -655,6 +717,8 @@ impl<'semantic> Analyzer<'semantic> {
             aggregate_order,
             aggregate_layouts,
             current_binding_categories: HashMap::new(),
+            current_path_reachable: true,
+            active_loops: Vec::new(),
             checking: ExpressionChecking::default(),
         }
     }
@@ -683,6 +747,9 @@ impl<'semantic> Analyzer<'semantic> {
 
     fn visit_function(&mut self, function: &Function) {
         let enclosing_categories = self.current_binding_categories.clone();
+        let enclosing_reachability = self.current_path_reachable;
+        let enclosing_loops = std::mem::take(&mut self.active_loops);
+        self.current_path_reachable = true;
         self.seed_callable_parameters(function.id, &function.parameters);
         let return_type = self
             .signatures
@@ -691,6 +758,8 @@ impl<'semantic> Analyzer<'semantic> {
             .return_type;
         self.visit_callable_body(&function.body, return_type);
         self.current_binding_categories = enclosing_categories;
+        self.current_path_reachable = enclosing_reachability;
+        self.active_loops = enclosing_loops;
     }
 
     /// Makes a named function's or lambda's parameters available while checking
@@ -760,14 +829,17 @@ impl<'semantic> Analyzer<'semantic> {
             }
             (Some(value), true) => self.analyze_return_value(value, expected),
             (Some(value), false) => {
+                let enclosing_reachability = self.current_path_reachable;
+                self.current_path_reachable = false;
                 let _ = self.synthesize_discarded(value);
+                self.current_path_reachable = enclosing_reachability;
             }
             (None, true) => self.check_absent_value(expected, block.span),
             (None, false) => {}
         }
     }
 
-    fn visit_statement(&mut self, statement: &Statement) -> bool {
+    fn visit_statement(&mut self, statement: &Statement) -> StatementFlow {
         match &statement.kind {
             StatementKind::Binding {
                 qualifiers,
@@ -781,14 +853,25 @@ impl<'semantic> Analyzer<'semantic> {
                     type_annotation.as_ref().map(|syntax| syntax.id),
                     initializer,
                 );
-                source.map_or(true, |typed| !self.is_divergence(typed.type_id))
+                if source.is_some_and(|typed| self.is_divergence(typed.type_id)) {
+                    StatementFlow::Diverges
+                } else {
+                    StatementFlow::Completes
+                }
             }
-            StatementKind::Expression(expression) => self
-                .synthesize_discarded(expression)
-                .map_or(true, |typed| !self.is_divergence(typed.type_id)),
+            StatementKind::Expression(expression) => {
+                if self
+                    .synthesize_discarded(expression)
+                    .is_some_and(|typed| self.is_divergence(typed.type_id))
+                {
+                    StatementFlow::Diverges
+                } else {
+                    StatementFlow::Completes
+                }
+            }
             StatementKind::Function(function) => {
                 self.visit_function(function);
-                true
+                StatementFlow::Completes
             }
             StatementKind::Return(value) => {
                 let callable = self
@@ -805,23 +888,107 @@ impl<'semantic> Analyzer<'semantic> {
                 } else {
                     self.check_absent_value(expected, statement.span);
                 }
-                false
+                StatementFlow::Returns
             }
-            StatementKind::Defer(_)
-            | StatementKind::Coroutine(_)
-            | StatementKind::Break(_)
-            | StatementKind::Continue => true,
+            StatementKind::Break(value) => self.analyze_break(statement, value.as_ref()),
+            StatementKind::Continue => self.analyze_continue(statement),
+            StatementKind::Defer(_) | StatementKind::Coroutine(_) => StatementFlow::Completes,
         }
+    }
+
+    fn analyze_break(
+        &mut self,
+        statement: &Statement,
+        value: Option<&Expression>,
+    ) -> StatementFlow {
+        let target = self
+            .context
+            .loop_for_transfer(statement.id)
+            .expect("break statement must have a resolved loop target");
+        let active = self
+            .active_loops
+            .last()
+            .expect("break statement must be checked inside an active loop");
+        assert_eq!(
+            active.expression, target,
+            "resolved break target must be the innermost active loop"
+        );
+        let expected_result_type = active.expected_result_type;
+        let typed = match value {
+            Some(value) => match expected_result_type {
+                Some(expected_result_type) => self.check(value, expected_result_type),
+                None => self.synthesize(value),
+            },
+            None => Some(self.check_bare_break(statement, expected_result_type)),
+        };
+        let Some(typed) = typed else {
+            return StatementFlow::Breaks(target);
+        };
+        if self.is_divergence(typed.type_id) {
+            return StatementFlow::Diverges;
+        }
+        if self.current_path_reachable {
+            let categories = self.current_binding_categories.clone();
+            let active = self
+                .active_loops
+                .last_mut()
+                .expect("break statement must be checked inside an active loop");
+            assert_eq!(
+                active.expression, target,
+                "resolved break target must be the innermost active loop"
+            );
+            active.breaks.push(LoopResultPath {
+                value: value.map(|value| value.id),
+                span: value.map_or(statement.span, |value| value.span),
+                typed,
+                categories,
+            });
+        }
+        StatementFlow::Breaks(target)
+    }
+
+    fn check_bare_break(
+        &mut self,
+        statement: &Statement,
+        expected: Option<TypeId>,
+    ) -> TypedExpression {
+        let unit = self.fresh_primitive(PrimitiveType::Unit);
+        expected.map_or(unit, |expected| {
+            self.check_implicit_value(statement.id, statement.span, expected, unit)
+        })
+    }
+
+    fn analyze_continue(&mut self, statement: &Statement) -> StatementFlow {
+        let target = self
+            .context
+            .loop_for_transfer(statement.id)
+            .expect("continue statement must have a resolved loop target");
+        if self.current_path_reachable {
+            let categories = self.current_binding_categories.clone();
+            let active = self
+                .active_loops
+                .last_mut()
+                .expect("continue statement must be checked inside an active loop");
+            assert_eq!(
+                active.expression, target,
+                "resolved continue target must be the innermost active loop"
+            );
+            active.continues.push(categories);
+        }
+        StatementFlow::Continues(target)
     }
 
     /// Analyzes every statement in source order and reports whether sequential
     /// execution can reach the block's final expression or closing brace.
     fn visit_block_statements(&mut self, block: &Block) -> bool {
+        let enclosing_reachability = self.current_path_reachable;
         let mut can_reach_block_end = true;
         for statement in &block.statements {
-            let statement_can_complete = self.visit_statement(statement);
-            can_reach_block_end &= statement_can_complete;
+            self.current_path_reachable = enclosing_reachability && can_reach_block_end;
+            let flow = self.visit_statement(statement);
+            can_reach_block_end &= flow.can_complete_normally();
         }
+        self.current_path_reachable = enclosing_reachability;
         can_reach_block_end
     }
 
@@ -1000,7 +1167,10 @@ impl<'semantic> Analyzer<'semantic> {
 
         if !can_reach_block_end {
             if let Some(value) = &block.value {
+                let enclosing_reachability = self.current_path_reachable;
+                self.current_path_reachable = false;
                 let _ = self.synthesize_discarded(value);
+                self.current_path_reachable = enclosing_reachability;
             }
             return Some(BlockOutcome {
                 typed: TypedExpression {
@@ -1476,6 +1646,471 @@ impl<'semantic> Analyzer<'semantic> {
             .insert(expression.id, outcome.explicitly_produces_value);
     }
 
+    fn analyze_loop_expression(
+        &mut self,
+        expression: &Expression,
+        expected: Option<TypeId>,
+    ) -> Option<TypedExpression> {
+        let first_error = self.checking.errors.len();
+        let incoming_categories = self.current_binding_categories.clone();
+        let mut invalid = false;
+        let (iteration, else_branch, naturally_terminating) = match &expression.kind {
+            ExpressionKind::Loop { body } => (
+                self.analyze_loop_iterations(
+                    expression.id,
+                    expected,
+                    body,
+                    None,
+                    None,
+                    true,
+                )?,
+                None,
+                false,
+            ),
+            ExpressionKind::While {
+                condition,
+                body,
+                else_branch,
+            } => {
+                let bool_type = self
+                    .types
+                    .types_mut()
+                    .primitive(PrimitiveType::Bool, AccessCapability::Const);
+                let iteration = self.analyze_loop_iterations(
+                    expression.id,
+                    expected,
+                    body,
+                    Some((condition, bool_type)),
+                    None,
+                    true,
+                )?;
+                (
+                    iteration,
+                    else_branch.as_ref(),
+                    true,
+                )
+            }
+            ExpressionKind::RangeFor {
+                start,
+                end,
+                body,
+                else_branch,
+                ..
+            } => {
+                let int_type = self
+                    .types
+                    .types_mut()
+                    .primitive(PrimitiveType::Int, AccessCapability::Const);
+                let start = self.check(start, int_type)?;
+                invalid |= self.is_recovery(start.type_id);
+                let end = self.check(end, int_type)?;
+                invalid |= self.is_recovery(end.type_id);
+                let bounds_complete =
+                    !self.is_divergence(start.type_id) && !self.is_divergence(end.type_id);
+                let symbol = self
+                    .names
+                    .symbol_for_declaration(expression.id)
+                    .expect("range binding must have a semantic symbol");
+                let iteration = self.analyze_loop_iterations(
+                    expression.id,
+                    expected,
+                    body,
+                    None,
+                    Some((symbol, int_type)),
+                    bounds_complete,
+                )?;
+                (
+                    iteration,
+                    else_branch.as_ref(),
+                    true,
+                )
+            }
+            _ => unreachable!("loop analysis requires a loop expression"),
+        };
+
+        invalid |= iteration.invalid;
+        let mut paths = iteration.breaks;
+        let has_else = else_branch.is_some();
+        if naturally_terminating {
+            if let Some(natural_categories) = iteration.natural_categories {
+                self.current_binding_categories = natural_categories;
+                if let Some(else_branch) = else_branch {
+                    let outcome = self.analyze_block(
+                        else_branch,
+                        expected,
+                        ConditionalUse::Value,
+                        false,
+                    )?;
+                    let mut typed = outcome.typed;
+                    if let Some(expected) = expected
+                        && outcome.explicit_value.is_none()
+                        && !self.is_divergence(typed.type_id)
+                    {
+                        typed = self.check_implicit_value(
+                            else_branch.id,
+                            else_branch.span,
+                            expected,
+                            typed,
+                        );
+                    }
+                    if !self.is_divergence(typed.type_id) {
+                        invalid |= self.is_recovery(typed.type_id);
+                        paths.push(LoopResultPath {
+                            value: outcome.explicit_value,
+                            span: else_branch
+                                .value
+                                .as_deref()
+                                .map_or(else_branch.span, |value| value.span),
+                            typed,
+                            categories: self.current_binding_categories.clone(),
+                        });
+                    }
+                }
+            } else if let Some(else_branch) = else_branch {
+                let enclosing_reachability = self.current_path_reachable;
+                self.current_path_reachable = false;
+                let _ = self.analyze_block(
+                    else_branch,
+                    expected,
+                    ConditionalUse::Value,
+                    false,
+                );
+                self.current_path_reachable = enclosing_reachability;
+            }
+        }
+
+        let typed = self.finish_loop_result(
+            expression,
+            expected,
+            &mut paths,
+            naturally_terminating,
+            has_else,
+            invalid,
+        );
+        let completing_categories: Vec<_> = paths
+            .iter()
+            .filter(|path| !self.is_divergence(path.typed.type_id))
+            .map(|path| &path.categories)
+            .collect();
+        self.current_binding_categories =
+            self.merge_binding_categories(&incoming_categories, &completing_categories);
+        self.checking.expressions.insert(expression.id, typed);
+        self.checking.explicit_values.insert(expression.id, true);
+        self.checking.errors[first_error..]
+            .sort_by_key(|error| (error.span.start, error.span.end));
+        Some(typed)
+    }
+
+    /// Reanalyzes a loop iteration from progressively merged loop-head states
+    /// until binding provenance stops changing. Semantic facts from speculative
+    /// iterations are discarded, leaving only the stable analysis recorded.
+    fn analyze_loop_iterations(
+        &mut self,
+        expression: NodeId,
+        expected_result_type: Option<TypeId>,
+        body: &Block,
+        condition: Option<(&Expression, TypeId)>,
+        range_binding: Option<(SymbolId, TypeId)>,
+        header_can_complete: bool,
+    ) -> Option<LoopIterationOutcome> {
+        let base_categories = self.current_binding_categories.clone();
+        let baseline_checking = self.checking.clone();
+        let baseline_loops = self.active_loops.clone();
+        let enclosing_reachability = self.current_path_reachable;
+        let mut loop_head = base_categories.clone();
+
+        loop {
+            self.checking = baseline_checking.clone();
+            self.active_loops = baseline_loops.clone();
+            self.current_binding_categories = loop_head.clone();
+            self.current_path_reachable = enclosing_reachability;
+
+            let mut header_completes = header_can_complete;
+            let mut invalid = false;
+            if let Some((condition, bool_type)) = condition {
+                let checked = self.check(condition, bool_type)?;
+                invalid |= self.is_recovery(checked.type_id);
+                header_completes &= !self.is_divergence(checked.type_id);
+            }
+            if let Some((symbol, int_type)) = range_binding {
+                let qualifiers = BindingQualifiers::new(
+                    BindingMutability::Const,
+                    ValueCapability::Const,
+                );
+                self.checking.bindings.insert(
+                    symbol,
+                    BindingSemantics {
+                        type_id: int_type,
+                        qualifiers,
+                        category: ValueCategory::OwnedInlinePlace,
+                    },
+                );
+                self.current_binding_categories
+                    .insert(symbol, ValueCategory::OwnedInlinePlace);
+            }
+            let mut natural_categories = header_completes
+                .then(|| self.current_binding_categories.clone());
+            self.active_loops.push(ActiveLoop {
+                expression,
+                expected_result_type,
+                breaks: Vec::new(),
+                continues: Vec::new(),
+            });
+            self.current_path_reachable = enclosing_reachability && header_completes;
+            let body_completes = self.visit_loop_iteration_body(body);
+            let normal_state = (header_completes && body_completes)
+                .then(|| self.current_binding_categories.clone());
+            let active = self
+                .active_loops
+                .pop()
+                .expect("loop analysis must retain its active loop context");
+
+            let mut looping_states: Vec<_> = active.continues.iter().collect();
+            if let Some(normal_state) = &normal_state {
+                looping_states.push(normal_state);
+            }
+            let next_head = self.merge_binding_categories(&base_categories, &looping_states);
+            if next_head == loop_head {
+                if let Some((symbol, _)) = range_binding {
+                    if let Some(categories) = &mut natural_categories {
+                        categories.remove(&symbol);
+                    }
+                }
+                self.current_path_reachable = enclosing_reachability;
+                return Some(LoopIterationOutcome {
+                    breaks: active.breaks,
+                    natural_categories,
+                    invalid,
+                });
+            }
+            loop_head = next_head;
+        }
+    }
+
+    /// Checks an iteration body as discarded syntax. Its final expression is
+    /// evaluated on each iteration but never contributes the loop's result.
+    fn visit_loop_iteration_body(&mut self, body: &Block) -> bool {
+        let can_reach_value = self.visit_block_statements(body);
+        let Some(value) = &body.value else {
+            return can_reach_value;
+        };
+        let enclosing_reachability = self.current_path_reachable;
+        self.current_path_reachable &= can_reach_value;
+        let typed = self.synthesize_discarded(value);
+        self.current_path_reachable = enclosing_reachability;
+        can_reach_value && typed.map_or(true, |typed| !self.is_divergence(typed.type_id))
+    }
+
+    fn finish_loop_result(
+        &mut self,
+        expression: &Expression,
+        expected: Option<TypeId>,
+        paths: &mut Vec<LoopResultPath>,
+        naturally_terminating: bool,
+        has_else: bool,
+        mut invalid: bool,
+    ) -> TypedExpression {
+        let unit = self.fresh_primitive(PrimitiveType::Unit);
+        let mut comparable_paths = paths.len();
+        if naturally_terminating && !has_else {
+            let requires_else = expected.is_some_and(|expected| {
+                !self.is_recovery(expected)
+                    && !self
+                        .types
+                        .types()
+                        .has_same_shape(expected, unit.type_id)
+                        .expect("loop result types belong to the program type store")
+            }) || expected.is_none()
+                && paths.iter().any(|path| {
+                    !self.is_recovery(path.typed.type_id)
+                        && !self
+                            .types
+                            .types()
+                            .has_same_shape(path.typed.type_id, unit.type_id)
+                            .expect("loop result types belong to the program type store")
+                });
+            if requires_else {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::LoopElseRequired,
+                    span: expression.span,
+                });
+                invalid = true;
+            }
+            paths.push(LoopResultPath {
+                value: None,
+                span: expression.span,
+                typed: unit,
+                categories: self.current_binding_categories.clone(),
+            });
+            if !requires_else {
+                comparable_paths = paths.len();
+            }
+        }
+
+        invalid |= paths
+            .iter()
+            .any(|path| self.is_recovery(path.typed.type_id));
+        if paths.is_empty() {
+            return if invalid {
+                self.recovery_temporary()
+            } else {
+                TypedExpression {
+                    type_id: self.types.types().divergence(),
+                    category: ValueCategory::FreshTemporary,
+                }
+            };
+        }
+
+        let result_type = expected.unwrap_or_else(|| {
+            paths
+                .iter()
+                .find(|path| !self.is_recovery(path.typed.type_id))
+                .map_or(self.types.types().recovery(), |path| path.typed.type_id)
+        });
+        if expected.is_none() && !self.is_recovery(result_type) {
+            for path in paths[..comparable_paths].iter() {
+                if self.is_recovery(path.typed.type_id) {
+                    continue;
+                }
+                if !self
+                    .types
+                    .types()
+                    .has_same_shape(path.typed.type_id, result_type)
+                    .expect("loop result types belong to the program type store")
+                {
+                    self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::TypeMismatch {
+                            expected: result_type,
+                            found: path.typed.type_id,
+                        },
+                        span: path.span,
+                    });
+                    if let Some(value) = path.value {
+                        self.checking.expressions.insert(
+                            value,
+                            TypedExpression {
+                                type_id: self.types.types().recovery(),
+                                category: path.typed.category,
+                            },
+                        );
+                    }
+                    invalid = true;
+                }
+            }
+        }
+        if invalid || self.is_recovery(result_type) {
+            self.recovery_temporary()
+        } else {
+            self.merge_loop_values(result_type, paths)
+        }
+    }
+
+    fn merge_loop_values(
+        &mut self,
+        result_type: TypeId,
+        paths: &[LoopResultPath],
+    ) -> TypedExpression {
+        if paths.len() == 1 {
+            return paths[0].typed;
+        }
+        let semantic = self
+            .types
+            .types()
+            .get(result_type)
+            .expect("loop result type belongs to the program type store");
+        let category = if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+            for path in paths.iter().filter_map(|path| path.value) {
+                self.checking
+                    .transfers
+                    .insert(path, ValueTransfer::CopyGcReference);
+            }
+            ValueCategory::GcReference
+        } else if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
+            for path in paths.iter().filter_map(|path| path.value) {
+                self.checking
+                    .transfers
+                    .insert(path, ValueTransfer::TrivialCopy);
+            }
+            ValueCategory::FreshTemporary
+        } else {
+            let all_fresh = paths
+                .iter()
+                .all(|path| path.typed.category == ValueCategory::FreshTemporary);
+            for path in paths {
+                let Some(value) = path.value else {
+                    continue;
+                };
+                self.checking.transfers.insert(
+                    value,
+                    if path.typed.category == ValueCategory::FreshTemporary {
+                        ValueTransfer::MoveTemporary
+                    } else {
+                        ValueTransfer::Borrow
+                    },
+                );
+            }
+            if all_fresh {
+                ValueCategory::FreshTemporary
+            } else {
+                ValueCategory::BorrowedPlace
+            }
+        };
+        TypedExpression {
+            type_id: result_type,
+            category,
+        }
+    }
+
+    fn check_implicit_value(
+        &mut self,
+        node: NodeId,
+        span: Span,
+        expected: TypeId,
+        found: TypedExpression,
+    ) -> TypedExpression {
+        if self.is_recovery(expected) || self.is_recovery(found.type_id) {
+            return found;
+        }
+        if self
+            .types
+            .types()
+            .has_same_shape(found.type_id, expected)
+            .expect("implicit values belong to the program type store")
+        {
+            return found;
+        }
+        let union_member = match self.types.types().get(expected) {
+            Some(SemanticType::Union { members, .. }) => members.iter().copied().find(|member| {
+                self.types
+                    .types()
+                    .has_same_shape(found.type_id, *member)
+                    .expect("union members belong to the program type store")
+            }),
+            _ => None,
+        };
+        if let Some(member_type) = union_member {
+            self.checking.union_injections.insert(
+                node,
+                UnionInjection {
+                    member_type,
+                    union_type: expected,
+                },
+            );
+            return TypedExpression {
+                type_id: expected,
+                category: ValueCategory::FreshTemporary,
+            };
+        }
+        self.checking.errors.push(ExpressionCheckingError {
+            kind: ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            },
+            span,
+        });
+        self.recovery_temporary()
+    }
+
     fn synthesize(&mut self, expression: &Expression) -> Option<TypedExpression> {
         if let Some(typed) = self.checking.expressions.get(&expression.id).copied() {
             return Some(typed);
@@ -1508,6 +2143,11 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::If { .. } => {
                 self.synthesize_conditional_expression(expression, ConditionalUse::Value)?
                     .typed
+            }
+            ExpressionKind::Loop { .. }
+            | ExpressionKind::While { .. }
+            | ExpressionKind::RangeFor { .. } => {
+                self.analyze_loop_expression(expression, None)?
             }
             ExpressionKind::Lambda {
                 parameters, body, ..
@@ -1586,9 +2226,14 @@ impl<'semantic> Analyzer<'semantic> {
 
         let first_body_error = self.checking.errors.len();
         let enclosing_categories = self.current_binding_categories.clone();
+        let enclosing_reachability = self.current_path_reachable;
+        let enclosing_loops = std::mem::take(&mut self.active_loops);
+        self.current_path_reachable = true;
         self.seed_callable_parameters(expression.id, parameters);
         self.visit_callable_body(body, signature.return_type);
         self.current_binding_categories = enclosing_categories;
+        self.current_path_reachable = enclosing_reachability;
+        self.active_loops = enclosing_loops;
         if self.checking.errors.len() != first_body_error {
             return Some(self.recovery_temporary());
         }
@@ -1868,6 +2513,15 @@ impl<'semantic> Analyzer<'semantic> {
                     allow_recursive_copy,
                 )
                 .map(|outcome| outcome.typed);
+        }
+        if matches!(
+            &expression.kind,
+            ExpressionKind::Loop { .. }
+                | ExpressionKind::While { .. }
+                | ExpressionKind::RangeFor { .. }
+        ) && !self.checking.expressions.contains_key(&expression.id)
+        {
+            return self.analyze_loop_expression(expression, Some(expected));
         }
         if let ExpressionKind::Group(inner) = &expression.kind
             && !self.checking.expressions.contains_key(&expression.id)
@@ -6738,6 +7392,302 @@ mod tests {
             checking.interface_conversions[&borrowed.id].backing_transfer,
             ValueTransfer::Borrow
         );
+    }
+
+    #[test]
+    fn checks_loop_results_range_bindings_and_control_flow() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const selected = loop {\n",
+            "        if true { break 1; }\n",
+            "        continue;\n",
+            "    };\n",
+            "    while true { break; } else {};\n",
+            "    for index in 0..=3 { index; break; } else {};\n",
+            "    selected;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let main = function(&program.declarations[0]);
+        let selected = binding_initializer(&main.body.statements[0]);
+        assert!(matches!(
+            types.types().get(checking.expressions[&selected.id].type_id),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                ..
+            })
+        ));
+        let ExpressionKind::Loop { body } = &selected.kind else {
+            panic!("expected value-producing loop")
+        };
+        let conditional = expression(&body.statements[0]);
+        let ExpressionKind::If { then_branch, .. } = &conditional.kind else {
+            panic!("expected conditional break")
+        };
+        let StatementKind::Break(Some(value)) = &then_branch.statements[0].kind else {
+            panic!("expected valued break")
+        };
+        assert_eq!(
+            checking.transfers.get(&value.id),
+            None,
+            "a sole result path preserves its category without a merge transfer"
+        );
+
+        let range = expression(&main.body.statements[2]);
+        let ExpressionKind::RangeFor { body, .. } = &range.kind else {
+            panic!("expected range loop")
+        };
+        let symbol = names
+            .symbol_for_declaration(range.id)
+            .expect("range binding should resolve");
+        let binding = checking.bindings[&symbol];
+        assert_eq!(binding.qualifiers.binding, BindingMutability::Const);
+        assert_eq!(binding.qualifiers.value, ValueCapability::Const);
+        let index = expression(&body.statements[0]);
+        assert_eq!(
+            checking.places[&index.id].binding_mutability,
+            Some(BindingMutability::Const)
+        );
+    }
+
+    #[test]
+    fn diagnoses_loop_else_and_result_mismatches_without_cascades() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const missing = while true { break 1; };\n",
+            "    const mixed = loop { if true { break 1; } break 2.0; };\n",
+            "    const annotated: int = loop { break 3.0; };\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 3, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::LoopElseRequired
+        );
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        let main = function(&program.declarations[0]);
+        for statement in &main.body.statements {
+            assert!(matches!(
+                types
+                    .types()
+                    .get(checking.expressions[&binding_initializer(statement).id].type_id),
+                Some(SemanticType::Recovery)
+            ));
+        }
+    }
+
+    #[test]
+    fn records_union_plain_and_gc_loop_result_transfers() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn main() {\n",
+            "    const number: int | float = loop {\n",
+            "        if true { break 1; }\n",
+            "        break 2.0;\n",
+            "    };\n",
+            "    const original = Item {};\n",
+            "    const plain = loop {\n",
+            "        if true { break Item {}; }\n",
+            "        break original;\n",
+            "    };\n",
+            "    const first = &Item {};\n",
+            "    const second = &Item {};\n",
+            "    const shared: &Item = loop {\n",
+            "        if true { break first; }\n",
+            "        break second;\n",
+            "    };\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let main = function(&program.declarations[1]);
+
+        let number = binding_initializer(&main.body.statements[0]);
+        let ExpressionKind::Loop { body: number_body } = &number.kind else {
+            panic!("expected union loop")
+        };
+        let number_if = expression(&number_body.statements[0]);
+        let ExpressionKind::If { then_branch, .. } = &number_if.kind else {
+            panic!("expected union break conditional")
+        };
+        let StatementKind::Break(Some(integer)) = &then_branch.statements[0].kind else {
+            panic!("expected integer break")
+        };
+        let StatementKind::Break(Some(float)) = &number_body.statements[1].kind else {
+            panic!("expected float break")
+        };
+        assert!(checking.union_injections.contains_key(&integer.id));
+        assert!(checking.union_injections.contains_key(&float.id));
+
+        let plain = binding_initializer(&main.body.statements[2]);
+        assert_eq!(
+            checking.expressions[&plain.id].category,
+            ValueCategory::BorrowedPlace
+        );
+        let ExpressionKind::Loop { body: plain_body } = &plain.kind else {
+            panic!("expected plain loop")
+        };
+        let plain_if = expression(&plain_body.statements[0]);
+        let ExpressionKind::If { then_branch, .. } = &plain_if.kind else {
+            panic!("expected plain break conditional")
+        };
+        let StatementKind::Break(Some(fresh)) = &then_branch.statements[0].kind else {
+            panic!("expected fresh break")
+        };
+        let StatementKind::Break(Some(named)) = &plain_body.statements[1].kind else {
+            panic!("expected named break")
+        };
+        assert_eq!(checking.transfers[&fresh.id], ValueTransfer::MoveTemporary);
+        assert_eq!(checking.transfers[&named.id], ValueTransfer::Borrow);
+
+        let shared = binding_initializer(&main.body.statements[5]);
+        assert_eq!(checking.expressions[&shared.id].category, ValueCategory::GcReference);
+        let ExpressionKind::Loop { body: shared_body } = &shared.kind else {
+            panic!("expected GC loop")
+        };
+        let shared_if = expression(&shared_body.statements[0]);
+        let ExpressionKind::If { then_branch, .. } = &shared_if.kind else {
+            panic!("expected GC break conditional")
+        };
+        let StatementKind::Break(Some(first)) = &then_branch.statements[0].kind else {
+            panic!("expected first GC break")
+        };
+        let StatementKind::Break(Some(second)) = &shared_body.statements[1].kind else {
+            panic!("expected second GC break")
+        };
+        assert_eq!(checking.transfers[&first.id], ValueTransfer::CopyGcReference);
+        assert_eq!(checking.transfers[&second.id], ValueTransfer::CopyGcReference);
+    }
+
+    #[test]
+    fn excludes_unreachable_and_nested_breaks_from_the_wrong_loop() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const direct = loop { break 1; break 2.0; };\n",
+            "    const nested = loop {\n",
+            "        while true { break; } else { break 2; }\n",
+            "    };\n",
+            "    direct; nested;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let main = function(&program.declarations[0]);
+        for index in 0..2 {
+            let loop_expression = binding_initializer(&main.body.statements[index]);
+            assert!(matches!(
+                types.types().get(checking.expressions[&loop_expression.id].type_id),
+                Some(SemanticType::Primitive {
+                    primitive: PrimitiveType::Int,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn reaches_a_fixed_point_for_loop_binding_provenance() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn main(mut borrowed: Item) {\n",
+            "    mut x = Item {};\n",
+            "    mut y = Item {};\n",
+            "    while true {\n",
+            "        x = y;\n",
+            "        y = borrowed;\n",
+            "        continue;\n",
+            "    };\n",
+            "    x;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let main = function(&program.declarations[1]);
+        let x = expression(&main.body.statements[3]);
+        assert_eq!(
+            checking.expressions[&x.id].category,
+            ValueCategory::BorrowedPlace
+        );
+    }
+
+    #[test]
+    fn rejects_assignment_to_the_range_binding() {
+        let source = "fn main() { for index in 0..3 { index = 0; } }";
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ImmutableBinding
+        );
+    }
+
+    #[test]
+    fn propagates_loop_divergence_into_callable_completion() {
+        let source = concat!(
+            "fn spins() -> int { loop {} }\n",
+            "fn returns() -> int { loop { return 1; } }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        for declaration in &program.declarations[..2] {
+            let function = function(declaration);
+            let value = function
+                .body
+                .value
+                .as_deref()
+                .expect("callable should end with a loop");
+            assert!(matches!(
+                types.types().get(checking.expressions[&value.id].type_id),
+                Some(SemanticType::Divergence)
+            ));
+        }
+    }
+
+    #[test]
+    fn reports_loop_headers_left_to_right_and_checks_unreachable_bodies() {
+        let source = concat!(
+            "fn main() {\n",
+            "    while 0 { 9223372036854775808; } else {};\n",
+            "    for index in 0.0..false {};\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 4, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::IntegerLiteralOutOfRange
+        );
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
     }
 
     #[test]

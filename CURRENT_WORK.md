@@ -120,11 +120,13 @@ reviewable phases:
      and compiler-provided `.copy()`.
    - Authoritative capturing-callable escape validation remains in post-type
      semantic analysis.
-6. Type algebra and flow (next)
-   - Implement union and intersection assignability, contextual conversions,
-     branch and loop result typing, type tests, and flow-sensitive narrowing.
-   - Cover value-producing loops, including range-binding typing and
-     mutability, and explicitly expected union types.
+6. Type algebra and flow (in progress)
+   - Complete: `loop`, `while`, and integer range `for` expressions, including
+     resolved `break` and `continue`, result typing, `else`, divergence,
+     range-binding typing and mutability, expected unions, transfers, and
+     flow-sensitive binding-provenance merging.
+   - Next: general union and intersection assignability, contextual
+     conversions, type tests, and flow-sensitive narrowing.
 7. Built-ins and completion
    - Check strings, bytes, indexing and index-place mutability, slicing,
      primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`,
