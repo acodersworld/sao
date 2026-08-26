@@ -19,8 +19,9 @@ Initial collector rules:
   points.
 - Values explicitly qualified with `&`, coroutine objects, and activation
   frames are traced heap objects. Frame metadata traces GC references contained
-  by inline locals and hidden roots retained for GC-derived borrows. Queues and
-  queued values follow their source-level plain or `&` storage qualification.
+  by inline locals and follows borrowed object views using their universal
+  storage attributes. Queues and queued values follow their source-level plain
+  or `&` storage qualification.
 - Reference cycles are collected naturally.
 - The first implementation has no user-defined destructors, finalizers, weak
   references, generational collection, or incremental collection.
@@ -72,16 +73,33 @@ internal representation without changing SAO semantics.
 
 ## 13.3 Concrete value representations
 
-Every garbage-collected allocation begins with a common object header. The
-object pointer addresses the start of this header, whose first word is the
-vtable pointer:
+Every object that can be reached through a borrow or interface exposes common
+runtime attributes containing its concrete type/vtable and whether its storage
+is inline or garbage collected. The attributes also contain a traversal mark,
+preferably the most recent collection epoch, so cycles involving inline and GC
+objects do not cause repeated traversal. The backend may place these attributes
+in an object prefix, a sidecar descriptor, or an equivalent tagged
+representation; their exact encoding is not part of typed IR.
+
+When tracing reaches an object, it first compares and updates the traversal
+mark. An object already visited during the current collection is not traversed
+again. Otherwise its storage attribute selects the ownership behavior:
+
+- An inline object is marked as visited and traversed through its generated
+  tracing function, but it is never considered for reclamation.
+- A garbage-collected object is marked as visited and retained from sweeping,
+  then traversed through the same concrete-type tracing function.
+
+Every garbage-collected allocation additionally participates in the collector's
+allocation list and carries its size. One possible layout is:
 
 ```text
 +-------------------+
 | vtable pointer    |
+| storage kind: GC  |
+| traversal epoch   |
 | next GC object    |
 | allocation size   |
-| mark state        |
 +-------------------+
 ```
 
@@ -119,10 +137,12 @@ including for empty and full slices; prefix `&` may move that result into GC
 storage.
 
 A plain struct value is stored inline in its frame, containing aggregate, or
-caller-provided result slot. An `&Struct` is a stable pointer to a GC allocation
-whose common header is followed by those same inline fields in declaration
-order, with backend-required padding. Anonymous structs place copied hidden
-captures after their declared fields. Plain values do not carry a GC header.
+caller-provided result slot and exposes equivalent universal attributes with an
+inline storage kind. An `&Struct` is a stable pointer to a GC allocation whose
+common header is followed by those same fields in declaration order, with
+backend-required padding. Anonymous structs place copied hidden captures after
+their declared fields. Plain values do not carry GC allocation-list or mark
+bookkeeping.
 
 A plain callable is a non-escaping code-and-environment view. Its environment is
 owned inline by the creating frame. `&fn(...)` places the callable environment
@@ -131,7 +151,10 @@ null environment pointer and allocate no environment. Code pointers are never
 GC references.
 
 A plain interface or intersection is a non-escaping pair containing a borrowed
-object address and dispatch/type metadata, so it can view inline storage.
+object address and dispatch/type metadata, so it can view inline or GC storage.
+Frame tracing follows the address and uses the object's universal storage kind
+to decide whether the visited object participates in sweeping. Both inline and
+GC-backed objects are marked during traversal so cycles terminate.
 `&Interface` uses a GC-backed concrete object whose header supplies its vtable;
 it may use a compact one-pointer representation. Anonymous interface objects
 are compiler-generated structs following the same qualification rules.

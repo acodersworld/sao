@@ -96,7 +96,7 @@ reviewable phases:
      conversions, GC allocation, blocks, conditionals, returns, and ordinary
      bindings.
    - Record fresh-temporary, owned-inline, borrowed-place, and GC-reference
-     categories plus moves, implicit return copies, and hidden GC-owner roots.
+     categories plus moves, implicit return copies, and object traversal metadata.
    - Do not synthesize unions when result paths disagree.
 4. Places and mutability
    - Model writable locations separately from ordinary values while retaining
@@ -139,8 +139,8 @@ the current phase and its focused tests have been reviewed.
    - Record the Error-propagation, coroutine-call, and deferred-call metadata
      required by lowering, and emit a typed program representation.
    - Run per-function escape analysis after capture discovery. Reject borrowed
-     values reaching retained positions and record frame tracing, hidden roots,
-     recursive copies, and cleanup requirements for typed IR.
+     values reaching retained positions and record frame tracing, borrowed-view
+     traversal, recursive copies, and cleanup requirements for typed IR.
 
 ## Later compiler work
 
@@ -153,7 +153,7 @@ After semantic analysis, the remaining compiler work includes:
   runtime prototype with the designed frame, value, object, queue, and
   garbage-collection models. Lowering must use caller-owned result slots for
   plain aggregates, inline frame/object layouts, GC payload moves for prefix
-  `&`, recursive tracing, hidden borrow-owner roots, and runtime-only cleanup
+  `&`, universal object storage attributes, recursive tracing, and runtime-only cleanup
   for frame-owned auxiliary storage.
 
 Deferred features are recorded in `design/14-deferred-features.md` and summarized

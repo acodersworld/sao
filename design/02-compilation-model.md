@@ -18,9 +18,9 @@ source
 Semantic analysis is internally staged as name and scope resolution, contextual
 validation, type checking and inference, and post-type analyses such as capture
 and per-function escape analysis. Escape analysis consumes typed value-category
-and capture metadata and records hidden GC-owner roots before typed IR is
-emitted. Each validation rule belongs to the earliest stage with enough
-information to decide it; validation is not a separate catch-all pass.
+and capture metadata before typed IR is emitted. Each validation rule belongs
+to the earliest stage with enough information to decide it; validation is not a
+separate catch-all pass.
 
 The IR should belong to SAO rather than mirror C. This leaves room for an
 interpreter or a Cranelift JIT/AOT backend in the future:

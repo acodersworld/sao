@@ -26,7 +26,7 @@ mod tests {
 
     static COMPLEX_PROGRAM: &str = r#"
 interface Formatter {
-    fn format(&self, prefix: string) -> string;
+    fn format(self, prefix: string) -> string;
 }
 
 interface Accumulator {
@@ -36,7 +36,7 @@ interface Accumulator {
 struct Summary {
     name: string,
     total: int,
-    next: Summary | none,
+    next: &Summary | none,
 
     fn new(name: string) -> Summary {
         Summary { name: name + "", total: 0, next: none }
@@ -97,20 +97,25 @@ fn main() {
         announce(initial);
     };
 
-    const formatter: Formatter = struct {
+    const vmut formatter_implementation = struct {
         prefix: string = "total: ";
         offset = initial;
 
         fn format(self, suffix: string) -> string {
-            self.prefix + suffix + string(self.offset)
+            self.prefix + suffix
+        }
+
+        fn add(mut self, amount: int) -> int {
+            self.offset + amount
         }
     };
+    const formatter: Formatter = formatter_implementation;
     const heap_formatter: &Formatter = &struct {
         fn format(self, value: string) -> string {
             value
         }
     };
-    const capabilities: Formatter & Accumulator = formatter;
+    const vmut capabilities: Formatter & Accumulator = formatter_implementation;
     const optional: int | none = none;
 
     const queue: Queue<int> = Queue<int>::new();

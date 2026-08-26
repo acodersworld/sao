@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
-        AnonymousStructMember, AssignmentOperator, BinaryOperator, BindingMutability,
+        AnonymousStructMember, AssignmentOperator, BinaryOperator, BindingMutability, BuiltinType,
         BindingQualifiers, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
         Function, FunctionParameter, FunctionParameterKind, LiteralKind, NodeId, PrimitiveType,
         Program, ReceiverStorage, Statement, StatementKind, StructFieldInitializer, StructMember,
@@ -26,7 +26,8 @@ use crate::{
         ValueTransfer,
     },
     signature_collection::{
-        MethodId, ReceiverSignature, SignatureCollection, StructMemberSignatureKind,
+        InterfaceRequirementSignature, MethodId, ReceiverSignature, SignatureCollection,
+        StructMemberSignatureKind, StructSignature,
     },
     source::{SourceModule, Span},
     symbol_table::{SymbolId, SymbolKind},
@@ -67,6 +68,23 @@ struct BlockOutcome {
 struct UnionInjection {
     member_type: TypeId,
     union_type: TypeId,
+}
+
+/// Describes a structural conversion from a concrete struct to an erased
+/// interface view. Lowering uses the matched method identities to select the
+/// concrete vtable and the backing transfer to keep the viewed object alive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InterfaceConversion {
+    source_type: TypeId,
+    destination_type: TypeId,
+    methods: Vec<MethodId>,
+    backing_transfer: ValueTransfer,
+}
+
+#[derive(Debug, Clone)]
+struct RequiredInterfaceMethod {
+    name: String,
+    requirement: InterfaceRequirementSignature,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +156,11 @@ enum ResolvedMember {
     /// A method invoked directly through a value. Methods are never emitted as
     /// first-class bound callable values.
     Method { declaration: NodeId, method_id: MethodId },
+    /// A structurally selected requirement invoked through interface dispatch.
+    InterfaceMethod {
+        declaration: NodeId,
+        method_id: MethodId,
+    },
     /// The compiler-provided recursive copy operation and its source type.
     Copy { source_type: TypeId },
 }
@@ -214,6 +237,17 @@ enum ExpressionCheckingErrorKind {
     CopyRequiresValue,
     ReceiverStorageMismatch,
     ReceiverCapabilityMismatch,
+    MissingInterfaceMethod { declaration: NodeId },
+    IncompatibleInterfaceMethod {
+        requirement: NodeId,
+        implementation: NodeId,
+    },
+    ConflictingInterfaceRequirement {
+        first: NodeId,
+        second: NodeId,
+    },
+    InterfaceRequiresGarbageCollectedSource,
+    InfiniteInlineLayout { owner: TypeId },
 }
 
 #[derive(Debug, Default)]
@@ -223,6 +257,10 @@ struct ExpressionChecking {
     bindings: HashMap<SymbolId, BindingSemantics>,
     transfers: HashMap<NodeId, ValueTransfer>,
     union_injections: HashMap<NodeId, UnionInjection>,
+    interface_conversions: HashMap<NodeId, InterfaceConversion>,
+    /// Final semantic types of anonymous fields, including types inferred from
+    /// their initializers after signature collection.
+    anonymous_field_types: HashMap<NodeId, TypeId>,
     lambda_captures: HashMap<NodeId, Vec<LambdaCapture>>,
     /// Assignable roots and fields, including the access capability that
     /// controls rebinding or mutation through each place.
@@ -452,6 +490,19 @@ impl LexicalIndex {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LayoutField {
+    declaration: NodeId,
+    span: Span,
+    type_id: TypeId,
+}
+
+#[derive(Debug, Clone)]
+struct AggregateLayout {
+    type_id: TypeId,
+    fields: Vec<LayoutField>,
+}
+
 struct Analyzer<'semantic> {
     module: &'semantic SourceModule,
     names: &'semantic NameResolution,
@@ -465,6 +516,10 @@ struct Analyzer<'semantic> {
     callable_parents: HashMap<NodeId, Option<NodeId>>,
     symbol_owners: HashMap<SymbolId, NodeId>,
     receiver_qualifiers: HashMap<NodeId, BindingQualifiers>,
+    /// Aggregate declarations and expressions in source discovery order. The
+    /// order is retained so recursive-layout diagnostics are deterministic.
+    aggregate_order: Vec<NodeId>,
+    aggregate_layouts: HashMap<NodeId, AggregateLayout>,
     /// Flow-sensitive provenance of the storage currently denoted by each
     /// binding. Declared type and qualifiers remain in `checking.bindings`.
     current_binding_categories: HashMap<SymbolId, ValueCategory>,
@@ -505,6 +560,8 @@ impl<'semantic> Analyzer<'semantic> {
         } = LexicalIndex::build(program, names);
         let mut method_owners = HashMap::new();
         let mut named_struct_symbols = HashMap::new();
+        let mut aggregate_order = Vec::new();
+        let mut aggregate_layouts = HashMap::new();
         for declaration in &program.declarations {
             let Declaration::Struct(structure) = declaration else {
                 continue;
@@ -513,10 +570,45 @@ impl<'semantic> Analyzer<'semantic> {
                 .symbol_for_declaration(structure.id)
                 .expect("named struct must have a semantic symbol");
             named_struct_symbols.insert(symbol, structure.id);
-            let owner = signatures
+            let signature = signatures
                 .named_struct(structure.id)
-                .expect("named struct signature must have been collected")
-                .type_id;
+                .expect("named struct signature must have been collected");
+            let owner = signature.type_id;
+            let fields = structure
+                .members
+                .iter()
+                .filter_map(|member| {
+                    let StructMember::Field(field) = member else {
+                        return None;
+                    };
+                    let StructMemberSignatureKind::Field(field_signature) = signature
+                        .member(
+                            module
+                                .text(field.name)
+                                .expect("field span belongs to the source module"),
+                        )
+                        .expect("named field must have a collected signature")
+                        .kind
+                    else {
+                        unreachable!("named field must select a field signature")
+                    };
+                    Some(LayoutField {
+                        declaration: field.id,
+                        span: field.span,
+                        type_id: field_signature
+                            .type_id
+                            .expect("named fields always have declared types"),
+                    })
+                })
+                .collect();
+            aggregate_order.push(structure.id);
+            aggregate_layouts.insert(
+                structure.id,
+                AggregateLayout {
+                    type_id: owner,
+                    fields,
+                },
+            );
             for member in &structure.members {
                 if let StructMember::Function(function) = member
                     && signatures
@@ -539,6 +631,8 @@ impl<'semantic> Analyzer<'semantic> {
             callable_parents,
             symbol_owners,
             receiver_qualifiers,
+            aggregate_order,
+            aggregate_layouts,
             current_binding_categories: HashMap::new(),
             checking: ExpressionChecking::default(),
         }
@@ -548,6 +642,7 @@ impl<'semantic> Analyzer<'semantic> {
         for declaration in &program.declarations {
             self.visit_declaration(declaration);
         }
+        self.validate_finite_inline_layouts();
         self.checking
     }
 
@@ -1421,8 +1516,11 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::StructConstruction { fields, .. } => {
                 self.synthesize_named_struct_construction(expression, fields)?
             }
+            ExpressionKind::AnonymousStruct { members } => {
+                self.synthesize_anonymous_struct(expression, members)?
+            }
             ExpressionKind::MemberAccess { object, member } => {
-                self.synthesize_named_member_access(expression, object, *member)?
+                self.synthesize_member_access(expression, object, *member)?
             }
             ExpressionKind::AssociatedAccess { owner, member } => {
                 self.synthesize_named_associated_access(expression, owner, *member)?
@@ -1829,6 +1927,14 @@ impl<'semantic> Analyzer<'semantic> {
             }
             return Some(self.report_type_mismatch(expression, expected, found));
         }
+        if let Some(converted) = self.check_structural_interface_conversion(
+            expression,
+            expected,
+            found,
+            allow_recursive_copy,
+        ) {
+            return Some(converted);
+        }
         let union_member = match self.types.types().get(expected) {
             Some(SemanticType::Union { members, .. }) => members.iter().copied().find(|member| {
                 self.types
@@ -1890,6 +1996,224 @@ impl<'semantic> Analyzer<'semantic> {
         let recovered = TypedExpression {
             type_id: self.types.types().recovery(),
             category: found.category,
+        };
+        self.checking.expressions.insert(expression.id, recovered);
+        recovered
+    }
+
+    /// Converts a concrete named or anonymous struct into an explicitly
+    /// expected structural interface view. Returning `None` means ordinary
+    /// exact-shape or union checking should handle the pair instead.
+    fn check_structural_interface_conversion(
+        &mut self,
+        expression: &Expression,
+        expected: TypeId,
+        found: TypedExpression,
+        _allow_recursive_copy: bool,
+    ) -> Option<TypedExpression> {
+        let (interface_type, destination_capability, destination_is_gc) =
+            self.interface_destination(expected)?;
+        let Some((owner, source_capability, source_is_gc)) =
+            self.aggregate_parts(found.type_id)
+        else {
+            return None;
+        };
+        let requirements = match self.interface_requirements(interface_type) {
+            Ok(requirements) => requirements,
+            Err((first, second)) => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::ConflictingInterfaceRequirement {
+                        first,
+                        second,
+                    },
+                    span: expression.span,
+                });
+                return Some(self.recover_expression(expression, found.category));
+            }
+        };
+
+        let requires_gc_receiver = requirements.iter().any(|required| {
+            self.signatures
+                .method_signature(required.requirement.method_id)
+                .is_some_and(|signature| {
+                    signature.receiver.storage == ReceiverStorage::GarbageCollected
+                })
+        });
+        if (destination_is_gc || requires_gc_receiver) && !source_is_gc {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InterfaceRequiresGarbageCollectedSource,
+                span: expression.span,
+            });
+            return Some(self.recover_expression(expression, found.category));
+        }
+
+        if source_capability == AccessCapability::Const
+            && destination_capability == AccessCapability::Mut
+            && found.category != ValueCategory::FreshTemporary
+        {
+            return Some(self.report_type_mismatch(expression, expected, found));
+        }
+
+        let signature = self
+            .aggregate_signature(owner)
+            .expect("concrete interface source must have a struct signature")
+            .clone();
+        let mut matched = Vec::with_capacity(requirements.len());
+        let mut valid = true;
+        for required in &requirements {
+            let Some(implementation) = signature.member(&required.name).copied() else {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::MissingInterfaceMethod {
+                        declaration: required.requirement.declaration,
+                    },
+                    span: expression.span,
+                });
+                valid = false;
+                continue;
+            };
+            let (implementation_declaration, implementation_method) = match implementation.kind {
+                StructMemberSignatureKind::Method {
+                    declaration,
+                    method_id,
+                } => (declaration, Some(method_id)),
+                StructMemberSignatureKind::Field(field) => (field.declaration, None),
+                StructMemberSignatureKind::AssociatedFunction { declaration } => {
+                    (declaration, None)
+                }
+            };
+            if implementation_method != Some(required.requirement.method_id) {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::IncompatibleInterfaceMethod {
+                        requirement: required.requirement.declaration,
+                        implementation: implementation_declaration,
+                    },
+                    span: implementation.span,
+                });
+                valid = false;
+                continue;
+            }
+            matched.push(required.requirement.method_id);
+        }
+        if !valid {
+            return Some(self.recover_expression(expression, found.category));
+        }
+
+        let (category, backing_transfer) = if destination_is_gc {
+            (
+                ValueCategory::GarbageCollectedReference,
+                ValueTransfer::ReuseGarbageCollected,
+            )
+        } else if source_is_gc {
+            (
+                ValueCategory::BorrowedPlace,
+                ValueTransfer::Borrow,
+            )
+        } else if found.category == ValueCategory::FreshTemporary {
+            (
+                ValueCategory::BorrowedPlace,
+                ValueTransfer::MoveTemporary,
+            )
+        } else {
+            (ValueCategory::BorrowedPlace, ValueTransfer::Borrow)
+        };
+        self.checking.interface_conversions.insert(
+            expression.id,
+            InterfaceConversion {
+                source_type: found.type_id,
+                destination_type: expected,
+                methods: matched,
+                backing_transfer,
+            },
+        );
+        let converted = TypedExpression {
+            type_id: expected,
+            category,
+        };
+        self.checking.expressions.insert(expression.id, converted);
+        Some(converted)
+    }
+
+    /// Peels plain or GC-qualified interface destinations while preserving
+    /// the access capability enforced at the conversion boundary.
+    fn interface_destination(
+        &self,
+        type_id: TypeId,
+    ) -> Option<(TypeId, AccessCapability, bool)> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Interface { capability, .. }
+            | SemanticType::Intersection { capability, .. } => {
+                Some((type_id, *capability, false))
+            }
+            SemanticType::GarbageCollected { target, capability }
+                if matches!(
+                    self.types.types().get(*target),
+                    Some(SemanticType::Interface { .. } | SemanticType::Intersection { .. })
+                ) => Some((*target, *capability, true)),
+            _ => None,
+        }
+    }
+
+    /// Flattens one interface or intersection into source-ordered requirements.
+    /// Identical repeated requirements are deduplicated; a repeated name with
+    /// a different method identity makes the intersection uncallable.
+    fn interface_requirements(
+        &self,
+        type_id: TypeId,
+    ) -> Result<Vec<RequiredInterfaceMethod>, (NodeId, NodeId)> {
+        let mut requirements = Vec::new();
+        let mut by_name: HashMap<String, InterfaceRequirementSignature> = HashMap::new();
+        self.collect_interface_requirements(type_id, &mut requirements, &mut by_name)?;
+        Ok(requirements)
+    }
+
+    fn collect_interface_requirements(
+        &self,
+        type_id: TypeId,
+        requirements: &mut Vec<RequiredInterfaceMethod>,
+        by_name: &mut HashMap<String, InterfaceRequirementSignature>,
+    ) -> Result<(), (NodeId, NodeId)> {
+        match self.types.types().get(type_id) {
+            Some(SemanticType::Interface { declaration, .. }) => {
+                let signature = self
+                    .signatures
+                    .interface(*declaration)
+                    .expect("interface signature must have been collected");
+                for name in signature.requirement_order() {
+                    let requirement = *signature
+                        .requirement(name)
+                        .expect("ordered interface requirement remains available");
+                    if let Some(previous) = by_name.get(name) {
+                        if previous.method_id != requirement.method_id {
+                            return Err((previous.declaration, requirement.declaration));
+                        }
+                        continue;
+                    }
+                    by_name.insert(name.clone(), requirement);
+                    requirements.push(RequiredInterfaceMethod {
+                        name: name.clone(),
+                        requirement,
+                    });
+                }
+                Ok(())
+            }
+            Some(SemanticType::Intersection { members, .. }) => {
+                for member in members {
+                    self.collect_interface_requirements(*member, requirements, by_name)?;
+                }
+                Ok(())
+            }
+            _ => unreachable!("interface destination contains only interface members"),
+        }
+    }
+
+    fn recover_expression(
+        &mut self,
+        expression: &Expression,
+        category: ValueCategory,
+    ) -> TypedExpression {
+        let recovered = TypedExpression {
+            type_id: self.types.types().recovery(),
+            category,
         };
         self.checking.expressions.insert(expression.id, recovered);
         recovered
@@ -2278,10 +2602,124 @@ impl<'semantic> Analyzer<'semantic> {
         })
     }
 
-    /// Synthesizes field access on a named struct and records the resulting
-    /// place. Methods and `.copy` deliberately fail here because they are only
-    /// meaningful when the member access is immediately used as a call callee.
-    fn synthesize_named_member_access(
+    /// Checks the fields and methods declared by one anonymous struct and
+    /// materializes its compiler-generated nominal type.
+    ///
+    /// Fields execute at construction time and are therefore analyzed in
+    /// source order. Methods are checked only after every inferred field type
+    /// is known, so a method may refer to a field declared later in the source.
+    fn synthesize_anonymous_struct(
+        &mut self,
+        expression: &Expression,
+        members: &[AnonymousStructMember],
+    ) -> Option<TypedExpression> {
+        let signature = self
+            .signatures
+            .anonymous_struct(expression.id)
+            .expect("anonymous struct signature must have been collected")
+            .clone();
+        let first_error = self.checking.errors.len();
+        let mut layout_fields = Vec::new();
+        let mut all_supported = true;
+
+        for member in members {
+            let AnonymousStructMember::Field(field) = member else {
+                continue;
+            };
+            let name = self
+                .module
+                .text(field.name)
+                .expect("anonymous field name belongs to the source module");
+            let field_signature = signature
+                .member(name)
+                .expect("anonymous field must have a collected signature");
+            let StructMemberSignatureKind::Field(field_signature) = field_signature.kind else {
+                unreachable!("anonymous field must select a field signature")
+            };
+            self.checking.resolved_members.insert(
+                field.id,
+                ResolvedMember::Field {
+                    declaration: field.id,
+                },
+            );
+
+            let checked = match field_signature.type_id {
+                Some(expected) => self.check(&field.initializer, expected),
+                None => self.synthesize(&field.initializer),
+            };
+            let Some(checked) = checked else {
+                all_supported = false;
+                let field_type = field_signature
+                    .type_id
+                    .unwrap_or_else(|| self.types.types().recovery());
+                self.checking
+                    .anonymous_field_types
+                    .insert(field.id, field_type);
+                layout_fields.push(LayoutField {
+                    declaration: field.id,
+                    span: field.span,
+                    type_id: field_type,
+                });
+                continue;
+            };
+            let field_type = if self.is_recovery(checked.type_id) {
+                checked.type_id
+            } else {
+                field_signature.type_id.unwrap_or(checked.type_id)
+            };
+            self.checking
+                .anonymous_field_types
+                .insert(field.id, field_type);
+            layout_fields.push(LayoutField {
+                declaration: field.id,
+                span: field.span,
+                type_id: field_type,
+            });
+            if !self.is_recovery(checked.type_id) {
+                self.validate_owning_transfer(&field.initializer, checked, true);
+            }
+        }
+
+        if !self.aggregate_layouts.contains_key(&expression.id) {
+            self.aggregate_order.push(expression.id);
+        }
+        self.aggregate_layouts.insert(
+            expression.id,
+            AggregateLayout {
+                type_id: signature.type_id,
+                fields: layout_fields,
+            },
+        );
+
+        for member in members {
+            let AnonymousStructMember::Method(method) = member else {
+                continue;
+            };
+            self.method_owners.insert(method.id, signature.type_id);
+            self.visit_function(method);
+        }
+
+        if !all_supported {
+            return None;
+        }
+        if self.checking.errors.len() != first_error {
+            return Some(self.recovery_temporary());
+        }
+        let type_id = self
+            .types
+            .types_mut()
+            .with_capability(signature.type_id, AccessCapability::Mut)
+            .expect("anonymous struct type belongs to the program type store");
+        Some(TypedExpression {
+            type_id,
+            category: ValueCategory::FreshTemporary,
+        })
+    }
+
+    /// Synthesizes field access on a named or anonymous struct and records the
+    /// resulting place. Concrete and interface methods, plus `.copy`, fail
+    /// here because they are meaningful only as an immediate call callee.
+    fn synthesize_member_access(
         &mut self,
         expression: &Expression,
         object: &Expression,
@@ -2292,8 +2730,34 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         }
         let Some((declaration, object_capability, is_gc)) =
-            self.named_struct_parts(typed_object.type_id)
+            self.aggregate_parts(typed_object.type_id)
         else {
+            if self.interface_destination(typed_object.type_id).is_some() {
+                let name = self
+                    .module
+                    .text(member)
+                    .expect("interface member name belongs to the source module");
+                match self.interface_requirement_named(typed_object.type_id, name) {
+                    Ok(Some(_)) => self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::MethodRequiresCall,
+                        span: member,
+                    }),
+                    Ok(None) => self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::UnknownMember,
+                        span: member,
+                    }),
+                    Err((first, second)) => {
+                        self.checking.errors.push(ExpressionCheckingError {
+                            kind: ExpressionCheckingErrorKind::ConflictingInterfaceRequirement {
+                                first,
+                                second,
+                            },
+                            span: member,
+                        });
+                    }
+                }
+                return Some(self.recovery_temporary());
+            }
             if self.member_owner_is_definitively_invalid(typed_object.type_id) {
                 self.checking.errors.push(ExpressionCheckingError {
                     kind: ExpressionCheckingErrorKind::InvalidMemberOwner {
@@ -2317,8 +2781,7 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         }
         let Some(selected) = self
-            .signatures
-            .named_struct(declaration)
+            .aggregate_signature(declaration)
             .and_then(|signature| signature.member(name))
             .copied()
         else {
@@ -2330,9 +2793,7 @@ impl<'semantic> Analyzer<'semantic> {
         };
         match selected.kind {
             StructMemberSignatureKind::Field(field) => {
-                let declared = field
-                    .type_id
-                    .expect("named struct fields always have declared types");
+                let declared = self.field_type(field.declaration, field.type_id);
                 let object_capability = if !is_gc
                     && typed_object.category == ValueCategory::FreshTemporary
                 {
@@ -2384,6 +2845,22 @@ impl<'semantic> Analyzer<'semantic> {
                 Some(self.recovery_temporary())
             }
         }
+    }
+
+    /// Selects one requirement by source member name after flattening and
+    /// validating an interface intersection.
+    fn interface_requirement_named(
+        &self,
+        type_id: TypeId,
+        name: &str,
+    ) -> Result<Option<RequiredInterfaceMethod>, (NodeId, NodeId)> {
+        let Some((interface, _, _)) = self.interface_destination(type_id) else {
+            return Ok(None);
+        };
+        Ok(self
+            .interface_requirements(interface)?
+            .into_iter()
+            .find(|required| required.name == name))
     }
 
     /// Selects a receiverless named-struct function through `Type::function`.
@@ -2461,20 +2938,26 @@ impl<'semantic> Analyzer<'semantic> {
         })
     }
 
-    /// Peels a plain or GC-qualified named struct into the information shared
-    /// by field and method lookup. The boolean distinguishes GC receivers so
-    /// receiver checking can enforce `self` versus `&self` storage.
-    fn named_struct_parts(&self, type_id: TypeId) -> Option<(NodeId, AccessCapability, bool)> {
+    /// Peels a plain or GC-qualified concrete struct into the information
+    /// shared by field, method, copy, and structural-interface checking. The
+    /// boolean distinguishes GC storage for receiver validation.
+    fn aggregate_parts(&self, type_id: TypeId) -> Option<(NodeId, AccessCapability, bool)> {
         match self.types.types().get(type_id)? {
             SemanticType::NamedStruct {
                 declaration,
                 capability,
+            }
+            | SemanticType::AnonymousStruct {
+                expression: declaration,
+                capability,
             } => Some((*declaration, *capability, false)),
             SemanticType::GarbageCollected { target, capability } => {
                 match self.types.types().get(*target)? {
-                    SemanticType::NamedStruct { declaration, .. } => {
-                        Some((*declaration, *capability, true))
-                    }
+                    SemanticType::NamedStruct { declaration, .. }
+                    | SemanticType::AnonymousStruct {
+                        expression: declaration,
+                        ..
+                    } => Some((*declaration, *capability, true)),
                     _ => None,
                 }
             }
@@ -2482,8 +2965,29 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
+    /// Finds the collected member table for either a source-named struct or a
+    /// compiler-named anonymous struct.
+    fn aggregate_signature(&self, owner: NodeId) -> Option<&StructSignature> {
+        self.signatures
+            .named_struct(owner)
+            .or_else(|| self.signatures.anonymous_struct(owner))
+    }
+
+    /// Completes a field signature by consulting expression-time inference for
+    /// anonymous fields that had no source annotation.
+    fn field_type(&self, declaration: NodeId, collected: Option<TypeId>) -> TypeId {
+        collected
+            .or_else(|| {
+                self.checking
+                    .anonymous_field_types
+                    .get(&declaration)
+                    .copied()
+            })
+            .expect("checked anonymous field must have an inferred type")
+    }
+
     /// Identifies owners that cannot gain a member family in a later increment.
-    /// Strings, bytes, built-ins, interfaces, and anonymous structs are omitted
+    /// Strings, bytes, built-ins, and interfaces are omitted
     /// because their member checking is intentionally still deferred.
     fn member_owner_is_definitively_invalid(&self, type_id: TypeId) -> bool {
         matches!(
@@ -2842,7 +3346,7 @@ impl<'semantic> Analyzer<'semantic> {
         callee: &Expression,
         arguments: &[Expression],
     ) -> Option<TypedExpression> {
-        if let Some(result) = self.synthesize_named_member_call(expression, callee, arguments) {
+        if let Some(result) = self.synthesize_member_call(expression, callee, arguments) {
             return result;
         }
         let typed_callee = self.synthesize(callee)?;
@@ -2891,11 +3395,11 @@ impl<'semantic> Analyzer<'semantic> {
         Some(self.call_result(return_type))
     }
 
-    /// Handles compiler-provided copies and named instance methods before an
+    /// Handles compiler-provided copies and concrete or interface methods before an
     /// ordinary call attempts to synthesize its callee as a first-class value.
     /// Returning `None` means the member is a field (possibly callable) or
     /// belongs to a member family deferred to a later increment.
-    fn synthesize_named_member_call(
+    fn synthesize_member_call(
         &mut self,
         call: &Expression,
         callee: &Expression,
@@ -2914,15 +3418,28 @@ impl<'semantic> Analyzer<'semantic> {
             }
             return Some(Some(self.recovery_temporary()));
         }
-        let Some((owner, object_capability, is_gc)) =
-            self.named_struct_parts(typed_object.type_id)
-        else {
-            return None;
-        };
+        let aggregate = self.aggregate_parts(typed_object.type_id);
         let name = self
             .module
             .text(*member)
-            .expect("member name belongs to the source module");
+            .expect("member name belongs to the source module")
+            .to_string();
+        if aggregate.is_none() {
+            if self.interface_destination(typed_object.type_id).is_some() {
+                return Some(self.synthesize_interface_method_call(
+                    call,
+                    callee,
+                    object,
+                    typed_object,
+                    *member,
+                    &name,
+                    arguments,
+                ));
+            }
+            return None;
+        }
+        let (owner, object_capability, is_gc) =
+            aggregate.expect("aggregate presence was checked");
         if name == "copy" {
             let valid_arity = arguments.is_empty();
             if !valid_arity {
@@ -2954,9 +3471,8 @@ impl<'semantic> Analyzer<'semantic> {
                 .transfers
                 .insert(object.id, ValueTransfer::RecursiveCopy);
             let plain = self
-                .signatures
-                .named_struct(owner)
-                .expect("copy owner has a named struct signature")
+                .aggregate_signature(owner)
+                .expect("copy owner has a struct signature")
                 .type_id;
             let type_id = self
                 .types
@@ -2970,9 +3486,8 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         let Some(selected) = self
-            .signatures
-            .named_struct(owner)
-            .and_then(|signature| signature.member(name))
+            .aggregate_signature(owner)
+            .and_then(|signature| signature.member(&name))
             .copied()
         else {
             self.checking.errors.push(ExpressionCheckingError {
@@ -3040,10 +3555,94 @@ impl<'semantic> Analyzer<'semantic> {
         Some(Some(self.call_result(signature.return_type)))
     }
 
+    /// Invokes one structurally selected interface requirement. The interface
+    /// type fixes the receiver shape; the runtime vtable supplies the concrete
+    /// receiver adapter recorded by the conversion that created the view.
+    fn synthesize_interface_method_call(
+        &mut self,
+        call: &Expression,
+        callee: &Expression,
+        object: &Expression,
+        typed_object: TypedExpression,
+        member: Span,
+        name: &str,
+        arguments: &[Expression],
+    ) -> Option<TypedExpression> {
+        let required = match self.interface_requirement_named(typed_object.type_id, name) {
+            Ok(Some(required)) => required,
+            Ok(None) => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::UnknownMember,
+                    span: member,
+                });
+                for argument in arguments {
+                    let _ = self.synthesize(argument);
+                }
+                return Some(self.recovery_temporary());
+            }
+            Err((first, second)) => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::ConflictingInterfaceRequirement {
+                        first,
+                        second,
+                    },
+                    span: member,
+                });
+                for argument in arguments {
+                    let _ = self.synthesize(argument);
+                }
+                return Some(self.recovery_temporary());
+            }
+        };
+        let signature = self
+            .signatures
+            .callable(required.requirement.declaration)
+            .expect("interface requirement signature must have been collected")
+            .clone();
+        let receiver = signature
+            .receiver
+            .expect("interface requirement must have a receiver");
+        let (_, object_capability, _) = self
+            .interface_destination(typed_object.type_id)
+            .expect("interface method receiver has an interface type");
+        let receiver_valid = if receiver.capability == AccessCapability::Mut
+            && object_capability == AccessCapability::Const
+        {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ReceiverCapabilityMismatch,
+                span: object.span,
+            });
+            false
+        } else {
+            true
+        };
+        let transfer = match receiver.storage {
+            ReceiverStorage::GarbageCollected => ValueTransfer::ReuseGarbageCollected,
+            ReceiverStorage::Plain => ValueTransfer::Borrow,
+        };
+        self.checking.transfers.insert(object.id, transfer);
+        self.checking.resolved_members.insert(
+            callee.id,
+            ResolvedMember::InterfaceMethod {
+                declaration: required.requirement.declaration,
+                method_id: required.requirement.method_id,
+            },
+        );
+        let arguments_valid = self.analyze_call_arguments(
+            call,
+            arguments,
+            &signature.parameters,
+        )?;
+        if !receiver_valid || !arguments_valid || self.is_recovery(signature.return_type) {
+            return Some(self.recovery_temporary());
+        }
+        Some(self.call_result(signature.return_type))
+    }
+
     /// Validates the hidden receiver supplied by a direct method call and
-    /// records how it is passed. Plain methods borrow; borrowing from a GC
-    /// object retains its hidden owner root; `&self` methods reuse the GC
-    /// reference. A fresh plain temporary may independently select mut access.
+    /// records how it is passed. Plain methods use `Borrow` regardless of the
+    /// object's storage class; `&self` methods reuse a GC reference. A fresh
+    /// plain temporary may independently select mut access.
     fn check_method_receiver(
         &mut self,
         object: &Expression,
@@ -3072,9 +3671,6 @@ impl<'semantic> Analyzer<'semantic> {
         if storage_valid && capability_valid {
             let transfer = match receiver.storage {
                 ReceiverStorage::GarbageCollected => ValueTransfer::ReuseGarbageCollected,
-                ReceiverStorage::Plain if is_gc => ValueTransfer::BorrowFromGarbageCollected {
-                    retain_hidden_owner_root: true,
-                },
                 ReceiverStorage::Plain => ValueTransfer::Borrow,
             };
             self.checking.transfers.insert(object.id, transfer);
@@ -3367,6 +3963,117 @@ impl<'semantic> Analyzer<'semantic> {
         (source.category, ValueTransfer::Borrow)
     }
 
+    /// Rejects aggregates whose inline fields recursively require storage for
+    /// the aggregate itself. GC references and external-buffer built-ins stop
+    /// traversal because their payloads are not embedded inline.
+    fn validate_finite_inline_layouts(&mut self) {
+        let mut edges: HashMap<NodeId, Vec<(NodeId, LayoutField)>> = HashMap::new();
+        for owner in &self.aggregate_order {
+            let Some(layout) = self.aggregate_layouts.get(owner) else {
+                continue;
+            };
+            let mut owner_edges = Vec::new();
+            for field in &layout.fields {
+                let mut dependencies = Vec::new();
+                self.inline_aggregate_dependencies(
+                    field.type_id,
+                    &mut dependencies,
+                    &mut HashSet::new(),
+                );
+                for dependency in dependencies {
+                    owner_edges.push((dependency, *field));
+                }
+            }
+            edges.insert(*owner, owner_edges);
+        }
+
+        for component in strongly_connected_components(&self.aggregate_order, &edges) {
+            let members: HashSet<NodeId> = component.iter().copied().collect();
+            let cyclic = component.len() > 1
+                || component.first().is_some_and(|owner| {
+                    edges
+                        .get(owner)
+                        .is_some_and(|outgoing| outgoing.iter().any(|(target, _)| target == owner))
+                });
+            if !cyclic {
+                continue;
+            }
+            let offending = self.aggregate_order.iter().find_map(|owner| {
+                if !members.contains(owner) {
+                    return None;
+                }
+                edges.get(owner).and_then(|outgoing| {
+                    outgoing
+                        .iter()
+                        .find(|(target, _)| members.contains(target))
+                        .map(|(_, field)| (*owner, *field))
+                })
+            });
+            let Some((owner, field)) = offending else {
+                continue;
+            };
+            let owner_type = self
+                .aggregate_layouts
+                .get(&owner)
+                .expect("cyclic aggregate remains in the layout table")
+                .type_id;
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InfiniteInlineLayout {
+                    owner: owner_type,
+                },
+                span: field.span,
+            });
+        }
+    }
+
+    fn inline_aggregate_dependencies(
+        &self,
+        type_id: TypeId,
+        dependencies: &mut Vec<NodeId>,
+        visited: &mut HashSet<TypeId>,
+    ) {
+        if !visited.insert(type_id) {
+            return;
+        }
+        match self.types.types().get(type_id) {
+            Some(SemanticType::NamedStruct { declaration, .. }) => {
+                if !dependencies.contains(declaration) {
+                    dependencies.push(*declaration);
+                }
+            }
+            Some(SemanticType::AnonymousStruct { expression, .. }) => {
+                if !dependencies.contains(expression) {
+                    dependencies.push(*expression);
+                }
+            }
+            Some(SemanticType::Union { members, .. }) => {
+                for member in members {
+                    self.inline_aggregate_dependencies(*member, dependencies, visited);
+                }
+            }
+            Some(SemanticType::Builtin {
+                builtin: BuiltinType::Error,
+                arguments,
+                ..
+            }) => {
+                for argument in arguments {
+                    self.inline_aggregate_dependencies(*argument, dependencies, visited);
+                }
+            }
+            Some(
+                SemanticType::GarbageCollected { .. }
+                | SemanticType::Primitive { .. }
+                | SemanticType::Callable { .. }
+                | SemanticType::Interface { .. }
+                | SemanticType::Intersection { .. }
+                | SemanticType::Builtin { .. }
+                | SemanticType::Recovery
+                | SemanticType::Divergence,
+            )
+            | None => {}
+        }
+    }
+
     fn argument_transfer(&self, source: TypedExpression) -> Option<ValueTransfer> {
         let semantic = self
             .types
@@ -3409,6 +4116,106 @@ fn push_unique_capture(
     if seen.insert(source) {
         captures.push(source);
     }
+}
+
+/// Partitions the inline aggregate-containment graph using Robert Tarjan's
+/// strongly connected components algorithm.
+///
+/// Robert Tarjan introduced this depth-first-search algorithm in 1972. A
+/// strongly connected component is a maximal group of graph nodes in which
+/// every node can reach every other node. Here, nodes are named or anonymous
+/// structs and an edge `A -> B` means that `A` contains `B` inline. A component
+/// containing multiple structs therefore describes mutually recursive inline
+/// storage; a one-node component is recursive only when it has a self-edge.
+/// Both shapes have infinite size and are rejected by layout validation.
+/// Edges do not cross GC references, so `next: &Node | none` does not make
+/// `Node` part of an inline cycle.
+///
+/// During one depth-first traversal, Tarjan's algorithm assigns each node a
+/// monotonically increasing discovery index and a `low_link`: the earliest
+/// discovery index reachable while remaining in the active search. Active
+/// nodes stay on `stack`, with `on_stack` providing constant-time membership
+/// checks. When a node's low-link equals its own discovery index, that node is
+/// the root of a complete component, so nodes are popped through that root and
+/// emitted together. This finds every component in linear time relative to the
+/// number of aggregate nodes and inline-containment edges.
+fn strongly_connected_components(
+    nodes: &[NodeId],
+    edges: &HashMap<NodeId, Vec<(NodeId, LayoutField)>>,
+) -> Vec<Vec<NodeId>> {
+    struct Tarjan {
+        next_index: usize,
+        indices: HashMap<NodeId, usize>,
+        low_links: HashMap<NodeId, usize>,
+        stack: Vec<NodeId>,
+        on_stack: HashSet<NodeId>,
+        components: Vec<Vec<NodeId>>,
+    }
+
+    fn visit(
+        node: NodeId,
+        node_set: &HashSet<NodeId>,
+        edges: &HashMap<NodeId, Vec<(NodeId, LayoutField)>>,
+        state: &mut Tarjan,
+    ) {
+        let index = state.next_index;
+        state.next_index += 1;
+        state.indices.insert(node, index);
+        state.low_links.insert(node, index);
+        state.stack.push(node);
+        state.on_stack.insert(node);
+
+        if let Some(outgoing) = edges.get(&node) {
+            for (target, _) in outgoing {
+                if !node_set.contains(target) {
+                    continue;
+                }
+                if !state.indices.contains_key(target) {
+                    visit(*target, node_set, edges, state);
+                    let target_low = state.low_links[target];
+                    let node_low = state.low_links[&node].min(target_low);
+                    state.low_links.insert(node, node_low);
+                } else if state.on_stack.contains(target) {
+                    let target_index = state.indices[target];
+                    let node_low = state.low_links[&node].min(target_index);
+                    state.low_links.insert(node, node_low);
+                }
+            }
+        }
+
+        if state.low_links[&node] != state.indices[&node] {
+            return;
+        }
+        let mut component = Vec::new();
+        loop {
+            let member = state
+                .stack
+                .pop()
+                .expect("strongly connected component root remains on the stack");
+            state.on_stack.remove(&member);
+            component.push(member);
+            if member == node {
+                break;
+            }
+        }
+        state.components.push(component);
+    }
+
+    let node_set: HashSet<NodeId> = nodes.iter().copied().collect();
+    let mut state = Tarjan {
+        next_index: 0,
+        indices: HashMap::new(),
+        low_links: HashMap::new(),
+        stack: Vec::new(),
+        on_stack: HashSet::new(),
+        components: Vec::new(),
+    };
+    for node in nodes {
+        if !state.indices.contains_key(node) {
+            visit(*node, &node_set, edges, &mut state);
+        }
+    }
+    state.components
 }
 
 fn collect_conditional_arms<'expression>(
@@ -5797,9 +6604,7 @@ mod tests {
         };
         assert_eq!(
             checking.transfers[&borrowed_object.id],
-            ValueTransfer::BorrowFromGarbageCollected {
-                retain_hidden_owner_root: true,
-            }
+            ValueTransfer::Borrow
         );
 
         let gc_read = binding_initializer(&inspect.body.statements[8]);
@@ -6019,5 +6824,255 @@ mod tests {
             checking.errors[1].kind,
             ExpressionCheckingErrorKind::TypeMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn checks_anonymous_fields_methods_and_copy() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const seed = 1;\n",
+            "    const vmut object = struct {\n",
+            "        count = seed;\n",
+            "        label: string = \"item\";\n",
+            "        fn read(self) -> int { self.count }\n",
+            "        fn captured(self) -> int { seed }\n",
+            "        fn shadow(self, seed: int) -> int { seed }\n",
+            "        fn add(mut self, amount: int) -> int {\n",
+            "            self.count += amount;\n",
+            "            self.count\n",
+            "        }\n",
+            "    };\n",
+            "    object.count = 2;\n",
+            "    object.add(3);\n",
+            "    const copied = object.copy();\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let main = function(&program.declarations[0]);
+        let anonymous = binding_initializer(&main.body.statements[1]);
+        let ExpressionKind::AnonymousStruct { members } = &anonymous.kind else {
+            panic!("expected anonymous struct initializer")
+        };
+        let AnonymousStructMember::Field(count) = &members[0] else {
+            panic!("expected inferred anonymous field")
+        };
+        let AnonymousStructMember::Field(label) = &members[1] else {
+            panic!("expected annotated anonymous field")
+        };
+        assert!(matches!(
+            types.types().get(checking.anonymous_field_types[&count.id]),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                ..
+            })
+        ));
+        assert!(matches!(
+            types.types().get(checking.anonymous_field_types[&label.id]),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::String,
+                ..
+            })
+        ));
+        assert_eq!(
+            checking.transfers[&count.initializer.id],
+            ValueTransfer::TrivialCopy
+        );
+        assert_eq!(
+            checking.transfers[&label.initializer.id],
+            ValueTransfer::MoveTemporary
+        );
+        let copied = binding_initializer(&main.body.statements[4]);
+        let (copy_callee, _) = call(copied);
+        let ExpressionKind::MemberAccess { object, .. } = &copy_callee.kind else {
+            panic!("expected anonymous copy member")
+        };
+        assert_eq!(
+            checking.transfers[&object.id],
+            ValueTransfer::RecursiveCopy
+        );
+    }
+
+    #[test]
+    fn converts_named_and_anonymous_structs_and_dispatches_interfaces() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "interface Accumulator { fn add(mut self, amount: int) -> int; }\n",
+            "interface Empty {}\n",
+            "struct Named { value: int, fn read(self) -> int { self.value } }\n",
+            "fn consume(value: Reader) -> int { value.read() }\n",
+            "fn main() {\n",
+            "    const named = Named { value: 1 };\n",
+            "    const named_reader: Reader = named;\n",
+            "    const empty: Empty = named;\n",
+            "    const fresh_reader: Reader = Named { value: 4 };\n",
+            "    const vmut implementation = struct {\n",
+            "        value = 2;\n",
+            "        fn read(self) -> int { self.value }\n",
+            "        fn add(mut self, amount: int) -> int { self.value + amount }\n",
+            "    };\n",
+            "    const reader: Reader = implementation;\n",
+            "    const vmut both: Reader & Accumulator = implementation;\n",
+            "    consume(implementation);\n",
+            "    reader.read();\n",
+            "    both.add(3);\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let main = function(&program.declarations[5]);
+        let named_conversion = binding_initializer(&main.body.statements[1]);
+        let empty_conversion = binding_initializer(&main.body.statements[2]);
+        let fresh_conversion = binding_initializer(&main.body.statements[3]);
+        let reader_conversion = binding_initializer(&main.body.statements[5]);
+        let intersection_conversion = binding_initializer(&main.body.statements[6]);
+        for converted in [
+            named_conversion,
+            empty_conversion,
+            reader_conversion,
+            intersection_conversion,
+        ] {
+            assert_eq!(
+                checking.expressions[&converted.id].category,
+                ValueCategory::BorrowedPlace
+            );
+            assert_eq!(
+                checking.interface_conversions[&converted.id].backing_transfer,
+                ValueTransfer::Borrow
+            );
+        }
+        assert_eq!(
+            checking.interface_conversions[&fresh_conversion.id].backing_transfer,
+            ValueTransfer::MoveTemporary
+        );
+        assert!(checking.interface_conversions[&empty_conversion.id]
+            .methods
+            .is_empty());
+        let read_call = expression(&main.body.statements[8]);
+        let (read_callee, _) = call(read_call);
+        assert!(matches!(
+            checking.resolved_members[&read_callee.id],
+            ResolvedMember::InterfaceMethod { .. }
+        ));
+        let add_call = expression(&main.body.statements[9]);
+        let (add_callee, _) = call(add_call);
+        assert!(matches!(
+            checking.resolved_members[&add_callee.id],
+            ResolvedMember::InterfaceMethod { .. }
+        ));
+    }
+
+    #[test]
+    fn checks_gc_interface_backing_and_structural_failures() {
+        let source = concat!(
+            "interface Need { fn run(self, value: int) -> int; }\n",
+            "interface Keep { fn get(&self) -> int; }\n",
+            "interface First { fn same(self) -> int; }\n",
+            "interface Second { fn same(mut self) -> int; }\n",
+            "struct Wrong { fn run(self, value: float) -> int { 0 } }\n",
+            "fn main() {\n",
+            "    const wrong = Wrong {};\n",
+            "    const incompatible: Need = wrong;\n",
+            "    const missing: Need = struct {};\n",
+            "    const conflict: First & Second = struct {};\n",
+            "    const inline_keep: Keep = struct { fn get(&self) -> int { 1 } };\n",
+            "    const correct = struct { fn run(self, value: int) -> int { value } };\n",
+            "    const vmut escalation: Need = correct;\n",
+            "    const vmut fresh_need: Need = struct {\n",
+            "        fn run(self, value: int) -> int { value }\n",
+            "    };\n",
+            "    const heap_keep: &Keep = &struct { fn get(&self) -> int { 2 } };\n",
+            "    const borrowed_keep: Keep = &struct { fn get(&self) -> int { 3 } };\n",
+            "    heap_keep.get();\n",
+            "    borrowed_keep.get();\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 5, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::IncompatibleInterfaceMethod { .. }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::MissingInterfaceMethod { .. }
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::ConflictingInterfaceRequirement { .. }
+        ));
+        assert_eq!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::InterfaceRequiresGarbageCollectedSource
+        );
+        assert!(matches!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        let main = function(&program.declarations[5]);
+        let heap = binding_initializer(&main.body.statements[8]);
+        let borrowed = binding_initializer(&main.body.statements[9]);
+        assert_eq!(
+            checking.expressions[&heap.id].category,
+            ValueCategory::GarbageCollectedReference
+        );
+        assert_eq!(
+            checking.expressions[&borrowed.id].category,
+            ValueCategory::BorrowedPlace
+        );
+        assert_eq!(
+            checking.interface_conversions[&borrowed.id].backing_transfer,
+            ValueTransfer::Borrow
+        );
+    }
+
+    #[test]
+    fn rejects_only_unbounded_inline_aggregate_cycles() {
+        let source = concat!(
+            "struct Direct { next: Direct, }\n",
+            "struct Left { right: Right | none, }\n",
+            "struct Right { left: Left, }\n",
+            "struct Safe { next: &Safe | none, items: Vector<Safe>, }\n",
+            "struct Wrapped { failure: Error<Wrapped>, }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(
+            &module,
+            &program,
+            &names,
+            &context,
+            &mut types,
+            &signatures,
+        );
+        assert_eq!(checking.errors.len(), 3, "{:#?}", checking.errors);
+        assert!(checking.errors.iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::InfiniteInlineLayout { .. }
+        )));
     }
 }

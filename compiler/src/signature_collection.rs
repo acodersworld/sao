@@ -127,6 +127,9 @@ pub struct InterfaceRequirementSignature {
 pub struct InterfaceSignature {
     pub type_id: TypeId,
     requirements: HashMap<String, InterfaceRequirementSignature>,
+    /// Requirement names in declaration order. Structural lookup remains
+    /// hash-based, while expression diagnostics use this order.
+    requirement_order: Vec<String>,
 }
 
 impl InterfaceSignature {
@@ -138,6 +141,11 @@ impl InterfaceSignature {
     #[must_use]
     pub const fn requirements(&self) -> &HashMap<String, InterfaceRequirementSignature> {
         &self.requirements
+    }
+
+    #[must_use]
+    pub fn requirement_order(&self) -> &[String] {
+        &self.requirement_order
     }
 }
 
@@ -798,11 +806,13 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     .type_for_declaration(interface.id)
                     .expect("resolved interface declaration must have a type");
                 let mut requirements = HashMap::new();
+                let mut requirement_order = Vec::new();
                 for requirement in &interface.requirements {
                     self.reject_reserved_copy(requirement.name);
                     let signature = self.collect_interface_requirement(requirement);
                     let method_id = self.intern_method(requirement.name, &signature);
                     let name = self.text(requirement.name).to_string();
+                    requirement_order.push(name.clone());
                     let entry = InterfaceRequirementSignature {
                         declaration: requirement.id,
                         method_id,
@@ -815,6 +825,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     InterfaceSignature {
                         type_id,
                         requirements,
+                        requirement_order,
                     },
                 );
             }

@@ -36,8 +36,9 @@ changes the storage or identity of an existing value.
 
 Binding a named, object-like plain value to another local creates a borrow.
 An `&T` may likewise be viewed as plain `T` in a local or parameter context;
-the compiler retains its originating GC allocation as a hidden root. Scalar
-primitives retain trivial copy behavior.
+the view preserves whether its object is inline or garbage collected through
+the object's universal runtime attributes. Scalar primitives retain trivial
+copy behavior.
 
 The reserved compiler-provided `value.copy()` operation creates an independent
 value. It recursively copies inline fields and copies nested `&T` fields as
@@ -77,7 +78,8 @@ cannot be copied this way and must be GC-qualified before the boundary.
 
 After type checking and capture discovery, each function classifies expressions
 as fresh temporaries, owned inline places, borrowed places, or GC references.
-It records hidden GC-owner roots for borrows derived from `&T`.
+It records whether borrowed places refer to inline or GC-backed objects so
+typed IR can emit the correct traversal operation.
 
 A borrow escapes if it is returned as a GC reference, passed to an `&T`
 parameter, stored in a retained field or queue, or retained by an escaping
@@ -88,11 +90,15 @@ the diagnostic suggests copying and then allocating with `&`.
 All source locals remain alive for the complete function invocation, including
 across coroutine suspension, so lexical lifetime syntax is unnecessary. Frame
 and object tracing metadata recursively visits inline fields containing GC
-references and visits hidden owner roots. Frame-owned strings, collections,
-closures, and other values with auxiliary raw allocations receive compiler-
-generated runtime cleanup metadata. Cleanup cannot invoke SAO code.
+references and follows live borrowed object views. The viewed object's universal
+attributes include a traversal epoch and storage kind. Every reached object is
+marked as visited so cycles terminate; the storage kind determines whether it
+also participates in sweeping. Frame-owned strings, collections, closures, and
+other values with auxiliary raw allocations receive compiler-generated runtime
+cleanup metadata. Cleanup cannot invoke SAO code.
 
 The portable ABI uses caller-provided result storage for plain aggregate
 returns. A GC allocation begins with the common object header and contains the
 moved temporary payload. The collector remains non-moving, keeping borrowed
-addresses stable while their compiler-recorded owners remain rooted.
+addresses stable while live views remain reachable from traced frames or
+objects.

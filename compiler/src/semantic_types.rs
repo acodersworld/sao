@@ -79,10 +79,6 @@ pub enum ValueTransfer {
     Borrow,
     MoveTemporary,
     RecursiveCopy,
-    BorrowFromGarbageCollected {
-        /// Lowering must retain the originating allocation as a hidden root.
-        retain_hidden_owner_root: bool,
-    },
     AllocateGarbageCollected,
     ReuseGarbageCollected,
 }
