@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-21
+Last reviewed: 2026-08-26
 
 ## Current phase
 
@@ -90,38 +90,45 @@ reviewable phases:
      anonymous fields for expression checking.
    - Complete: validate shared member namespaces and the required `main`
      signature.
-3. Core expression checking (next)
-   - Add expected-type-driven checking and local inference.
-   - Cover literals, identifiers, `self`, functions, lambdas, calls, operators,
-     conversions, GC allocation, blocks, conditionals, returns, and ordinary
-     bindings.
-   - Record fresh-temporary, owned-inline, borrowed-place, and GC-reference
-     categories plus moves, implicit return copies, and object traversal metadata.
-   - Do not synthesize unions when result paths disagree.
-4. Places and mutability
-   - Model writable locations separately from ordinary values while retaining
-     capability in semantic types.
-   - Check binding, parameter, receiver, field, index, assignment,
-     compound-assignment, and range-binding mutability.
-   - Permit copied values to acquire independent mutable storage without
-     allowing borrowed or GC-reference capabilities to increase.
-5. Aggregates and structural typing
-   - Check named and anonymous struct construction, fields, methods, associated
-     functions, member selection, and structural interface satisfaction.
-   - Record resolved member and call targets and implicit conversions required
-     by typed IR.
-   - Implement exact interface method-signature matching.
-   - Validate finite inline layouts, reserve the `copy` member name, synthesize
-     `.copy()`, and restrict plain erased interfaces and capturing callables to
-     non-owning local and parameter positions.
-6. Type algebra and flow
+3. Core expression checking (complete)
+   - Complete: expected-type-driven checking and local inference.
+   - Complete: literals, identifiers, `self`, functions, lambdas, calls,
+     operators, conversions, GC allocation, blocks, conditionals, returns, and
+     ordinary bindings.
+   - Complete: fresh-temporary, owned-inline, borrowed-place, and GC-reference
+     categories plus moves, implicit return copies, and object traversal
+     metadata.
+   - Complete: differing result paths do not synthesize unions.
+4. Places and mutability (complete)
+   - Complete: model root and field places separately from ordinary values while
+     retaining capability in semantic types.
+   - Complete: check binding, parameter, receiver, and field mutability;
+     reference-slot rebinding; owning field replacement; assignment and
+     compound assignment; and reassignment metadata.
+   - Complete: permit copied values to acquire independent mutable storage
+     without allowing borrowed or GC-reference capabilities to increase.
+   - Range-binding mutability is checked with range loops in phase 6. Index-place
+     mutability is checked with indexed built-ins in phase 7.
+5. Aggregates and structural typing (complete)
+   - Complete: named and anonymous struct construction, fields, methods,
+     associated functions, member selection, and structural interface
+     satisfaction.
+   - Complete: resolved member and call targets, interface dispatch metadata,
+     and implicit conversions required by typed IR.
+   - Complete: exact interface method-signature matching.
+   - Complete: finite inline-layout validation, the reserved `copy` member name,
+     and compiler-provided `.copy()`.
+   - Authoritative capturing-callable escape validation remains in post-type
+     semantic analysis.
+6. Type algebra and flow (next)
    - Implement union and intersection assignability, contextual conversions,
      branch and loop result typing, type tests, and flow-sensitive narrowing.
-   - Cover value-producing loops and explicitly expected union types.
+   - Cover value-producing loops, including range-binding typing and
+     mutability, and explicitly expected union types.
 7. Built-ins and completion
-   - Check strings, bytes, indexing, slicing, primitive conversions, `Queue`,
-     `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`, `yield`, `co`, and
-     `defer`.
+   - Check strings, bytes, indexing and index-place mutability, slicing,
+     primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`,
+     output, `panic`, `yield`, `co`, and `defer`.
    - Aggregate deterministic diagnostics and expose successful semantic
      metadata for expressions, bindings, declarations, and callable signatures.
    - Add comprehensive tests and update implementation-status documents only
