@@ -412,7 +412,7 @@ impl<'source> Resolver<'source> {
             ExpressionKind::PrimitiveConversion { value, .. } => {
                 self.resolve_expression(scope, value);
             }
-            ExpressionKind::GarbageCollect(value) => self.resolve_expression(scope, value),
+            ExpressionKind::GcAllocate(value) => self.resolve_expression(scope, value),
             ExpressionKind::StructConstruction { name, fields } => {
                 self.resolve_type_name(scope, expression.id, *name);
                 for field in fields {
@@ -488,7 +488,7 @@ impl<'source> Resolver<'source> {
                 }
             }
             TypeKind::Mutable(inner)
-            | TypeKind::GarbageCollected(inner)
+            | TypeKind::Gc(inner)
             | TypeKind::Group(inner) => self.resolve_type(scope, inner),
             TypeKind::Callable {
                 parameters,

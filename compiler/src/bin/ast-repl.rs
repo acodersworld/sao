@@ -200,7 +200,7 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::InvalidReceiverQualifiers => {
             "a receiver must be written as self, mut self, &self, or &mut self".to_owned()
         }
-        ParseErrorKind::InvalidGarbageCollectedCapabilitySyntax => {
+        ParseErrorKind::InvalidGcCapabilitySyntax => {
             "mutable GC access is written &mut T, not mut &T".to_owned()
         }
         ParseErrorKind::BindingValueCapabilityMustPrecedeName => {
@@ -416,7 +416,7 @@ mod tests {
         );
         assert_eq!(
             syntax_error_message(ParseError {
-                kind: ParseErrorKind::InvalidGarbageCollectedCapabilitySyntax,
+                kind: ParseErrorKind::InvalidGcCapabilitySyntax,
                 span: Span::new(ModuleId::PRELUDE, 0, 3),
             }),
             "mutable GC access is written &mut T, not mut &T"

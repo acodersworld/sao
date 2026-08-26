@@ -62,7 +62,7 @@ pub enum ParseErrorKind {
         found: TokenKind,
     },
     InvalidReceiverQualifiers,
-    InvalidGarbageCollectedCapabilitySyntax,
+    InvalidGcCapabilitySyntax,
     BindingValueCapabilityMustPrecedeName,
     AggregateMemberCapabilityNotSupported,
     ExpectedToken {
@@ -533,7 +533,7 @@ where
                 ),
                 FunctionParameterKind::Receiver {
                     name: receiver.span,
-                    storage: ReceiverStorage::GarbageCollected,
+                    storage: ReceiverStorage::Gc,
                 },
                 Span::new(self.module_id, ampersand.span.start, receiver.span.end),
             ));
@@ -786,7 +786,7 @@ where
             self.advance()?;
             if self.current()?.kind == TokenKind::Ampersand {
                 return Err(ParseError {
-                    kind: ParseErrorKind::InvalidGarbageCollectedCapabilitySyntax,
+                    kind: ParseErrorKind::InvalidGcCapabilitySyntax,
                     span: token.span,
                 }
                 .into());
@@ -880,7 +880,7 @@ where
         let token = self.current()?;
 
         match token.kind {
-            TokenKind::Ampersand => self.garbage_collected_type(),
+            TokenKind::Ampersand => self.gc_type(),
             TokenKind::Int => self.primitive_type(PrimitiveType::Int),
             TokenKind::Float => self.primitive_type(PrimitiveType::Float),
             TokenKind::Bool => self.primitive_type(PrimitiveType::Bool),
@@ -903,7 +903,7 @@ where
         }
     }
 
-    fn garbage_collected_type(&mut self) -> ParseResult<TypeSyntax> {
+    fn gc_type(&mut self) -> ParseResult<TypeSyntax> {
         let ampersand = self.advance()?;
         let mutable = if self.current()?.kind == TokenKind::Mut {
             self.advance()?;
@@ -914,7 +914,7 @@ where
         let inner = self.primary_type()?;
         let end = inner.span.end;
         let mut inner = match inner.kind {
-            TypeKind::GarbageCollected(inner) => *inner,
+            TypeKind::Gc(inner) => *inner,
             kind => TypeSyntax::new(kind, inner.span),
         };
 
@@ -924,7 +924,7 @@ where
         }
 
         Ok(TypeSyntax::new(
-            TypeKind::GarbageCollected(Box::new(inner)),
+            TypeKind::Gc(Box::new(inner)),
             Span::new(self.module_id, ampersand.span.start, end),
         ))
     }
@@ -1354,12 +1354,12 @@ where
                     self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
                 let span = Span::new(self.module_id, token.span.start, operand.span.end);
                 let operand = match operand.kind {
-                    ExpressionKind::GarbageCollect(inner) => *inner,
+                    ExpressionKind::GcAllocate(inner) => *inner,
                     kind => Expression::new(kind, operand.span),
                 };
 
                 Ok(Expression::new(
-                    ExpressionKind::GarbageCollect(Box::new(operand)),
+                    ExpressionKind::GcAllocate(Box::new(operand)),
                     span,
                 ))
             }
@@ -2079,7 +2079,7 @@ fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext
     expression.id = context.next_node_id();
     match &mut expression.kind {
         ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {}
-        ExpressionKind::GarbageCollect(inner) => assign_expression_ids(inner, context),
+        ExpressionKind::GcAllocate(inner) => assign_expression_ids(inner, context),
         ExpressionKind::Group(inner) => assign_expression_ids(inner, context),
         ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
             assign_block_ids(block, context);
@@ -2208,7 +2208,7 @@ fn assign_type_ids(type_syntax: &mut TypeSyntax, context: &mut ParseContext) {
                 assign_type_ids(argument, context);
             }
         }
-        TypeKind::Mutable(inner) | TypeKind::GarbageCollected(inner) | TypeKind::Group(inner) => {
+        TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
             assign_type_ids(inner, context)
         }
         TypeKind::Callable {
@@ -3167,7 +3167,7 @@ mod tests {
             else {
                 panic!("expected a receiver");
             };
-            assert_eq!(*storage, ReceiverStorage::GarbageCollected);
+            assert_eq!(*storage, ReceiverStorage::Gc);
             assert_eq!(
                 function.parameters[0].qualifiers.value,
                 if mutable {
@@ -6219,7 +6219,7 @@ mod tests {
         else {
             panic!("expected bitwise-and at the root");
         };
-        let ExpressionKind::GarbageCollect(value) = left.kind else {
+        let ExpressionKind::GcAllocate(value) = left.kind else {
             panic!("expected GC allocation on the left");
         };
         assert!(matches!(
@@ -6644,7 +6644,7 @@ mod tests {
     fn parses_gc_qualified_types_and_reserves_logical_and_for_expressions() {
         let type_syntax = parse_type_source("&mut (Reader & Writer)")
             .expect("mutable GC intersection should parse");
-        let TypeKind::GarbageCollected(inner) = type_syntax.kind else {
+        let TypeKind::Gc(inner) = type_syntax.kind else {
             panic!("expected a GC-qualified type");
         };
         let TypeKind::Mutable(inner) = inner.kind else {
@@ -6665,7 +6665,7 @@ mod tests {
         assert!(matches!(
             parse_type_source("mut &User"),
             Err(FrontendError::Syntax(ParseError {
-                kind: ParseErrorKind::InvalidGarbageCollectedCapabilitySyntax,
+                kind: ParseErrorKind::InvalidGcCapabilitySyntax,
                 ..
             }))
         ));

@@ -1042,7 +1042,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {
             }
             ExpressionKind::Group(inner)
-            | ExpressionKind::GarbageCollect(inner)
+            | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::PrimitiveConversion { value: inner, .. }
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::Unary { operand: inner, .. } => self.visit_expression(inner),
@@ -1356,7 +1356,7 @@ mod tests {
         };
         assert!(matches!(
             types.types().get(*first_field_type),
-            Some(SemanticType::GarbageCollected { target, .. })
+            Some(SemanticType::Gc { target, .. })
                 if Some(*target) == types.type_for_declaration(first.id)
         ));
     }
@@ -1509,7 +1509,7 @@ mod tests {
         assert_eq!(
             run.receiver,
             Some(ReceiverSignature {
-                storage: ReceiverStorage::GarbageCollected,
+                storage: ReceiverStorage::Gc,
                 capability: AccessCapability::Mut,
             })
         );

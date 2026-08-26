@@ -41,7 +41,7 @@ pub enum StorageSemantics {
     /// An erased, non-escaping view whose concrete storage is owned elsewhere.
     BorrowedView,
     /// A stable reference to an independently traced GC allocation.
-    GarbageCollected,
+    Gc,
 }
 
 /// The compiler-defined behavior of the reserved `.copy()` operation.
@@ -55,7 +55,7 @@ pub enum CopySemantics {
     /// Explicit `.copy()` materializes a plain copy of the GC payload. A GC
     /// reference encountered as a nested field of another recursive copy is
     /// still copied trivially and remains shared.
-    GarbageCollectedPayload,
+    GcPayload,
     /// The erased value cannot cross an owning boundary without GC storage.
     NonEscapingErasedView,
 }
@@ -68,7 +68,7 @@ pub enum ValueCategory {
     FreshTemporary,
     OwnedInlinePlace,
     BorrowedPlace,
-    GarbageCollectedReference,
+    GcReference,
 }
 
 /// A transfer selected by type checking and consumed by escape analysis and
@@ -79,27 +79,27 @@ pub enum ValueTransfer {
     Borrow,
     MoveTemporary,
     RecursiveCopy,
-    AllocateGarbageCollected,
-    ReuseGarbageCollected,
+    AllocateGc,
+    CopyGcReference,
 }
 
 /// Owning/retaining destinations checked by the per-function escape pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EscapeDestination {
-    GarbageCollectedReturn,
-    GarbageCollectedParameter,
+    GcReturn,
+    GcParameter,
     RetainedField,
     QueueElement,
     EscapingCapture,
-    GarbageCollectedReceiver,
+    GcReceiver,
 }
 
 /// A canonical semantic type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SemanticType {
     /// An escapable GC reference. Repeated qualification is normalized by
-    /// [`TypeStore::garbage_collected`].
-    GarbageCollected {
+    /// [`TypeStore::gc`].
+    Gc {
         target: TypeId,
         capability: AccessCapability,
     },
@@ -151,7 +151,7 @@ impl SemanticType {
     #[must_use]
     pub const fn capability(&self) -> Option<AccessCapability> {
         match self {
-            Self::GarbageCollected { capability, .. }
+            Self::Gc { capability, .. }
             | Self::Primitive { capability, .. }
             | Self::Callable { capability, .. }
             | Self::NamedStruct { capability, .. }
@@ -170,7 +170,7 @@ impl SemanticType {
     #[must_use]
     pub const fn storage_semantics(&self) -> Option<StorageSemantics> {
         match self {
-            Self::GarbageCollected { .. } => Some(StorageSemantics::GarbageCollected),
+            Self::Gc { .. } => Some(StorageSemantics::Gc),
             Self::Callable { .. } | Self::Interface { .. } | Self::Intersection { .. } => {
                 Some(StorageSemantics::BorrowedView)
             }
@@ -186,7 +186,7 @@ impl SemanticType {
     #[must_use]
     pub const fn copy_semantics(&self) -> Option<CopySemantics> {
         match self {
-            Self::GarbageCollected { .. } => Some(CopySemantics::GarbageCollectedPayload),
+            Self::Gc { .. } => Some(CopySemantics::GcPayload),
             Self::Primitive {
                 primitive:
                     PrimitiveType::Unit
@@ -212,8 +212,8 @@ impl SemanticType {
     fn has_same_shape(&self, other: &Self) -> bool {
         match (self, other) {
             (
-                Self::GarbageCollected { target: left, .. },
-                Self::GarbageCollected { target: right, .. },
+                Self::Gc { target: left, .. },
+                Self::Gc { target: right, .. },
             ) => left == right,
             (
                 Self::Primitive {
@@ -322,7 +322,7 @@ impl TypeStore {
     /// GC qualification is idempotent. Its access capability mirrors the
     /// target capability so `&T` and `&mut T` remain distinct without making
     /// GC ownership itself mutable.
-    pub fn garbage_collected(&mut self, target: TypeId) -> Option<TypeId> {
+    pub fn gc(&mut self, target: TypeId) -> Option<TypeId> {
         let semantic_type = self.get(target)?.clone();
         if matches!(
             semantic_type,
@@ -330,20 +330,20 @@ impl TypeStore {
         ) {
             return Some(target);
         }
-        if matches!(semantic_type, SemanticType::GarbageCollected { .. }) {
+        if matches!(semantic_type, SemanticType::Gc { .. }) {
             return Some(target);
         }
         let capability = semantic_type.capability()?;
-        Some(self.intern(SemanticType::GarbageCollected { target, capability }))
+        Some(self.intern(SemanticType::Gc { target, capability }))
     }
 
     /// Returns the plain target of a GC-qualified type, or `None` when `id` is
     /// valid but plain. An unknown ID also returns `None`; use [`Self::contains`]
     /// when that distinction matters.
     #[must_use]
-    pub fn garbage_collected_target(&self, id: TypeId) -> Option<TypeId> {
+    pub fn gc_target(&self, id: TypeId) -> Option<TypeId> {
         match self.get(id)? {
-            SemanticType::GarbageCollected { target, .. } => Some(*target),
+            SemanticType::Gc { target, .. } => Some(*target),
             _ => None,
         }
     }
@@ -491,11 +491,11 @@ impl TypeStore {
     pub fn has_same_shape(&self, left: TypeId, right: TypeId) -> Option<bool> {
         match (self.get(left)?, self.get(right)?) {
             (
-                SemanticType::GarbageCollected {
+                SemanticType::Gc {
                     target: left_target,
                     ..
                 },
-                SemanticType::GarbageCollected {
+                SemanticType::Gc {
                     target: right_target,
                     ..
                 },
@@ -513,9 +513,9 @@ impl TypeStore {
     /// returned unchanged.
     pub fn with_capability(&mut self, id: TypeId, capability: AccessCapability) -> Option<TypeId> {
         match self.get(id)?.clone() {
-            SemanticType::GarbageCollected { target, .. } => {
+            SemanticType::Gc { target, .. } => {
                 let target = self.with_capability(target, capability)?;
-                self.garbage_collected(target)
+                self.gc(target)
             }
             SemanticType::Primitive { primitive, .. } => {
                 Some(self.primitive(primitive, capability))
@@ -765,20 +765,20 @@ mod tests {
     }
 
     #[test]
-    fn garbage_collection_is_explicit_idempotent_and_capability_qualified() {
+    fn gc_allocation_is_explicit_idempotent_and_capability_qualified() {
         let mut types = TypeStore::new();
         let plain = types.named_struct(node(1), AccessCapability::Const);
         let mutable_plain = types.named_struct(node(1), AccessCapability::Mut);
         let gc = types
-            .garbage_collected(plain)
+            .gc(plain)
             .expect("plain values can be GC qualified");
         let mutable_gc = types
-            .garbage_collected(mutable_plain)
+            .gc(mutable_plain)
             .expect("mutable plain values can be GC qualified");
 
-        assert_eq!(types.garbage_collected(gc), Some(gc));
-        assert_eq!(types.garbage_collected_target(gc), Some(plain));
-        assert_eq!(types.garbage_collected_target(plain), None);
+        assert_eq!(types.gc(gc), Some(gc));
+        assert_eq!(types.gc_target(gc), Some(plain));
+        assert_eq!(types.gc_target(plain), None);
         assert_ne!(gc, mutable_gc);
         assert_eq!(types.has_same_shape(gc, mutable_gc), Some(true));
         assert_eq!(
@@ -787,11 +787,11 @@ mod tests {
         );
         assert_eq!(
             types.get(gc).and_then(SemanticType::storage_semantics),
-            Some(StorageSemantics::GarbageCollected)
+            Some(StorageSemantics::Gc)
         );
         assert_eq!(
             types.get(gc).and_then(SemanticType::copy_semantics),
-            Some(CopySemantics::GarbageCollectedPayload)
+            Some(CopySemantics::GcPayload)
         );
     }
 

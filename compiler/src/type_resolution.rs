@@ -293,7 +293,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
             ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {
             }
             ExpressionKind::Group(inner)
-            | ExpressionKind::GarbageCollect(inner)
+            | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::PrimitiveConversion { value: inner, .. }
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::Unary { operand: inner, .. } => self.visit_expression(inner),
@@ -439,10 +439,10 @@ impl<'source, 'names> Resolver<'source, 'names> {
                     .with_capability(inner, AccessCapability::Mut)
                     .expect("resolved type belongs to this type store")
             }
-            TypeKind::GarbageCollected(inner) => {
+            TypeKind::Gc(inner) => {
                 let inner = self.resolve_type(inner);
                 self.types
-                    .garbage_collected(inner)
+                    .gc(inner)
                     .expect("resolved type belongs to this type store")
             }
             TypeKind::Group(inner) => self.resolve_type(inner),
@@ -660,7 +660,7 @@ mod tests {
         let user = resolution
             .type_for_syntax(named_parameter_type(main, 2).id)
             .expect("GC user type should resolve");
-        let Some(SemanticType::GarbageCollected { target, capability }) =
+        let Some(SemanticType::Gc { target, capability }) =
             resolution.types().get(user)
         else {
             panic!("expected a GC-qualified user type");
@@ -688,7 +688,7 @@ mod tests {
         let stream = resolution
             .type_for_syntax(named_parameter_type(main, 3).id)
             .expect("GC intersection should resolve");
-        let Some(SemanticType::GarbageCollected { target, capability }) =
+        let Some(SemanticType::Gc { target, capability }) =
             resolution.types().get(stream)
         else {
             panic!("expected a GC-qualified intersection");
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(
             resolution
                 .types()
-                .garbage_collected_target(recursive_reference),
+                .gc_target(recursive_reference),
             resolution.type_for_declaration(first.id)
         );
     }

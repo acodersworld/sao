@@ -454,11 +454,11 @@ fn format_expression_into(
             );
             child_expression(output, source, "value", value, depth);
         }
-        ExpressionKind::GarbageCollect(inner) => {
+        ExpressionKind::GcAllocate(inner) => {
             line(
                 output,
                 depth,
-                format_args!("GarbageCollect {}", location(span)),
+                format_args!("GcAllocate {}", location(span)),
             );
             child_expression(output, source, "value", inner, depth);
         }
@@ -769,11 +769,11 @@ fn format_type_into(
             line(output, depth, format_args!("Mutable {}", location(span)));
             child_type(output, source, "type", inner, depth);
         }
-        TypeKind::GarbageCollected(inner) => {
+        TypeKind::Gc(inner) => {
             line(
                 output,
                 depth,
-                format_args!("GarbageCollected {}", location(span)),
+                format_args!("Gc {}", location(span)),
             );
             child_type(output, source, "type", inner, depth);
         }

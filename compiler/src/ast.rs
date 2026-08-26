@@ -361,7 +361,7 @@ pub enum FunctionParameterKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReceiverStorage {
     Plain,
-    GarbageCollected,
+    Gc,
 }
 
 /// The syntax accepted after an `else` keyword.
@@ -449,7 +449,7 @@ pub enum TypeKind {
     Mutable(Box<TypeSyntax>),
     /// An explicitly garbage-collected, escapable value. The contained type
     /// carries the access capability selected by `&T` or `&mut T`.
-    GarbageCollected(Box<TypeSyntax>),
+    Gc(Box<TypeSyntax>),
     Group(Box<TypeSyntax>),
     Callable {
         parameters: Vec<TypeSyntax>,
@@ -529,7 +529,7 @@ pub enum ExpressionKind {
     },
     /// Moves a fresh value into independently managed GC storage. Reapplying
     /// `&` to an already GC-qualified value is semantically idempotent.
-    GarbageCollect(Box<Expression>),
+    GcAllocate(Box<Expression>),
     StructConstruction {
         name: Span,
         fields: Vec<StructFieldInitializer>,

@@ -206,7 +206,7 @@ enum ExpressionCheckingErrorKind {
         operator: BinaryOperator,
         found: TypeId,
     },
-    InvalidGarbageCollectionSource {
+    InvalidGcAllocationSource {
         found: TypeId,
         category: ValueCategory,
     },
@@ -263,7 +263,7 @@ enum ExpressionCheckingErrorKind {
         first: NodeId,
         second: NodeId,
     },
-    InterfaceRequiresGarbageCollectedSource,
+    InterfaceRequiresGcSource,
     InfiniteInlineLayout {
         owner: TypeId,
     },
@@ -399,7 +399,7 @@ impl LexicalIndex {
             | ExpressionKind::AssociatedAccess { .. } => {}
             ExpressionKind::Group(inner)
             | ExpressionKind::PrimitiveConversion { value: inner, .. }
-            | ExpressionKind::GarbageCollect(inner)
+            | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::MemberAccess { object: inner, .. }
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::TypeTest { value: inner, .. }
@@ -915,8 +915,8 @@ impl<'semantic> Analyzer<'semantic> {
             .types()
             .get(source.type_id)
             .expect("return type belongs to the program type store");
-        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
-            Some(ValueTransfer::ReuseGarbageCollected)
+        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+            Some(ValueTransfer::CopyGcReference)
         } else {
             match semantic.copy_semantics() {
                 Some(CopySemantics::Trivial) => Some(ValueTransfer::TrivialCopy),
@@ -934,7 +934,7 @@ impl<'semantic> Analyzer<'semantic> {
                     Some(ValueTransfer::MoveTemporary)
                 }
                 Some(CopySemantics::NonEscapingErasedView) | None => None,
-                Some(CopySemantics::GarbageCollectedPayload) => {
+                Some(CopySemantics::GcPayload) => {
                     unreachable!("GC return storage was handled above")
                 }
             }
@@ -1336,12 +1336,12 @@ impl<'semantic> Analyzer<'semantic> {
             .get(result_type)
             .expect("conditional result type belongs to the program type store");
         let (category, transfers): (ValueCategory, Vec<_>) =
-            if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+            if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
                 (
-                    ValueCategory::GarbageCollectedReference,
+                    ValueCategory::GcReference,
                     values
                         .iter()
-                        .map(|(id, _)| (*id, ValueTransfer::ReuseGarbageCollected))
+                        .map(|(id, _)| (*id, ValueTransfer::CopyGcReference))
                         .collect(),
                 )
             } else if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
@@ -1405,9 +1405,9 @@ impl<'semantic> Analyzer<'semantic> {
                         .unwrap_or(*incoming_category);
                     if merged != category {
                         merged = match (merged, category) {
-                            (ValueCategory::GarbageCollectedReference, _)
-                            | (_, ValueCategory::GarbageCollectedReference) => {
-                                ValueCategory::GarbageCollectedReference
+                            (ValueCategory::GcReference, _)
+                            | (_, ValueCategory::GcReference) => {
+                                ValueCategory::GcReference
                             }
                             (ValueCategory::OwnedInlinePlace, ValueCategory::OwnedInlinePlace) => {
                                 ValueCategory::OwnedInlinePlace
@@ -1515,7 +1515,7 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::PrimitiveConversion { target, value } => {
                 self.synthesize_primitive_conversion(*target, value)?
             }
-            ExpressionKind::GarbageCollect(value) => self.synthesize_garbage_collection(value)?,
+            ExpressionKind::GcAllocate(value) => self.synthesize_gc_allocation(value)?,
             ExpressionKind::StructConstruction { fields, .. } => {
                 self.synthesize_named_struct_construction(expression, fields)?
             }
@@ -1702,7 +1702,7 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::Literal(_) | ExpressionKind::AssociatedAccess { .. } => {}
             ExpressionKind::Group(inner)
             | ExpressionKind::PrimitiveConversion { value: inner, .. }
-            | ExpressionKind::GarbageCollect(inner)
+            | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::MemberAccess { object: inner, .. }
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::TypeTest { value: inner, .. }
@@ -2018,12 +2018,12 @@ impl<'semantic> Analyzer<'semantic> {
             self.signatures
                 .method_signature(required.requirement.method_id)
                 .is_some_and(|signature| {
-                    signature.receiver.storage == ReceiverStorage::GarbageCollected
+                    signature.receiver.storage == ReceiverStorage::Gc
                 })
         });
         if (destination_is_gc || requires_gc_receiver) && !source_is_gc {
             self.checking.errors.push(ExpressionCheckingError {
-                kind: ExpressionCheckingErrorKind::InterfaceRequiresGarbageCollectedSource,
+                kind: ExpressionCheckingErrorKind::InterfaceRequiresGcSource,
                 span: expression.span,
             });
             return Some(self.recover_expression(expression, found.category));
@@ -2082,8 +2082,8 @@ impl<'semantic> Analyzer<'semantic> {
 
         let (category, backing_transfer) = if destination_is_gc {
             (
-                ValueCategory::GarbageCollectedReference,
-                ValueTransfer::ReuseGarbageCollected,
+                ValueCategory::GcReference,
+                ValueTransfer::CopyGcReference,
             )
         } else if source_is_gc {
             (ValueCategory::BorrowedPlace, ValueTransfer::Borrow)
@@ -2115,7 +2115,7 @@ impl<'semantic> Analyzer<'semantic> {
         match self.types.types().get(type_id)? {
             SemanticType::Interface { capability, .. }
             | SemanticType::Intersection { capability, .. } => Some((type_id, *capability, false)),
-            SemanticType::GarbageCollected { target, capability }
+            SemanticType::Gc { target, capability }
                 if matches!(
                     self.types.types().get(*target),
                     Some(SemanticType::Interface { .. } | SemanticType::Intersection { .. })
@@ -2239,7 +2239,7 @@ impl<'semantic> Analyzer<'semantic> {
     fn callable_capability(&self, type_id: TypeId) -> Option<AccessCapability> {
         match self.types.types().get(type_id)? {
             SemanticType::Callable { capability, .. } => Some(*capability),
-            SemanticType::GarbageCollected { target, .. } => {
+            SemanticType::Gc { target, .. } => {
                 match self.types.types().get(*target)? {
                     SemanticType::Callable { capability, .. } => Some(*capability),
                     _ => None,
@@ -2277,10 +2277,11 @@ impl<'semantic> Analyzer<'semantic> {
 
     /// Types prefix GC allocation and records how its operand enters GC storage.
     ///
-    /// Fresh temporaries are moved into a new allocation, existing GC
-    /// references are reused, and plain places are rejected because allocation
-    /// cannot change the storage identity of an existing value.
-    fn synthesize_garbage_collection(&mut self, value: &Expression) -> Option<TypedExpression> {
+    /// Fresh temporaries are moved into a new allocation, while applying `&`
+    /// to an existing GC reference copies that reference to the same allocation.
+    /// Plain places are rejected because allocation cannot change the storage
+    /// identity of an existing value.
+    fn synthesize_gc_allocation(&mut self, value: &Expression) -> Option<TypedExpression> {
         let source = self.synthesize(value)?;
         let semantic = self
             .types
@@ -2290,18 +2291,18 @@ impl<'semantic> Analyzer<'semantic> {
         if matches!(semantic, SemanticType::Recovery | SemanticType::Divergence) {
             return Some(source);
         }
-        if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+        if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
             self.checking
                 .transfers
-                .insert(value.id, ValueTransfer::ReuseGarbageCollected);
+                .insert(value.id, ValueTransfer::CopyGcReference);
             return Some(TypedExpression {
                 type_id: source.type_id,
-                category: ValueCategory::GarbageCollectedReference,
+                category: ValueCategory::GcReference,
             });
         }
         if source.category != ValueCategory::FreshTemporary {
             self.checking.errors.push(ExpressionCheckingError {
-                kind: ExpressionCheckingErrorKind::InvalidGarbageCollectionSource {
+                kind: ExpressionCheckingErrorKind::InvalidGcAllocationSource {
                     found: source.type_id,
                     category: source.category,
                 },
@@ -2313,14 +2314,14 @@ impl<'semantic> Analyzer<'semantic> {
         let type_id = self
             .types
             .types_mut()
-            .garbage_collected(source.type_id)
+            .gc(source.type_id)
             .expect("fresh value must have GC-qualifiable storage");
         self.checking
             .transfers
-            .insert(value.id, ValueTransfer::AllocateGarbageCollected);
+            .insert(value.id, ValueTransfer::AllocateGc);
         Some(TypedExpression {
             type_id,
-            category: ValueCategory::GarbageCollectedReference,
+            category: ValueCategory::GcReference,
         })
     }
 
@@ -2460,7 +2461,8 @@ impl<'semantic> Analyzer<'semantic> {
     /// Labels are resolved against collected fields while initializers are
     /// analyzed in source order. Successful values must be independently
     /// storable: primitives copy, fresh plain values move, and GC references
-    /// are reused. Named plain values therefore require an explicit `.copy()`.
+    /// have their references copied. Named plain values therefore require an
+    /// explicit `.copy()`.
     fn synthesize_named_struct_construction(
         &mut self,
         expression: &Expression,
@@ -2926,7 +2928,7 @@ impl<'semantic> Analyzer<'semantic> {
                 expression: declaration,
                 capability,
             } => Some((*declaration, *capability, false)),
-            SemanticType::GarbageCollected { target, capability } => {
+            SemanticType::Gc { target, capability } => {
                 match self.types.types().get(*target)? {
                     SemanticType::NamedStruct { declaration, .. }
                     | SemanticType::AnonymousStruct {
@@ -2994,7 +2996,7 @@ impl<'semantic> Analyzer<'semantic> {
             .get(declared)
             .expect("field type belongs to the program type store");
         let capability =
-            if declared_semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+            if declared_semantic.storage_semantics() == Some(StorageSemantics::Gc) {
                 match (object_capability, declared_semantic.capability()) {
                     (AccessCapability::Const, _) | (_, Some(AccessCapability::Const)) => {
                         AccessCapability::Const
@@ -3017,14 +3019,14 @@ impl<'semantic> Analyzer<'semantic> {
     /// field remains a GC reference regardless of its containing object.
     fn field_category(&self, object: TypedExpression, field_type: TypeId) -> ValueCategory {
         if self.types.types().get(field_type).is_some_and(|semantic| {
-            semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
+            semantic.storage_semantics() == Some(StorageSemantics::Gc)
         }) {
-            return ValueCategory::GarbageCollectedReference;
+            return ValueCategory::GcReference;
         }
         match object.category {
             ValueCategory::FreshTemporary => ValueCategory::FreshTemporary,
             ValueCategory::OwnedInlinePlace => ValueCategory::OwnedInlinePlace,
-            ValueCategory::BorrowedPlace | ValueCategory::GarbageCollectedReference => {
+            ValueCategory::BorrowedPlace | ValueCategory::GcReference => {
                 ValueCategory::BorrowedPlace
             }
         }
@@ -3046,8 +3048,8 @@ impl<'semantic> Analyzer<'semantic> {
             .types()
             .get(source.type_id)
             .expect("owning source type belongs to the program type store");
-        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
-            Some(ValueTransfer::ReuseGarbageCollected)
+        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+            Some(ValueTransfer::CopyGcReference)
         } else if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
             Some(ValueTransfer::TrivialCopy)
         } else if source.category == ValueCategory::FreshTemporary {
@@ -3328,7 +3330,7 @@ impl<'semantic> Analyzer<'semantic> {
                 return_type,
                 ..
             }) => Some((parameters, return_type)),
-            Some(SemanticType::GarbageCollected { target, .. }) => {
+            Some(SemanticType::Gc { target, .. }) => {
                 match self.types.types().get(target).cloned() {
                     Some(SemanticType::Callable {
                         parameters,
@@ -3573,7 +3575,7 @@ impl<'semantic> Analyzer<'semantic> {
             true
         };
         let transfer = match receiver.storage {
-            ReceiverStorage::GarbageCollected => ValueTransfer::ReuseGarbageCollected,
+            ReceiverStorage::Gc => ValueTransfer::CopyGcReference,
             ReceiverStorage::Plain => ValueTransfer::Borrow,
         };
         self.checking.transfers.insert(object.id, transfer);
@@ -3594,7 +3596,7 @@ impl<'semantic> Analyzer<'semantic> {
 
     /// Validates the hidden receiver supplied by a direct method call and
     /// records how it is passed. Plain methods use `Borrow` regardless of the
-    /// object's storage class; `&self` methods reuse a GC reference. A fresh
+    /// object's storage class; `&self` methods copy a GC reference. A fresh
     /// plain temporary may independently select mut access.
     fn check_method_receiver(
         &mut self,
@@ -3624,7 +3626,7 @@ impl<'semantic> Analyzer<'semantic> {
         }
         if storage_valid && capability_valid {
             let transfer = match receiver.storage {
-                ReceiverStorage::GarbageCollected => ValueTransfer::ReuseGarbageCollected,
+                ReceiverStorage::Gc => ValueTransfer::CopyGcReference,
                 ReceiverStorage::Plain => ValueTransfer::Borrow,
             };
             self.checking.transfers.insert(object.id, transfer);
@@ -3680,9 +3682,9 @@ impl<'semantic> Analyzer<'semantic> {
     /// supplied by the callee's result storage.
     fn call_result(&self, return_type: TypeId) -> TypedExpression {
         let category = if self.types.types().get(return_type).is_some_and(|semantic| {
-            semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
+            semantic.storage_semantics() == Some(StorageSemantics::Gc)
         }) {
-            ValueCategory::GarbageCollectedReference
+            ValueCategory::GcReference
         } else {
             ValueCategory::FreshTemporary
         };
@@ -3810,13 +3812,13 @@ impl<'semantic> Analyzer<'semantic> {
                 type_id: owner,
                 category: ValueCategory::BorrowedPlace,
             },
-            ReceiverStorage::GarbageCollected => TypedExpression {
+            ReceiverStorage::Gc => TypedExpression {
                 type_id: self
                     .types
                     .types_mut()
-                    .garbage_collected(owner)
+                    .gc(owner)
                     .expect("method owner is a value type"),
-                category: ValueCategory::GarbageCollectedReference,
+                category: ValueCategory::GcReference,
             },
         };
         self.checking.places.insert(
@@ -3842,7 +3844,7 @@ impl<'semantic> Analyzer<'semantic> {
             .get(type_id)
             .expect("parameter type belongs to the program type store");
         match semantic.storage_semantics() {
-            Some(StorageSemantics::GarbageCollected) => ValueCategory::GarbageCollectedReference,
+            Some(StorageSemantics::Gc) => ValueCategory::GcReference,
             _ if semantic.copy_semantics() == Some(CopySemantics::Trivial) => {
                 ValueCategory::OwnedInlinePlace
             }
@@ -3859,10 +3861,10 @@ impl<'semantic> Analyzer<'semantic> {
         if matches!(semantic, SemanticType::Recovery | SemanticType::Divergence) {
             return (source.category, None);
         }
-        if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+        if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
             return (
-                ValueCategory::GarbageCollectedReference,
-                Some(ValueTransfer::ReuseGarbageCollected),
+                ValueCategory::GcReference,
+                Some(ValueTransfer::CopyGcReference),
             );
         }
         if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
@@ -3886,10 +3888,10 @@ impl<'semantic> Analyzer<'semantic> {
             .types()
             .get(source.type_id)
             .expect("assigned type belongs to the program type store");
-        if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+        if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
             return (
-                ValueCategory::GarbageCollectedReference,
-                ValueTransfer::ReuseGarbageCollected,
+                ValueCategory::GcReference,
+                ValueTransfer::CopyGcReference,
             );
         }
         if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
@@ -4000,7 +4002,7 @@ impl<'semantic> Analyzer<'semantic> {
                 }
             }
             Some(
-                SemanticType::GarbageCollected { .. }
+                SemanticType::Gc { .. }
                 | SemanticType::Primitive { .. }
                 | SemanticType::Callable { .. }
                 | SemanticType::Interface { .. }
@@ -4022,8 +4024,8 @@ impl<'semantic> Analyzer<'semantic> {
         if matches!(semantic, SemanticType::Recovery | SemanticType::Divergence) {
             return None;
         }
-        if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
-            return Some(ValueTransfer::ReuseGarbageCollected);
+        if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+            return Some(ValueTransfer::CopyGcReference);
         }
         if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
             return Some(ValueTransfer::TrivialCopy);
@@ -4277,8 +4279,8 @@ mod tests {
         (callee, arguments)
     }
 
-    fn garbage_collected(expression: &Expression) -> &Expression {
-        let ExpressionKind::GarbageCollect(value) = &expression.kind else {
+    fn gc(expression: &Expression) -> &Expression {
+        let ExpressionKind::GcAllocate(value) = &expression.kind else {
             panic!("expected garbage-collection expression")
         };
         value
@@ -4587,7 +4589,7 @@ mod tests {
         );
         assert_eq!(
             checking.expressions[&shared.id].category,
-            ValueCategory::GarbageCollectedReference
+            ValueCategory::GcReference
         );
         let (mixed_then, mixed_else) = conditional_branches(mixed);
         let mixed_values = [
@@ -4623,7 +4625,7 @@ mod tests {
         for value in shared_values {
             assert_eq!(
                 checking.transfers[&value.id],
-                ValueTransfer::ReuseGarbageCollected
+                ValueTransfer::CopyGcReference
             );
         }
     }
@@ -4784,7 +4786,7 @@ mod tests {
         let expected_categories = [
             ValueCategory::OwnedInlinePlace,
             ValueCategory::BorrowedPlace,
-            ValueCategory::GarbageCollectedReference,
+            ValueCategory::GcReference,
         ];
         for (index, expected_category) in expected_categories.into_iter().enumerate() {
             let parameter = named_parameter(inspect, index);
@@ -4810,12 +4812,12 @@ mod tests {
         };
         assert_eq!(
             checking.transfers.get(&alias_initializer.id),
-            Some(&ValueTransfer::ReuseGarbageCollected)
+            Some(&ValueTransfer::CopyGcReference)
         );
     }
 
     #[test]
-    fn types_plain_and_garbage_collected_self() {
+    fn types_plain_and_gc_self() {
         let source = concat!(
             "struct Item { ",
             "fn plain(mut self) { self; } ",
@@ -4841,11 +4843,11 @@ mod tests {
         );
         assert_eq!(
             checking.expressions[&shared.id].category,
-            ValueCategory::GarbageCollectedReference
+            ValueCategory::GcReference
         );
         assert!(matches!(
             types.types().get(checking.expressions[&shared.id].type_id),
-            Some(SemanticType::GarbageCollected {
+            Some(SemanticType::Gc {
                 capability: AccessCapability::Mut,
                 ..
             })
@@ -5323,7 +5325,7 @@ mod tests {
             ),
             (
                 body_value(function(&program.declarations[6])),
-                ValueTransfer::ReuseGarbageCollected,
+                ValueTransfer::CopyGcReference,
             ),
             (
                 body_value(function(&program.declarations[8])),
@@ -5339,10 +5341,10 @@ mod tests {
             assert_eq!(checking.transfers.get(&value.id), Some(&transfer));
         }
         let allocated = body_value(function(&program.declarations[6]));
-        let allocation_source = garbage_collected(allocated);
+        let allocation_source = gc(allocated);
         assert_eq!(
             checking.transfers.get(&allocation_source.id),
-            Some(&ValueTransfer::AllocateGarbageCollected)
+            Some(&ValueTransfer::AllocateGc)
         );
         assert!(checking.errors.is_empty());
     }
@@ -5478,7 +5480,7 @@ mod tests {
             (
                 &main.body.statements[2],
                 3,
-                ValueCategory::GarbageCollectedReference,
+                ValueCategory::GcReference,
             ),
         ] {
             let called = expression(statement);
@@ -5513,7 +5515,7 @@ mod tests {
             ValueTransfer::TrivialCopy,
             ValueTransfer::Borrow,
             ValueTransfer::Borrow,
-            ValueTransfer::ReuseGarbageCollected,
+            ValueTransfer::CopyGcReference,
         ]) {
             assert_eq!(checking.transfers.get(&argument.id), Some(&transfer));
         }
@@ -5521,7 +5523,7 @@ mod tests {
     }
 
     #[test]
-    fn allocates_fresh_values_and_reuses_gc_references() {
+    fn allocates_fresh_values_and_copies_gc_references() {
         let source = concat!(
             "struct Item {}\n",
             "fn make() -> Item { Item {} }\n",
@@ -5549,22 +5551,22 @@ mod tests {
                 .expect("binding should have a symbol");
             assert_eq!(
                 checking.bindings[&symbol].category,
-                ValueCategory::GarbageCollectedReference
+                ValueCategory::GcReference
             );
             initializers.push(initializer);
         }
         for initializer in &initializers {
             assert_eq!(
                 checking.expressions[&initializer.id].category,
-                ValueCategory::GarbageCollectedReference
+                ValueCategory::GcReference
             );
         }
 
-        let number_value = garbage_collected(initializers[0]);
+        let number_value = gc(initializers[0]);
         let number_type = checking.expressions[&initializers[0].id].type_id;
         let number_target = types
             .types()
-            .garbage_collected_target(number_type)
+            .gc_target(number_type)
             .expect("allocated integer should have a GC target");
         assert!(matches!(
             types.types().get(number_target),
@@ -5574,11 +5576,11 @@ mod tests {
             })
         ));
 
-        let text_value = garbage_collected(initializers[1]);
+        let text_value = gc(initializers[1]);
         let text_type = checking.expressions[&initializers[1].id].type_id;
         let text_target = types
             .types()
-            .garbage_collected_target(text_type)
+            .gc_target(text_type)
             .expect("allocated string should have a GC target");
         assert!(matches!(
             types.types().get(text_target),
@@ -5588,10 +5590,10 @@ mod tests {
             })
         ));
 
-        let item_value = garbage_collected(initializers[2]);
+        let item_value = gc(initializers[2]);
         let item_type = checking.expressions[&initializers[2].id].type_id;
         assert_eq!(
-            types.types().garbage_collected_target(item_type),
+            types.types().gc_target(item_type),
             Some(
                 signatures
                     .callable(function(&program.declarations[1]).id)
@@ -5600,7 +5602,7 @@ mod tests {
             )
         );
 
-        let again_value = garbage_collected(initializers[4]);
+        let again_value = gc(initializers[4]);
         assert_eq!(
             checking.expressions[&initializers[4].id].type_id,
             checking.expressions[&initializers[3].id].type_id
@@ -5608,17 +5610,17 @@ mod tests {
         for value in [number_value, text_value, item_value] {
             assert_eq!(
                 checking.transfers.get(&value.id),
-                Some(&ValueTransfer::AllocateGarbageCollected)
+                Some(&ValueTransfer::AllocateGc)
             );
         }
         assert_eq!(
             checking.transfers.get(&again_value.id),
-            Some(&ValueTransfer::ReuseGarbageCollected)
+            Some(&ValueTransfer::CopyGcReference)
         );
         for initializer in initializers {
             assert_eq!(
                 checking.transfers.get(&initializer.id),
-                Some(&ValueTransfer::ReuseGarbageCollected)
+                Some(&ValueTransfer::CopyGcReference)
             );
         }
         assert!(checking.errors.is_empty());
@@ -5648,17 +5650,17 @@ mod tests {
         else {
             panic!("expected recovered binding")
         };
-        let local = garbage_collected(recovered);
+        let local = gc(recovered);
         let borrowed = expression(&inspect.body.statements[2]);
-        let parameter = garbage_collected(borrowed);
+        let parameter = gc(borrowed);
         let overflow = expression(&inspect.body.statements[3]);
-        let overflow_value = garbage_collected(overflow);
+        let overflow_value = gc(overflow);
 
         assert_eq!(checking.errors.len(), 3);
         assert_eq!(checking.errors[0].span, local.span);
         assert!(matches!(
             checking.errors[0].kind,
-            ExpressionCheckingErrorKind::InvalidGarbageCollectionSource {
+            ExpressionCheckingErrorKind::InvalidGcAllocationSource {
                 category: ValueCategory::OwnedInlinePlace,
                 ..
             }
@@ -5666,7 +5668,7 @@ mod tests {
         assert_eq!(checking.errors[1].span, parameter.span);
         assert!(matches!(
             checking.errors[1].kind,
-            ExpressionCheckingErrorKind::InvalidGarbageCollectionSource {
+            ExpressionCheckingErrorKind::InvalidGcAllocationSource {
                 category: ValueCategory::BorrowedPlace,
                 ..
             }
@@ -5827,10 +5829,10 @@ mod tests {
         let (immediate_lambda, _) = call(immediate);
         assert!(checking.lambda_captures[&immediate_lambda.id].is_empty());
         let heap = binding_initializer(&main.body.statements[4]);
-        let heap_lambda = garbage_collected(heap);
+        let heap_lambda = gc(heap);
         assert_eq!(
             checking.transfers[&heap_lambda.id],
-            ValueTransfer::AllocateGarbageCollected
+            ValueTransfer::AllocateGc
         );
         let heap_called = binding_initializer(&main.body.statements[5]);
         let (_, arguments) = call(heap_called);
@@ -6239,7 +6241,7 @@ mod tests {
         };
         assert_eq!(
             checking.transfers[&value.id],
-            ValueTransfer::ReuseGarbageCollected
+            ValueTransfer::CopyGcReference
         );
     }
 
@@ -6345,7 +6347,7 @@ mod tests {
         };
         assert_eq!(
             checking.transfers[&gc_object.id],
-            ValueTransfer::ReuseGarbageCollected
+            ValueTransfer::CopyGcReference
         );
 
         let copied = binding_initializer(&inspect.body.statements[9]);
@@ -6449,7 +6451,7 @@ mod tests {
     }
 
     #[test]
-    fn reuses_gc_references_stored_in_named_fields() {
+    fn copies_gc_references_stored_in_named_fields() {
         let source = concat!(
             "struct Item {}\n",
             "struct Holder { item: &Item, }\n",
@@ -6469,12 +6471,12 @@ mod tests {
         };
         assert_eq!(
             checking.transfers[&fields[0].value.id],
-            ValueTransfer::ReuseGarbageCollected
+            ValueTransfer::CopyGcReference
         );
         let read = binding_initializer(&inspect.body.statements[1]);
         assert_eq!(
             checking.expressions[&read.id].category,
-            ValueCategory::GarbageCollectedReference
+            ValueCategory::GcReference
         );
     }
 
@@ -6715,7 +6717,7 @@ mod tests {
         ));
         assert_eq!(
             checking.errors[3].kind,
-            ExpressionCheckingErrorKind::InterfaceRequiresGarbageCollectedSource
+            ExpressionCheckingErrorKind::InterfaceRequiresGcSource
         );
         assert!(matches!(
             checking.errors[4].kind,
@@ -6726,7 +6728,7 @@ mod tests {
         let borrowed = binding_initializer(&main.body.statements[9]);
         assert_eq!(
             checking.expressions[&heap.id].category,
-            ValueCategory::GarbageCollectedReference
+            ValueCategory::GcReference
         );
         assert_eq!(
             checking.expressions[&borrowed.id].category,
