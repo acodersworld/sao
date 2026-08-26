@@ -176,11 +176,7 @@ pub enum BuiltinTypeTemplate {
 
 impl BuiltinTypeTemplate {
     /// Instantiates this template using the supplied `T`/`K`/`V` substitutions.
-    pub fn instantiate(
-        &self,
-        substitutions: &[TypeId],
-        types: &mut TypeStore,
-    ) -> Option<TypeId> {
+    pub fn instantiate(&self, substitutions: &[TypeId], types: &mut TypeStore) -> Option<TypeId> {
         match self {
             Self::Primitive {
                 primitive,
@@ -396,11 +392,7 @@ impl BuiltinSignatures {
             BuiltinMemberOwner::Primitive(PrimitiveType::String),
             HashMap::from([(
                 "length",
-                BuiltinMemberSignature::Callable(callable(
-                    const_receiver,
-                    vec![],
-                    int.clone(),
-                )),
+                BuiltinMemberSignature::Callable(callable(const_receiver, vec![], int.clone())),
             )]),
         );
         members.insert(
@@ -408,11 +400,7 @@ impl BuiltinSignatures {
             HashMap::from([
                 (
                     "length",
-                    BuiltinMemberSignature::Callable(callable(
-                        const_receiver,
-                        vec![],
-                        int.clone(),
-                    )),
+                    BuiltinMemberSignature::Callable(callable(const_receiver, vec![], int.clone())),
                 ),
                 (
                     "concat",
@@ -522,11 +510,7 @@ impl BuiltinSignatures {
     }
 
     #[must_use]
-    pub fn member(
-        &self,
-        owner: BuiltinMemberOwner,
-        name: &str,
-    ) -> Option<&BuiltinMemberSignature> {
+    pub fn member(&self, owner: BuiltinMemberOwner, name: &str) -> Option<&BuiltinMemberSignature> {
         self.members.get(&owner)?.get(name)
     }
 
@@ -543,10 +527,7 @@ impl BuiltinSignatures {
     }
 }
 
-fn primitive(
-    primitive: PrimitiveType,
-    capability: AccessCapability,
-) -> BuiltinTypeTemplate {
+fn primitive(primitive: PrimitiveType, capability: AccessCapability) -> BuiltinTypeTemplate {
     BuiltinTypeTemplate::Primitive {
         primitive,
         capability,
@@ -690,8 +671,7 @@ impl fmt::Display for SignatureCollectionError {
 
 impl std::error::Error for SignatureCollectionError {}
 
-pub type SignatureCollectionResult =
-    Result<SignatureCollection, Vec<SignatureCollectionError>>;
+pub type SignatureCollectionResult = Result<SignatureCollection, Vec<SignatureCollectionError>>;
 
 /// Collects all declaration and explicit callable signatures in one program.
 pub fn collect_signatures(
@@ -885,8 +865,14 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                 }
             }
         }
-        self.named_structs
-            .insert(structure.id, StructSignature { type_id, members, field_order });
+        self.named_structs.insert(
+            structure.id,
+            StructSignature {
+                type_id,
+                members,
+                field_order,
+            },
+        );
     }
 
     fn collect_function(&mut self, function: &Function) -> CallableSignature {
@@ -953,11 +939,10 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
         }
         let return_type = match return_type {
             Some(syntax) => self.resolved_type(syntax.id),
-            None => {
-                self.types
-                    .types_mut()
-                    .primitive(PrimitiveType::Unit, AccessCapability::Const)
-            }
+            None => self
+                .types
+                .types_mut()
+                .primitive(PrimitiveType::Unit, AccessCapability::Const),
         };
         CallableSignature {
             receiver,
@@ -1054,9 +1039,8 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
 
     fn visit_expression(&mut self, expression: &Expression) {
         match &expression.kind {
-            ExpressionKind::Identifier
-            | ExpressionKind::SelfValue
-            | ExpressionKind::Literal(_) => {}
+            ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {
+            }
             ExpressionKind::Group(inner)
             | ExpressionKind::GarbageCollect(inner)
             | ExpressionKind::PrimitiveConversion { value: inner, .. }
@@ -1205,8 +1189,14 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                 }
             }
         }
-        self.anonymous_structs
-            .insert(expression, StructSignature { type_id, members, field_order });
+        self.anonymous_structs.insert(
+            expression,
+            StructSignature {
+                type_id,
+                members,
+                field_order,
+            },
+        );
     }
 
     /// Reserves `.copy()` for the compiler-defined recursive copy operation in
@@ -1302,10 +1292,8 @@ mod tests {
         let program = parse_program(&mut parse_context, Lexer::new(&module))
             .expect("test source should parse");
         let names = resolve_program(&module, &program).expect("test names should resolve");
-        let context =
-            resolve_program_context(&program).expect("test context should resolve");
-        let types =
-            resolve_types(&module, &program, &names).expect("test types should resolve");
+        let context = resolve_program_context(&program).expect("test context should resolve");
+        let types = resolve_types(&module, &program, &names).expect("test types should resolve");
         (module, program, names, context, types)
     }
 
@@ -1342,7 +1330,9 @@ mod tests {
                     ..
                 }),
             ..
-        }) = signatures.named_struct(first.id).and_then(|item| item.member("later"))
+        }) = signatures
+            .named_struct(first.id)
+            .and_then(|item| item.member("later"))
         else {
             panic!("expected First.later")
         };
@@ -1358,7 +1348,9 @@ mod tests {
                     ..
                 }),
             ..
-        }) = signatures.named_struct(later.id).and_then(|item| item.member("first"))
+        }) = signatures
+            .named_struct(later.id)
+            .and_then(|item| item.member("first"))
         else {
             panic!("expected Later.first")
         };
@@ -1400,7 +1392,9 @@ mod tests {
         let Some(StructMemberSignature {
             kind: StructMemberSignatureKind::Method { method_id, .. },
             ..
-        }) = signatures.named_struct(file.id).and_then(|item| item.member("read"))
+        }) = signatures
+            .named_struct(file.id)
+            .and_then(|item| item.member("read"))
         else {
             panic!("expected File.read")
         };
@@ -1484,8 +1478,7 @@ mod tests {
         let Some(StructMemberSignature {
             kind:
                 StructMemberSignatureKind::Field(FieldSignature {
-                    type_id: Some(_),
-                    ..
+                    type_id: Some(_), ..
                 }),
             ..
         }) = anonymous.member("explicit")
@@ -1493,10 +1486,7 @@ mod tests {
             panic!("annotated field should be complete")
         };
         let Some(StructMemberSignature {
-            kind:
-                StructMemberSignatureKind::Field(FieldSignature {
-                    type_id: None, ..
-                }),
+            kind: StructMemberSignatureKind::Field(FieldSignature { type_id: None, .. }),
             ..
         }) = anonymous.member("inferred")
         else {
@@ -1513,7 +1503,9 @@ mod tests {
         let StructMember::Function(run) = &worker.members[1] else {
             panic!("expected Worker.run")
         };
-        let run = signatures.callable(run.id).expect("run should be collected");
+        let run = signatures
+            .callable(run.id)
+            .expect("run should be collected");
         assert_eq!(
             run.receiver,
             Some(ReceiverSignature {
@@ -1569,7 +1561,11 @@ mod tests {
             errors[5].kind,
             SignatureCollectionErrorKind::DuplicateMember { ref name, .. } if name == "field"
         ));
-        assert!(errors.windows(2).all(|pair| pair[0].span.start < pair[1].span.start));
+        assert!(
+            errors
+                .windows(2)
+                .all(|pair| pair[0].span.start < pair[1].span.start)
+        );
     }
 
     #[test]
@@ -1582,10 +1578,16 @@ mod tests {
         let errors = collect_signatures(&module, &program, &names, &context, &mut types)
             .expect_err("reserved copy members should be rejected");
         assert_eq!(errors.len(), 3);
-        assert!(errors.iter().all(|error| {
-            error.kind == SignatureCollectionErrorKind::ReservedCopyMember
-        }));
-        assert!(errors.windows(2).all(|pair| pair[0].span.start < pair[1].span.start));
+        assert!(
+            errors
+                .iter()
+                .all(|error| { error.kind == SignatureCollectionErrorKind::ReservedCopyMember })
+        );
+        assert!(
+            errors
+                .windows(2)
+                .all(|pair| pair[0].span.start < pair[1].span.start)
+        );
     }
 
     #[test]
@@ -1607,30 +1609,38 @@ mod tests {
                 .and_then(|type_id| types.types().get(type_id)),
             Some(SemanticType::Callable { .. })
         ));
-        assert!(builtins
-            .member(
-                BuiltinMemberOwner::Parameterized(BuiltinType::Queue),
-                "try_receive"
-            )
-            .is_some());
-        assert!(builtins
-            .member(
-                BuiltinMemberOwner::Parameterized(BuiltinType::Error),
-                "value"
-            )
-            .is_some());
-        assert!(builtins
-            .member(
-                BuiltinMemberOwner::Parameterized(BuiltinType::Vector),
-                "length"
-            )
-            .is_none());
-        assert!(builtins
-            .member(
-                BuiltinMemberOwner::Parameterized(BuiltinType::Map),
-                "insert"
-            )
-            .is_none());
+        assert!(
+            builtins
+                .member(
+                    BuiltinMemberOwner::Parameterized(BuiltinType::Queue),
+                    "try_receive"
+                )
+                .is_some()
+        );
+        assert!(
+            builtins
+                .member(
+                    BuiltinMemberOwner::Parameterized(BuiltinType::Error),
+                    "value"
+                )
+                .is_some()
+        );
+        assert!(
+            builtins
+                .member(
+                    BuiltinMemberOwner::Parameterized(BuiltinType::Vector),
+                    "length"
+                )
+                .is_none()
+        );
+        assert!(
+            builtins
+                .member(
+                    BuiltinMemberOwner::Parameterized(BuiltinType::Map),
+                    "insert"
+                )
+                .is_none()
+        );
 
         let int = types
             .types_mut()

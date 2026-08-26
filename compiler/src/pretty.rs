@@ -312,10 +312,7 @@ fn format_parameter_into(
             );
             child_type(output, source, "type", type_annotation, depth);
         }
-        FunctionParameterKind::Receiver {
-            storage,
-            ..
-        } => {
+        FunctionParameterKind::Receiver { storage, .. } => {
             line(
                 output,
                 depth,
@@ -458,7 +455,11 @@ fn format_expression_into(
             child_expression(output, source, "value", value, depth);
         }
         ExpressionKind::GarbageCollect(inner) => {
-            line(output, depth, format_args!("GarbageCollect {}", location(span)));
+            line(
+                output,
+                depth,
+                format_args!("GarbageCollect {}", location(span)),
+            );
             child_expression(output, source, "value", inner, depth);
         }
         ExpressionKind::StructConstruction { name, fields } => {

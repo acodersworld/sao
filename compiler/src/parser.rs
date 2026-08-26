@@ -1350,7 +1350,8 @@ where
         match token.kind {
             TokenKind::Ampersand => {
                 self.advance()?;
-                let operand = self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
+                let operand =
+                    self.expression(prefix_binding_power(token.kind), allow_struct_construction)?;
                 let span = Span::new(self.module_id, token.span.start, operand.span.end);
                 let operand = match operand.kind {
                     ExpressionKind::GarbageCollect(inner) => *inner,
@@ -2207,9 +2208,9 @@ fn assign_type_ids(type_syntax: &mut TypeSyntax, context: &mut ParseContext) {
                 assign_type_ids(argument, context);
             }
         }
-        TypeKind::Mutable(inner)
-        | TypeKind::GarbageCollected(inner)
-        | TypeKind::Group(inner) => assign_type_ids(inner, context),
+        TypeKind::Mutable(inner) | TypeKind::GarbageCollected(inner) | TypeKind::Group(inner) => {
+            assign_type_ids(inner, context)
+        }
         TypeKind::Callable {
             parameters,
             return_type,
@@ -2318,9 +2319,7 @@ const PREFIX_BINDING_POWER: u8 = 23;
 
 const fn prefix_binding_power(kind: TokenKind) -> u8 {
     match kind {
-        TokenKind::Ampersand
-        | TokenKind::Minus
-        | TokenKind::Bang => PREFIX_BINDING_POWER,
+        TokenKind::Ampersand | TokenKind::Minus | TokenKind::Bang => PREFIX_BINDING_POWER,
         _ => LOWEST_BINDING_POWER,
     }
 }
@@ -3164,10 +3163,7 @@ mod tests {
             let StatementKind::Function(function) = statement.kind else {
                 panic!("expected a function declaration");
             };
-            let FunctionParameterKind::Receiver {
-                storage,
-                ..
-            } = &function.parameters[0].kind
+            let FunctionParameterKind::Receiver { storage, .. } = &function.parameters[0].kind
             else {
                 panic!("expected a receiver");
             };
@@ -6226,7 +6222,10 @@ mod tests {
         let ExpressionKind::GarbageCollect(value) = left.kind else {
             panic!("expected GC allocation on the left");
         };
-        assert!(matches!(value.kind, ExpressionKind::StructConstruction { .. }));
+        assert!(matches!(
+            value.kind,
+            ExpressionKind::StructConstruction { .. }
+        ));
 
         assert!(matches!(
             parse("&&Point {}"),

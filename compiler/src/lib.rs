@@ -217,22 +217,9 @@ fn main() {
             .expect("every callable and control-flow context should be valid");
         let mut types = resolve_types(&module, &program, &names)
             .expect("every source type in the complex program should resolve");
-        let signatures = collect_signatures(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-        )
-        .expect("every declaration signature in the complex program should collect");
+        let signatures = collect_signatures(&module, &program, &names, &context, &mut types)
+            .expect("every declaration signature in the complex program should collect");
 
-        assert_program_checks(
-            &module,
-            &program,
-            &names,
-            &context,
-            &signatures,
-            &mut types,
-        );
+        assert_program_checks(&module, &program, &names, &context, &signatures, &mut types);
     }
 }

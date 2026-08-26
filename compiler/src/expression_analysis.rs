@@ -13,11 +13,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
-        AnonymousStructMember, AssignmentOperator, BinaryOperator, BindingMutability, BuiltinType,
-        BindingQualifiers, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
-        Function, FunctionParameter, FunctionParameterKind, LiteralKind, NodeId, PrimitiveType,
-        Program, ReceiverStorage, Statement, StatementKind, StructFieldInitializer, StructMember,
-        TypeSyntax, UnaryOperator, ValueCapability,
+        AnonymousStructMember, AssignmentOperator, BinaryOperator, BindingMutability,
+        BindingQualifiers, Block, BuiltinType, ConditionalElse, Declaration, Expression,
+        ExpressionKind, Function, FunctionParameter, FunctionParameterKind, LiteralKind, NodeId,
+        PrimitiveType, Program, ReceiverStorage, Statement, StatementKind, StructFieldInitializer,
+        StructMember, TypeSyntax, UnaryOperator, ValueCapability,
     },
     context_resolution::ContextResolution,
     name_resolution::NameResolution,
@@ -155,7 +155,10 @@ enum ResolvedMember {
     AssociatedFunction { declaration: NodeId },
     /// A method invoked directly through a value. Methods are never emitted as
     /// first-class bound callable values.
-    Method { declaration: NodeId, method_id: MethodId },
+    Method {
+        declaration: NodeId,
+        method_id: MethodId,
+    },
     /// A structurally selected requirement invoked through interface dispatch.
     InterfaceMethod {
         declaration: NodeId,
@@ -191,7 +194,10 @@ struct ExpressionCheckingError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExpressionCheckingErrorKind {
     IntegerLiteralOutOfRange,
-    TypeMismatch { expected: TypeId, found: TypeId },
+    TypeMismatch {
+        expected: TypeId,
+        found: TypeId,
+    },
     InvalidUnaryOperand {
         operator: UnaryOperator,
         found: TypeId,
@@ -208,8 +214,13 @@ enum ExpressionCheckingErrorKind {
         found: TypeId,
         category: ValueCategory,
     },
-    NotCallable { found: TypeId },
-    ArgumentCountMismatch { expected: usize, found: usize },
+    NotCallable {
+        found: TypeId,
+    },
+    ArgumentCountMismatch {
+        expected: usize,
+        found: usize,
+    },
     ConditionalElseRequired,
     ConditionalBranchValueRequired,
     InvalidAssignmentTarget,
@@ -222,13 +233,17 @@ enum ExpressionCheckingErrorKind {
     InvalidConstructionOwner,
     UnknownConstructionField,
     DuplicateConstructionField,
-    MissingConstructionField { declaration: NodeId },
+    MissingConstructionField {
+        declaration: NodeId,
+    },
     InvalidOwningSource {
         found: TypeId,
         category: ValueCategory,
     },
     UnknownMember,
-    InvalidMemberOwner { found: TypeId },
+    InvalidMemberOwner {
+        found: TypeId,
+    },
     FieldRequiresValue,
     AssociatedFunctionRequiresType,
     MethodRequiresValue,
@@ -237,7 +252,9 @@ enum ExpressionCheckingErrorKind {
     CopyRequiresValue,
     ReceiverStorageMismatch,
     ReceiverCapabilityMismatch,
-    MissingInterfaceMethod { declaration: NodeId },
+    MissingInterfaceMethod {
+        declaration: NodeId,
+    },
     IncompatibleInterfaceMethod {
         requirement: NodeId,
         implementation: NodeId,
@@ -247,7 +264,9 @@ enum ExpressionCheckingErrorKind {
         second: NodeId,
     },
     InterfaceRequiresGarbageCollectedSource,
-    InfiniteInlineLayout { owner: TypeId },
+    InfiniteInlineLayout {
+        owner: TypeId,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -309,9 +328,11 @@ impl LexicalIndex {
     ) {
         self.callable_parents.insert(function.id, parent);
         self.record_parameters(function.id, &function.parameters, names);
-        if let Some(receiver) = function.parameters.iter().find(|parameter| {
-            matches!(&parameter.kind, FunctionParameterKind::Receiver { .. })
-        }) {
+        if let Some(receiver) = function
+            .parameters
+            .iter()
+            .find(|parameter| matches!(&parameter.kind, FunctionParameterKind::Receiver { .. }))
+        {
             self.receiver_qualifiers
                 .insert(function.id, receiver.qualifiers);
         }
@@ -535,8 +556,8 @@ pub(super) fn assert_program_checks(
     signatures: &SignatureCollection,
     types: &mut TypeResolution,
 ) {
-    let checking = Analyzer::new(module, names, context, signatures, types, program)
-        .check_program(program);
+    let checking =
+        Analyzer::new(module, names, context, signatures, types, program).check_program(program);
     assert!(
         checking.errors.is_empty(),
         "the complex program should pass implemented expression checking: {:#?}",
@@ -678,11 +699,7 @@ impl<'semantic> Analyzer<'semantic> {
     /// Each parameter's collected semantic type, source qualifiers, and value
     /// category are recorded against its resolved symbol. Receivers are not
     /// included because `self` is typed separately from receiver metadata.
-    fn seed_callable_parameters(
-        &mut self,
-        callable: NodeId,
-        parameters: &[FunctionParameter],
-    ) {
+    fn seed_callable_parameters(&mut self, callable: NodeId, parameters: &[FunctionParameter]) {
         let signature = self
             .signatures
             .callable(callable)
@@ -839,9 +856,7 @@ impl<'semantic> Analyzer<'semantic> {
         let mut stored_type = if self.is_recovery(source.type_id) {
             source.type_id
         } else {
-            expected.unwrap_or_else(|| {
-                self.with_value_capability(source.type_id, qualifiers.value)
-            })
+            expected.unwrap_or_else(|| self.with_value_capability(source.type_id, qualifiers.value))
         };
         if expected.is_none()
             && !self.is_recovery(source.type_id)
@@ -900,19 +915,18 @@ impl<'semantic> Analyzer<'semantic> {
             .types()
             .get(source.type_id)
             .expect("return type belongs to the program type store");
-        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
-        {
+        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
             Some(ValueTransfer::ReuseGarbageCollected)
         } else {
             match semantic.copy_semantics() {
                 Some(CopySemantics::Trivial) => Some(ValueTransfer::TrivialCopy),
-                Some(CopySemantics::Recursive) => Some(
-                    if source.category == ValueCategory::FreshTemporary {
+                Some(CopySemantics::Recursive) => {
+                    Some(if source.category == ValueCategory::FreshTemporary {
                         ValueTransfer::MoveTemporary
                     } else {
                         ValueTransfer::RecursiveCopy
-                    },
-                ),
+                    })
+                }
                 Some(CopySemantics::NonEscapingErasedView)
                     if matches!(semantic, SemanticType::Callable { .. })
                         && source.category != ValueCategory::BorrowedPlace =>
@@ -1032,9 +1046,7 @@ impl<'semantic> Analyzer<'semantic> {
         };
         Some(BlockOutcome {
             typed: outcome.typed,
-            explicit_value: outcome
-                .explicitly_produces_value
-                .then_some(value.id),
+            explicit_value: outcome.explicitly_produces_value.then_some(value.id),
         })
     }
 
@@ -1118,13 +1130,14 @@ impl<'semantic> Analyzer<'semantic> {
         let mut condition_invalid = false;
         let incoming_categories = self.current_binding_categories.clone();
         let mut fallthrough_categories = incoming_categories.clone();
-        let mut branches = Vec::with_capacity(
-            arms.len() + if final_else.is_some() { 1 } else { 0 },
-        );
-        let mut branch_categories = Vec::with_capacity(
-            arms.len() + if final_else.is_some() { 1 } else { 0 },
-        );
-        let conditional_nodes: Vec<_> = arms.iter().map(|(conditional, _, _)| *conditional).collect();
+        let mut branches =
+            Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
+        let mut branch_categories =
+            Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
+        let conditional_nodes: Vec<_> = arms
+            .iter()
+            .map(|(conditional, _, _)| *conditional)
+            .collect();
         for (_, condition, branch) in arms {
             self.current_binding_categories = fallthrough_categories;
             let checked_condition = self.check(condition, bool_type)?;
@@ -1166,10 +1179,8 @@ impl<'semantic> Analyzer<'semantic> {
         if !has_else {
             completing_categories.push(&fallthrough_categories);
         }
-        self.current_binding_categories = self.merge_binding_categories(
-            &incoming_categories,
-            &completing_categories,
-        );
+        self.current_binding_categories =
+            self.merge_binding_categories(&incoming_categories, &completing_categories);
         let branch_invalid = branches
             .iter()
             .any(|(_, branch)| self.is_recovery(branch.typed.type_id));
@@ -1234,13 +1245,9 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         let mut typed = if any_explicit {
-            let mut values = normally_completing
-                .iter()
-                .filter_map(|(block, branch)| {
-                    branch
-                        .explicit_value
-                        .map(|id| (*block, id, branch.typed))
-                });
+            let mut values = normally_completing.iter().filter_map(|(block, branch)| {
+                branch.explicit_value.map(|id| (*block, id, branch.typed))
+            });
             let (_, _, first) = values
                 .next()
                 .expect("an explicit conditional has a normally completing value path");
@@ -1305,8 +1312,7 @@ impl<'semantic> Analyzer<'semantic> {
             invalid,
             has_else,
         );
-        self.checking.errors[first_error..]
-            .sort_by_key(|error| (error.span.start, error.span.end));
+        self.checking.errors[first_error..].sort_by_key(|error| (error.span.start, error.span.end));
         Some(outcome)
     }
 
@@ -1393,7 +1399,10 @@ impl<'semantic> Analyzer<'semantic> {
             .map(|(symbol, incoming_category)| {
                 let mut merged = *incoming_category;
                 for categories in completing {
-                    let category = categories.get(symbol).copied().unwrap_or(*incoming_category);
+                    let category = categories
+                        .get(symbol)
+                        .copied()
+                        .unwrap_or(*incoming_category);
                     if merged != category {
                         merged = match (merged, category) {
                             (ValueCategory::GarbageCollectedReference, _)
@@ -1445,10 +1454,7 @@ impl<'semantic> Analyzer<'semantic> {
                 .any(|(_, branch)| branch.explicit_value.is_some())
             {
                 ExpressionOutcome {
-                    typed: self.merge_conditional_values(
-                        outer.typed.type_id,
-                        &normally_completing,
-                    ),
+                    typed: self.merge_conditional_values(outer.typed.type_id, &normally_completing),
                     explicitly_produces_value: true,
                 }
             } else {
@@ -1461,12 +1467,10 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
-    fn record_expression_outcome(
-        &mut self,
-        expression: &Expression,
-        outcome: ExpressionOutcome,
-    ) {
-        self.checking.expressions.insert(expression.id, outcome.typed);
+    fn record_expression_outcome(&mut self, expression: &Expression, outcome: ExpressionOutcome) {
+        self.checking
+            .expressions
+            .insert(expression.id, outcome.typed);
         self.checking
             .explicit_values
             .insert(expression.id, outcome.explicitly_produces_value);
@@ -1501,18 +1505,17 @@ impl<'semantic> Analyzer<'semantic> {
                     .insert(expression.id, outcome.explicit_value.is_some());
                 outcome.typed
             }
-            ExpressionKind::If { .. } => self
-                .synthesize_conditional_expression(expression, ConditionalUse::Value)?
-                .typed,
+            ExpressionKind::If { .. } => {
+                self.synthesize_conditional_expression(expression, ConditionalUse::Value)?
+                    .typed
+            }
             ExpressionKind::Lambda {
                 parameters, body, ..
             } => self.synthesize_lambda(expression, parameters, body)?,
             ExpressionKind::PrimitiveConversion { target, value } => {
                 self.synthesize_primitive_conversion(*target, value)?
             }
-            ExpressionKind::GarbageCollect(value) => {
-                self.synthesize_garbage_collection(value)?
-            }
+            ExpressionKind::GarbageCollect(value) => self.synthesize_garbage_collection(value)?,
             ExpressionKind::StructConstruction { fields, .. } => {
                 self.synthesize_named_struct_construction(expression, fields)?
             }
@@ -1543,13 +1546,17 @@ impl<'semantic> Analyzer<'semantic> {
             } if matches!(
                 &target.kind,
                 ExpressionKind::Identifier | ExpressionKind::MemberAccess { .. }
-            ) => {
+            ) =>
+            {
                 self.synthesize_place_assignment(target, *operator, value)?
             }
             _ => return None,
         };
         self.checking.expressions.insert(expression.id, typed);
-        self.checking.explicit_values.entry(expression.id).or_insert(true);
+        self.checking
+            .explicit_values
+            .entry(expression.id)
+            .or_insert(true);
         Some(typed)
     }
 
@@ -1573,7 +1580,9 @@ impl<'semantic> Analyzer<'semantic> {
         } else {
             AccessCapability::Const
         };
-        self.checking.lambda_captures.insert(expression.id, captures);
+        self.checking
+            .lambda_captures
+            .insert(expression.id, captures);
 
         let first_body_error = self.checking.errors.len();
         let enclosing_categories = self.current_binding_categories.clone();
@@ -1605,12 +1614,13 @@ impl<'semantic> Analyzer<'semantic> {
             .into_iter()
             .map(|source| {
                 let qualifiers = match source {
-                    LambdaCaptureSource::Symbol(symbol) => self
-                        .checking
-                        .bindings
-                        .get(&symbol)
-                        .expect("captured binding must be available before the lambda")
-                        .qualifiers,
+                    LambdaCaptureSource::Symbol(symbol) => {
+                        self.checking
+                            .bindings
+                            .get(&symbol)
+                            .expect("captured binding must be available before the lambda")
+                            .qualifiers
+                    }
                     LambdaCaptureSource::SelfValue { method } => *self
                         .receiver_qualifiers
                         .get(&method)
@@ -1634,9 +1644,7 @@ impl<'semantic> Analyzer<'semantic> {
                 | StatementKind::Expression(initializer)
                 | StatementKind::Defer(initializer)
                 | StatementKind::Coroutine(initializer) => {
-                    self.collect_captures_from_expression(
-                        lambda, initializer, captures, seen,
-                    );
+                    self.collect_captures_from_expression(lambda, initializer, captures, seen);
                 }
                 // Named functions never capture, and illegal references from
                 // their bodies must not make an enclosing lambda capturing.
@@ -1679,11 +1687,7 @@ impl<'semantic> Analyzer<'semantic> {
                     return;
                 };
                 if !self.callable_is_within(owner, lambda) {
-                    push_unique_capture(
-                        LambdaCaptureSource::Symbol(symbol),
-                        captures,
-                        seen,
-                    );
+                    push_unique_capture(LambdaCaptureSource::Symbol(symbol), captures, seen);
                 }
             }
             ExpressionKind::SelfValue => {
@@ -1692,11 +1696,7 @@ impl<'semantic> Analyzer<'semantic> {
                     .method_for_self(expression.id)
                     .expect("self expression must have a resolved method target");
                 if !self.callable_is_within(method, lambda) {
-                    push_unique_capture(
-                        LambdaCaptureSource::SelfValue { method },
-                        captures,
-                        seen,
-                    );
+                    push_unique_capture(LambdaCaptureSource::SelfValue { method }, captures, seen);
                 }
             }
             ExpressionKind::Literal(_) | ExpressionKind::AssociatedAccess { .. } => {}
@@ -1762,9 +1762,7 @@ impl<'semantic> Analyzer<'semantic> {
             }
             ExpressionKind::StructConstruction { fields, .. } => {
                 for field in fields {
-                    self.collect_captures_from_expression(
-                        lambda, &field.value, captures, seen,
-                    );
+                    self.collect_captures_from_expression(lambda, &field.value, captures, seen);
                 }
             }
             ExpressionKind::AnonymousStruct { members } => {
@@ -1779,12 +1777,7 @@ impl<'semantic> Analyzer<'semantic> {
                             );
                         }
                         AnonymousStructMember::Method(method) => {
-                            self.collect_captures_from_block(
-                                lambda,
-                                &method.body,
-                                captures,
-                                seen,
-                            );
+                            self.collect_captures_from_block(lambda, &method.body, captures, seen);
                         }
                     }
                 }
@@ -1852,18 +1845,12 @@ impl<'semantic> Analyzer<'semantic> {
                 ConditionalUse::Value,
                 allow_recursive_copy,
             )?;
-            let typed = if outcome.explicit_value.is_none()
-                && !self.is_divergence(outcome.typed.type_id)
-            {
-                self.check_typed(
-                    expression,
-                    expected,
-                    outcome.typed,
-                    allow_recursive_copy,
-                )?
-            } else {
-                outcome.typed
-            };
+            let typed =
+                if outcome.explicit_value.is_none() && !self.is_divergence(outcome.typed.type_id) {
+                    self.check_typed(expression, expected, outcome.typed, allow_recursive_copy)?
+                } else {
+                    outcome.typed
+                };
             self.checking.expressions.insert(expression.id, typed);
             self.checking
                 .explicit_values
@@ -1941,11 +1928,7 @@ impl<'semantic> Analyzer<'semantic> {
                     .types()
                     .has_same_shape(found.type_id, *member)
                     .expect("union members belong to the program type store")
-                    && self.value_capability_is_compatible(
-                        found,
-                        *member,
-                        allow_recursive_copy,
-                    )
+                    && self.value_capability_is_compatible(found, *member, allow_recursive_copy)
             }),
             _ => None,
         };
@@ -2013,8 +1996,7 @@ impl<'semantic> Analyzer<'semantic> {
     ) -> Option<TypedExpression> {
         let (interface_type, destination_capability, destination_is_gc) =
             self.interface_destination(expected)?;
-        let Some((owner, source_capability, source_is_gc)) =
-            self.aggregate_parts(found.type_id)
+        let Some((owner, source_capability, source_is_gc)) = self.aggregate_parts(found.type_id)
         else {
             return None;
         };
@@ -2104,15 +2086,9 @@ impl<'semantic> Analyzer<'semantic> {
                 ValueTransfer::ReuseGarbageCollected,
             )
         } else if source_is_gc {
-            (
-                ValueCategory::BorrowedPlace,
-                ValueTransfer::Borrow,
-            )
+            (ValueCategory::BorrowedPlace, ValueTransfer::Borrow)
         } else if found.category == ValueCategory::FreshTemporary {
-            (
-                ValueCategory::BorrowedPlace,
-                ValueTransfer::MoveTemporary,
-            )
+            (ValueCategory::BorrowedPlace, ValueTransfer::MoveTemporary)
         } else {
             (ValueCategory::BorrowedPlace, ValueTransfer::Borrow)
         };
@@ -2135,20 +2111,18 @@ impl<'semantic> Analyzer<'semantic> {
 
     /// Peels plain or GC-qualified interface destinations while preserving
     /// the access capability enforced at the conversion boundary.
-    fn interface_destination(
-        &self,
-        type_id: TypeId,
-    ) -> Option<(TypeId, AccessCapability, bool)> {
+    fn interface_destination(&self, type_id: TypeId) -> Option<(TypeId, AccessCapability, bool)> {
         match self.types.types().get(type_id)? {
             SemanticType::Interface { capability, .. }
-            | SemanticType::Intersection { capability, .. } => {
-                Some((type_id, *capability, false))
-            }
+            | SemanticType::Intersection { capability, .. } => Some((type_id, *capability, false)),
             SemanticType::GarbageCollected { target, capability }
                 if matches!(
                     self.types.types().get(*target),
                     Some(SemanticType::Interface { .. } | SemanticType::Intersection { .. })
-                ) => Some((*target, *capability, true)),
+                ) =>
+            {
+                Some((*target, *capability, true))
+            }
             _ => None,
         }
     }
@@ -2306,10 +2280,7 @@ impl<'semantic> Analyzer<'semantic> {
     /// Fresh temporaries are moved into a new allocation, existing GC
     /// references are reused, and plain places are rejected because allocation
     /// cannot change the storage identity of an existing value.
-    fn synthesize_garbage_collection(
-        &mut self,
-        value: &Expression,
-    ) -> Option<TypedExpression> {
+    fn synthesize_garbage_collection(&mut self, value: &Expression) -> Option<TypedExpression> {
         let source = self.synthesize(value)?;
         let semantic = self
             .types
@@ -2365,13 +2336,18 @@ impl<'semantic> Analyzer<'semantic> {
         let primitive = self.primitive_kind(typed_operand.type_id);
         let valid = matches!(
             (operator, primitive),
-            (UnaryOperator::Negate, Some(PrimitiveType::Int | PrimitiveType::Float))
-                | (UnaryOperator::Not, Some(PrimitiveType::Bool | PrimitiveType::Int))
+            (
+                UnaryOperator::Negate,
+                Some(PrimitiveType::Int | PrimitiveType::Float)
+            ) | (
+                UnaryOperator::Not,
+                Some(PrimitiveType::Bool | PrimitiveType::Int)
+            )
         );
         if valid {
-            return Some(self.fresh_primitive(
-                primitive.expect("valid unary operand must be primitive"),
-            ));
+            return Some(
+                self.fresh_primitive(primitive.expect("valid unary operand must be primitive")),
+            );
         }
 
         self.checking.errors.push(ExpressionCheckingError {
@@ -2404,12 +2380,12 @@ impl<'semantic> Analyzer<'semantic> {
                 }
                 _ => None,
             },
-            BinaryOperator::Subtract
-            | BinaryOperator::Multiply
-            | BinaryOperator::Divide => match left_primitive {
-                Some(PrimitiveType::Int | PrimitiveType::Float) => left_primitive,
-                _ => None,
-            },
+            BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide => {
+                match left_primitive {
+                    Some(PrimitiveType::Int | PrimitiveType::Float) => left_primitive,
+                    _ => None,
+                }
+            }
             BinaryOperator::Remainder
             | BinaryOperator::ShiftLeft
             | BinaryOperator::ShiftRight
@@ -2794,13 +2770,12 @@ impl<'semantic> Analyzer<'semantic> {
         match selected.kind {
             StructMemberSignatureKind::Field(field) => {
                 let declared = self.field_type(field.declaration, field.type_id);
-                let object_capability = if !is_gc
-                    && typed_object.category == ValueCategory::FreshTemporary
-                {
-                    AccessCapability::Mut
-                } else {
-                    object_capability
-                };
+                let object_capability =
+                    if !is_gc && typed_object.category == ValueCategory::FreshTemporary {
+                        AccessCapability::Mut
+                    } else {
+                        object_capability
+                    };
                 let type_id = self.field_access_type(declared, object_capability);
                 let category = self.field_category(typed_object, type_id);
                 let capability = self
@@ -3018,18 +2993,17 @@ impl<'semantic> Analyzer<'semantic> {
             .types()
             .get(declared)
             .expect("field type belongs to the program type store");
-        let capability = if declared_semantic.storage_semantics()
-            == Some(StorageSemantics::GarbageCollected)
-        {
-            match (object_capability, declared_semantic.capability()) {
-                (AccessCapability::Const, _) | (_, Some(AccessCapability::Const)) => {
-                    AccessCapability::Const
+        let capability =
+            if declared_semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
+                match (object_capability, declared_semantic.capability()) {
+                    (AccessCapability::Const, _) | (_, Some(AccessCapability::Const)) => {
+                        AccessCapability::Const
+                    }
+                    _ => AccessCapability::Mut,
                 }
-                _ => AccessCapability::Mut,
-            }
-        } else {
-            object_capability
-        };
+            } else {
+                object_capability
+            };
         self.types
             .types_mut()
             .with_capability(declared, capability)
@@ -3041,19 +3015,10 @@ impl<'semantic> Analyzer<'semantic> {
     /// Inline ownership is preserved through owned or fresh objects. Access
     /// through a borrowed or GC-backed object is borrowed, while a GC-valued
     /// field remains a GC reference regardless of its containing object.
-    fn field_category(
-        &self,
-        object: TypedExpression,
-        field_type: TypeId,
-    ) -> ValueCategory {
-        if self
-            .types
-            .types()
-            .get(field_type)
-            .is_some_and(|semantic| {
-                semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
-            })
-        {
+    fn field_category(&self, object: TypedExpression, field_type: TypeId) -> ValueCategory {
+        if self.types.types().get(field_type).is_some_and(|semantic| {
+            semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
+        }) {
             return ValueCategory::GarbageCollectedReference;
         }
         match object.category {
@@ -3081,9 +3046,7 @@ impl<'semantic> Analyzer<'semantic> {
             .types()
             .get(source.type_id)
             .expect("owning source type belongs to the program type store");
-        let transfer = if semantic.storage_semantics()
-            == Some(StorageSemantics::GarbageCollected)
-        {
+        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected) {
             Some(ValueTransfer::ReuseGarbageCollected)
         } else if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
             Some(ValueTransfer::TrivialCopy)
@@ -3094,7 +3057,9 @@ impl<'semantic> Analyzer<'semantic> {
         };
         if let Some(transfer) = transfer {
             if record {
-                self.checking.transfers.insert(source_expression.id, transfer);
+                self.checking
+                    .transfers
+                    .insert(source_expression.id, transfer);
             }
             return true;
         }
@@ -3169,8 +3134,8 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         let primitive = self.primitive_kind(typed_target.type_id);
-        let string_append = operator == AssignmentOperator::Add
-            && primitive == Some(PrimitiveType::String);
+        let string_append =
+            operator == AssignmentOperator::Add && primitive == Some(PrimitiveType::String);
         let valid_operator = matches!(
             (operator, primitive),
             (
@@ -3179,8 +3144,7 @@ impl<'semantic> Analyzer<'semantic> {
                     | AssignmentOperator::Multiply
                     | AssignmentOperator::Divide,
                 Some(PrimitiveType::Int | PrimitiveType::Float)
-            )
-                | (AssignmentOperator::Add, Some(PrimitiveType::String))
+            ) | (AssignmentOperator::Add, Some(PrimitiveType::String))
                 | (
                     AssignmentOperator::Remainder
                         | AssignmentOperator::BitwiseAnd
@@ -3265,8 +3229,8 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         let primitive = self.primitive_kind(typed_target.type_id);
-        let string_append = operator == AssignmentOperator::Add
-            && primitive == Some(PrimitiveType::String);
+        let string_append =
+            operator == AssignmentOperator::Add && primitive == Some(PrimitiveType::String);
         let mutable_destination = if string_append {
             place.value_capability == ValueCapability::Mut
         } else {
@@ -3291,8 +3255,7 @@ impl<'semantic> Analyzer<'semantic> {
                     | AssignmentOperator::Multiply
                     | AssignmentOperator::Divide,
                 Some(PrimitiveType::Int | PrimitiveType::Float)
-            )
-                | (AssignmentOperator::Add, Some(PrimitiveType::String))
+            ) | (AssignmentOperator::Add, Some(PrimitiveType::String))
                 | (
                     AssignmentOperator::Remainder
                         | AssignmentOperator::BitwiseAnd
@@ -3328,7 +3291,9 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         }
         if string_append {
-            self.checking.transfers.insert(value.id, ValueTransfer::Borrow);
+            self.checking
+                .transfers
+                .insert(value.id, ValueTransfer::Borrow);
         } else {
             self.checking
                 .transfers
@@ -3438,8 +3403,7 @@ impl<'semantic> Analyzer<'semantic> {
             }
             return None;
         }
-        let (owner, object_capability, is_gc) =
-            aggregate.expect("aggregate presence was checked");
+        let (owner, object_capability, is_gc) = aggregate.expect("aggregate presence was checked");
         if name == "copy" {
             let valid_arity = arguments.is_empty();
             if !valid_arity {
@@ -3527,13 +3491,8 @@ impl<'semantic> Analyzer<'semantic> {
         let receiver = signature
             .receiver
             .expect("instance method must have a receiver signature");
-        let receiver_valid = self.check_method_receiver(
-            object,
-            typed_object,
-            receiver,
-            object_capability,
-            is_gc,
-        );
+        let receiver_valid =
+            self.check_method_receiver(object, typed_object, receiver, object_capability, is_gc);
         self.checking.resolved_members.insert(
             callee.id,
             ResolvedMember::Method {
@@ -3541,14 +3500,11 @@ impl<'semantic> Analyzer<'semantic> {
                 method_id,
             },
         );
-        let arguments_valid = match self.analyze_call_arguments(
-            call,
-            arguments,
-            &signature.parameters,
-        ) {
-            Some(valid) => valid,
-            None => return Some(None),
-        };
+        let arguments_valid =
+            match self.analyze_call_arguments(call, arguments, &signature.parameters) {
+                Some(valid) => valid,
+                None => return Some(None),
+            };
         if !receiver_valid || !arguments_valid || self.is_recovery(signature.return_type) {
             return Some(Some(self.recovery_temporary()));
         }
@@ -3628,11 +3584,8 @@ impl<'semantic> Analyzer<'semantic> {
                 method_id: required.requirement.method_id,
             },
         );
-        let arguments_valid = self.analyze_call_arguments(
-            call,
-            arguments,
-            &signature.parameters,
-        )?;
+        let arguments_valid =
+            self.analyze_call_arguments(call, arguments, &signature.parameters)?;
         if !receiver_valid || !arguments_valid || self.is_recovery(signature.return_type) {
             return Some(self.recovery_temporary());
         }
@@ -3661,7 +3614,8 @@ impl<'semantic> Analyzer<'semantic> {
         let capability_valid = !matches!(
             (object_capability, receiver.capability),
             (AccessCapability::Const, AccessCapability::Mut)
-        ) || (!is_gc && typed_object.category == ValueCategory::FreshTemporary);
+        ) || (!is_gc
+            && typed_object.category == ValueCategory::FreshTemporary);
         if !capability_valid {
             self.checking.errors.push(ExpressionCheckingError {
                 kind: ExpressionCheckingErrorKind::ReceiverCapabilityMismatch,
@@ -3725,14 +3679,9 @@ impl<'semantic> Analyzer<'semantic> {
     /// results preserve reference provenance; other results are fresh values
     /// supplied by the callee's result storage.
     fn call_result(&self, return_type: TypeId) -> TypedExpression {
-        let category = if self
-            .types
-            .types()
-            .get(return_type)
-            .is_some_and(|semantic| {
-                semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
-            })
-        {
+        let category = if self.types.types().get(return_type).is_some_and(|semantic| {
+            semantic.storage_semantics() == Some(StorageSemantics::GarbageCollected)
+        }) {
             ValueCategory::GarbageCollectedReference
         } else {
             ValueCategory::FreshTemporary
@@ -3893,9 +3842,7 @@ impl<'semantic> Analyzer<'semantic> {
             .get(type_id)
             .expect("parameter type belongs to the program type store");
         match semantic.storage_semantics() {
-            Some(StorageSemantics::GarbageCollected) => {
-                ValueCategory::GarbageCollectedReference
-            }
+            Some(StorageSemantics::GarbageCollected) => ValueCategory::GarbageCollectedReference,
             _ if semantic.copy_semantics() == Some(CopySemantics::Trivial) => {
                 ValueCategory::OwnedInlinePlace
             }
@@ -3903,10 +3850,7 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
-    fn binding_transfer(
-        &self,
-        source: TypedExpression,
-    ) -> (ValueCategory, Option<ValueTransfer>) {
+    fn binding_transfer(&self, source: TypedExpression) -> (ValueCategory, Option<ValueTransfer>) {
         let semantic = self
             .types
             .types()
@@ -3949,10 +3893,7 @@ impl<'semantic> Analyzer<'semantic> {
             );
         }
         if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
-            return (
-                ValueCategory::OwnedInlinePlace,
-                ValueTransfer::TrivialCopy,
-            );
+            return (ValueCategory::OwnedInlinePlace, ValueTransfer::TrivialCopy);
         }
         if source.category == ValueCategory::FreshTemporary {
             return (
@@ -4018,9 +3959,7 @@ impl<'semantic> Analyzer<'semantic> {
                 .expect("cyclic aggregate remains in the layout table")
                 .type_id;
             self.checking.errors.push(ExpressionCheckingError {
-                kind: ExpressionCheckingErrorKind::InfiniteInlineLayout {
-                    owner: owner_type,
-                },
+                kind: ExpressionCheckingErrorKind::InfiniteInlineLayout { owner: owner_type },
                 span: field.span,
             });
         }
@@ -4237,9 +4176,7 @@ fn collect_conditional_arms<'expression>(
     arms.push((expression, condition, then_branch));
     match else_branch {
         Some(ConditionalElse::Block(block)) => Some(block),
-        Some(ConditionalElse::If(conditional)) => {
-            collect_conditional_arms(conditional, arms)
-        }
+        Some(ConditionalElse::If(conditional)) => collect_conditional_arms(conditional, arms),
         None => None,
     }
 }
@@ -4274,8 +4211,7 @@ mod tests {
         let program = parse_program(&mut parse_context, Lexer::new(&module))
             .expect("test source should parse");
         let names = resolve_program(&module, &program).expect("test names should resolve");
-        let context =
-            resolve_program_context(&program).expect("test context should resolve");
+        let context = resolve_program_context(&program).expect("test context should resolve");
         let mut types =
             resolve_types(&module, &program, &names).expect("test types should resolve");
         let signatures = collect_signatures(&module, &program, &names, &context, &mut types)
@@ -4377,9 +4313,7 @@ mod tests {
         function
             .parameters
             .iter()
-            .filter(|parameter| {
-                matches!(&parameter.kind, FunctionParameterKind::Named { .. })
-            })
+            .filter(|parameter| matches!(&parameter.kind, FunctionParameterKind::Named { .. }))
             .nth(index)
             .expect("named parameter should exist")
     }
@@ -4417,20 +4351,16 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let inspect = function(&program.declarations[1]);
         let borrowed = binding_initializer(&inspect.body.statements[0]);
         let explicit_unit = binding_initializer(&inspect.body.statements[1]);
         let implicit_unit = binding_initializer(&inspect.body.statements[2]);
-        assert_eq!(checking.expressions[&borrowed.id].category, ValueCategory::BorrowedPlace);
+        assert_eq!(
+            checking.expressions[&borrowed.id].category,
+            ValueCategory::BorrowedPlace
+        );
         assert_eq!(checking.transfers[&borrowed.id], ValueTransfer::Borrow);
         assert_eq!(checking.explicit_values[&borrowed.id], true);
         assert_eq!(checking.explicit_values[&explicit_unit.id], true);
@@ -4460,14 +4390,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 1);
         assert!(matches!(
             checking.errors[0].kind,
@@ -4475,7 +4398,10 @@ mod tests {
         ));
         let value = body_value(function(&program.declarations[0]));
         assert_eq!(checking.errors[0].span, value.span);
-        assert_eq!(checking.expressions[&value.id].type_id, types.types().recovery());
+        assert_eq!(
+            checking.expressions[&value.id].type_id,
+            types.types().recovery()
+        );
     }
 
     #[test]
@@ -4494,14 +4420,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let run = function(&program.declarations[1]);
         let statement = expression(&run.body.statements[0]);
@@ -4540,14 +4459,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let expected = [
             ExpressionCheckingErrorKind::ConditionalElseRequired,
             ExpressionCheckingErrorKind::ConditionalElseRequired,
@@ -4571,19 +4483,18 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let choose = function(&program.declarations[0]);
         let exact = binding_initializer(&choose.body.statements[0]);
         let (then_branch, else_branch) = conditional_branches(exact);
-        let then_value = then_branch.value.as_deref().expect("then value should exist");
-        let else_value = else_branch.value.as_deref().expect("else value should exist");
+        let then_value = then_branch
+            .value
+            .as_deref()
+            .expect("then value should exist");
+        let else_value = else_branch
+            .value
+            .as_deref()
+            .expect("else value should exist");
         assert_eq!(checking.union_injections.len(), 2);
         assert_eq!(
             checking.union_injections[&then_value.id].union_type,
@@ -4612,7 +4523,10 @@ mod tests {
                 .expect("else value should exist")
                 .span
         );
-        assert_eq!(checking.expressions[&inferred.id].type_id, types.types().recovery());
+        assert_eq!(
+            checking.expressions[&inferred.id].type_id,
+            types.types().recovery()
+        );
     }
 
     #[test]
@@ -4626,14 +4540,7 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[1]);
         let injected = binding_initializer(&main.body.statements[0]);
         let called = expression(&main.body.statements[1]);
@@ -4664,36 +4571,53 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let inspect = function(&program.declarations[0]);
         let mixed = binding_initializer(&inspect.body.statements[1]);
         let fresh = binding_initializer(&inspect.body.statements[2]);
         let shared = binding_initializer(&inspect.body.statements[5]);
-        assert_eq!(checking.expressions[&mixed.id].category, ValueCategory::BorrowedPlace);
-        assert_eq!(checking.expressions[&fresh.id].category, ValueCategory::FreshTemporary);
+        assert_eq!(
+            checking.expressions[&mixed.id].category,
+            ValueCategory::BorrowedPlace
+        );
+        assert_eq!(
+            checking.expressions[&fresh.id].category,
+            ValueCategory::FreshTemporary
+        );
         assert_eq!(
             checking.expressions[&shared.id].category,
             ValueCategory::GarbageCollectedReference
         );
         let (mixed_then, mixed_else) = conditional_branches(mixed);
         let mixed_values = [
-            mixed_then.value.as_deref().expect("then value should exist"),
-            mixed_else.value.as_deref().expect("else value should exist"),
+            mixed_then
+                .value
+                .as_deref()
+                .expect("then value should exist"),
+            mixed_else
+                .value
+                .as_deref()
+                .expect("else value should exist"),
         ];
-        assert_eq!(checking.transfers[&mixed_values[0].id], ValueTransfer::Borrow);
-        assert_eq!(checking.transfers[&mixed_values[1].id], ValueTransfer::MoveTemporary);
+        assert_eq!(
+            checking.transfers[&mixed_values[0].id],
+            ValueTransfer::Borrow
+        );
+        assert_eq!(
+            checking.transfers[&mixed_values[1].id],
+            ValueTransfer::MoveTemporary
+        );
         let (shared_then, shared_else) = conditional_branches(shared);
         let shared_values = [
-            shared_then.value.as_deref().expect("then value should exist"),
-            shared_else.value.as_deref().expect("else value should exist"),
+            shared_then
+                .value
+                .as_deref()
+                .expect("then value should exist"),
+            shared_else
+                .value
+                .as_deref()
+                .expect("else value should exist"),
         ];
         assert_eq!(shared_values.len(), 2);
         for value in shared_values {
@@ -4716,14 +4640,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let choose = body_value(function(&program.declarations[0]));
         let ExpressionKind::If {
@@ -4734,7 +4651,10 @@ mod tests {
             panic!("expected else-if chain")
         };
         assert_eq!(checking.explicit_values[&choose.id], true);
-        assert_eq!(checking.expressions[&nested.id], checking.expressions[&choose.id]);
+        assert_eq!(
+            checking.expressions[&nested.id],
+            checking.expressions[&choose.id]
+        );
         assert_eq!(checking.transfers[&choose.id], ValueTransfer::TrivialCopy);
         let finish = body_value(function(&program.declarations[1]));
         assert_eq!(
@@ -4755,14 +4675,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 2);
         assert!(matches!(
             checking.errors[0].kind,
@@ -4774,22 +4687,17 @@ mod tests {
         );
         let inspect = function(&program.declarations[1]);
         let invalid = binding_initializer(&inspect.body.statements[0]);
-        assert_eq!(checking.expressions[&invalid.id].type_id, types.types().recovery());
+        assert_eq!(
+            checking.expressions[&invalid.id].type_id,
+            types.types().recovery()
+        );
     }
 
     #[test]
     fn synthesizes_literal_types_and_categories() {
-        let (module, program, names, context, mut types, signatures) = prepare(
-            "fn main() { (); 1; 1.0; true; 'a'; \"text\"; none; }",
-        );
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let (module, program, names, context, mut types, signatures) =
+            prepare("fn main() { (); 1; 1.0; true; 'a'; \"text\"; none; }");
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
         let expected = [
             (PrimitiveType::Unit, AccessCapability::Const),
@@ -4800,9 +4708,7 @@ mod tests {
             (PrimitiveType::String, AccessCapability::Mut),
             (PrimitiveType::None, AccessCapability::Const),
         ];
-        for (statement, (primitive, capability)) in
-            main.body.statements.iter().zip(expected)
-        {
+        for (statement, (primitive, capability)) in main.body.statements.iter().zip(expected) {
             let expression = expression(statement);
             assert_eq!(
                 checking.expressions.get(&expression.id),
@@ -4819,14 +4725,7 @@ mod tests {
     fn reports_an_out_of_range_integer_literal() {
         let (module, program, names, context, mut types, signatures) =
             prepare("fn main() { 9223372036854775808; }");
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 1);
         assert_eq!(
             checking.errors[0].kind,
@@ -4850,14 +4749,7 @@ mod tests {
             "fn main() { first; }",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let first = function(&program.declarations[0]);
         for statement in &first.body.statements {
             let expression = expression(statement);
@@ -4887,14 +4779,7 @@ mod tests {
             "fn main() {}",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let inspect = function(&program.declarations[1]);
         let expected_categories = [
             ValueCategory::OwnedInlinePlace,
@@ -4911,7 +4796,10 @@ mod tests {
             assert_eq!(binding.category, expected_category);
             let reference = expression(&inspect.body.statements[index]);
             assert_eq!(checking.expressions[&reference.id].type_id, binding.type_id);
-            assert_eq!(checking.expressions[&reference.id].category, expected_category);
+            assert_eq!(
+                checking.expressions[&reference.id].category,
+                expected_category
+            );
         }
         let StatementKind::Binding {
             initializer: alias_initializer,
@@ -4935,14 +4823,7 @@ mod tests {
             "} fn main() {}",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let item = structure(&program.declarations[0]);
         let methods: Vec<_> = item
             .members
@@ -4982,17 +4863,13 @@ mod tests {
             "}",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
         let expected = [
-            (ValueCategory::OwnedInlinePlace, ValueTransfer::MoveTemporary),
+            (
+                ValueCategory::OwnedInlinePlace,
+                ValueTransfer::MoveTemporary,
+            ),
             (ValueCategory::BorrowedPlace, ValueTransfer::Borrow),
             (ValueCategory::OwnedInlinePlace, ValueTransfer::TrivialCopy),
             (ValueCategory::OwnedInlinePlace, ValueTransfer::TrivialCopy),
@@ -5029,14 +4906,7 @@ mod tests {
             "}",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
         let StatementKind::Binding {
             initializer: shadowing_initializer,
@@ -5074,14 +4944,7 @@ mod tests {
     fn reports_one_mismatch_and_recovers_without_cascading() {
         let source = "fn main() { const bad: float = 1; const next: int = bad; }";
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 1);
         assert!(matches!(
             checking.errors[0].kind,
@@ -5100,14 +4963,7 @@ mod tests {
     fn accepts_an_exact_annotated_binding_type() {
         let source = "fn main() { const value: int = 1; }";
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let main = function(&program.declarations[0]);
         let symbol = names
@@ -5132,20 +4988,16 @@ mod tests {
             "}",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
         let grouped = expression(&main.body.statements[1]);
         let ExpressionKind::Group(inner) = &grouped.kind else {
             panic!("expected grouped expression")
         };
-        assert_eq!(checking.expressions[&grouped.id], checking.expressions[&inner.id]);
+        assert_eq!(
+            checking.expressions[&grouped.id],
+            checking.expressions[&inner.id]
+        );
         assert_eq!(
             checking.expressions[&grouped.id].category,
             ValueCategory::OwnedInlinePlace
@@ -5175,17 +5027,9 @@ mod tests {
 
     #[test]
     fn checks_primitive_unary_operators() {
-        let (module, program, names, context, mut types, signatures) = prepare(
-            "fn main() { -1; -1.0; !true; !1; -\"text\"; !1.0; }",
-        );
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let (module, program, names, context, mut types, signatures) =
+            prepare("fn main() { -1; -1.0; !true; !1; -\"text\"; !1.0; }");
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
         let expected = [
             PrimitiveType::Int,
@@ -5227,14 +5071,7 @@ mod tests {
             "}",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
         let expected = [
             (PrimitiveType::Int, AccessCapability::Const),
@@ -5262,9 +5099,7 @@ mod tests {
             (PrimitiveType::Bool, AccessCapability::Const),
         ];
         assert_eq!(main.body.statements.len(), expected.len());
-        for (statement, (primitive, capability)) in
-            main.body.statements.iter().zip(expected)
-        {
+        for (statement, (primitive, capability)) in main.body.statements.iter().zip(expected) {
             assert_primitive_expression(
                 &types,
                 &checking,
@@ -5280,14 +5115,7 @@ mod tests {
     fn diagnoses_binary_operands_without_cascading() {
         let source = "fn main() { true + false; 1 + 1.0; (1 + 1.0) + 2; }";
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 3);
         assert!(matches!(
             checking.errors[0].kind,
@@ -5296,10 +5124,12 @@ mod tests {
                 ..
             }
         ));
-        assert!(checking.errors[1..].iter().all(|error| matches!(
-            error.kind,
-            ExpressionCheckingErrorKind::TypeMismatch { .. }
-        )));
+        assert!(
+            checking.errors[1..].iter().all(|error| matches!(
+                error.kind,
+                ExpressionCheckingErrorKind::TypeMismatch { .. }
+            ))
+        );
         let main = function(&program.declarations[0]);
         assert_eq!(
             checking.expressions[&expression(&main.body.statements[2]).id].type_id,
@@ -5316,19 +5146,13 @@ mod tests {
             "}",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
-        for (statement, primitive) in main.body.statements[..3]
-            .iter()
-            .zip([PrimitiveType::Int, PrimitiveType::Float, PrimitiveType::Char])
-        {
+        for (statement, primitive) in main.body.statements[..3].iter().zip([
+            PrimitiveType::Int,
+            PrimitiveType::Float,
+            PrimitiveType::Char,
+        ]) {
             assert_primitive_expression(
                 &types,
                 &checking,
@@ -5338,10 +5162,12 @@ mod tests {
             );
         }
         assert_eq!(checking.errors.len(), 2);
-        assert!(checking.errors.iter().all(|error| matches!(
-            error.kind,
-            ExpressionCheckingErrorKind::TypeMismatch { .. }
-        )));
+        assert!(
+            checking.errors.iter().all(|error| matches!(
+                error.kind,
+                ExpressionCheckingErrorKind::TypeMismatch { .. }
+            ))
+        );
         assert_eq!(
             checking.expressions[&expression(&main.body.statements[3]).id].type_id,
             types.types().recovery()
@@ -5352,23 +5178,14 @@ mod tests {
 
     #[test]
     fn records_binding_transfers_from_primitive_expressions() {
-        let (module, program, names, context, mut types, signatures) = prepare(
-            concat!(
-                "fn main() { ",
-                "const prefix = \"a\"; ",
-                "const sum = 1 + 2; ",
-                "const text = prefix + \"b\"; ",
-                "}",
-            ),
-        );
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let (module, program, names, context, mut types, signatures) = prepare(concat!(
+            "fn main() { ",
+            "const prefix = \"a\"; ",
+            "const sum = 1 + 2; ",
+            "const text = prefix + \"b\"; ",
+            "}",
+        ));
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
         for (statement, transfer) in main.body.statements.iter().zip([
             ValueTransfer::MoveTemporary,
@@ -5401,14 +5218,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let missing = function(&program.declarations[4]);
         let wrong_tail = body_value(function(&program.declarations[5]));
         let wrong_return = return_value(&function(&program.declarations[6]).body.statements[0]);
@@ -5448,7 +5258,10 @@ mod tests {
             checking.errors[5].kind,
             ExpressionCheckingErrorKind::InvalidBinaryOperand { .. }
         ));
-        assert_eq!(checking.errors[6].span, missing_bare.body.statements[0].span);
+        assert_eq!(
+            checking.errors[6].span,
+            missing_bare.body.statements[0].span
+        );
         assert!(matches!(
             checking.errors[6].kind,
             ExpressionCheckingErrorKind::TypeMismatch { .. }
@@ -5490,25 +5303,36 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let returned = [
-            (body_value(function(&program.declarations[2])), ValueTransfer::TrivialCopy),
-            (body_value(function(&program.declarations[3])), ValueTransfer::MoveTemporary),
-            (body_value(function(&program.declarations[4])), ValueTransfer::RecursiveCopy),
-            (body_value(function(&program.declarations[5])), ValueTransfer::RecursiveCopy),
+            (
+                body_value(function(&program.declarations[2])),
+                ValueTransfer::TrivialCopy,
+            ),
+            (
+                body_value(function(&program.declarations[3])),
+                ValueTransfer::MoveTemporary,
+            ),
+            (
+                body_value(function(&program.declarations[4])),
+                ValueTransfer::RecursiveCopy,
+            ),
+            (
+                body_value(function(&program.declarations[5])),
+                ValueTransfer::RecursiveCopy,
+            ),
             (
                 body_value(function(&program.declarations[6])),
                 ValueTransfer::ReuseGarbageCollected,
             ),
-            (body_value(function(&program.declarations[8])), ValueTransfer::MoveTemporary),
-            (body_value(function(&program.declarations[9])), ValueTransfer::MoveTemporary),
+            (
+                body_value(function(&program.declarations[8])),
+                ValueTransfer::MoveTemporary,
+            ),
+            (
+                body_value(function(&program.declarations[9])),
+                ValueTransfer::MoveTemporary,
+            ),
         ];
         assert_eq!(returned.len(), 7);
         for (value, transfer) in returned {
@@ -5534,14 +5358,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let returned = [
             body_value(function(&program.declarations[2])),
             body_value(function(&program.declarations[3])),
@@ -5578,16 +5395,8 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
-        let StructMember::Function(method) = &structure(&program.declarations[0]).members[0]
-        else {
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        let StructMember::Function(method) = &structure(&program.declarations[0]).members[0] else {
             panic!("expected method")
         };
         let outer = function(&program.declarations[1]);
@@ -5604,10 +5413,7 @@ mod tests {
         ];
         assert_eq!(returned.len(), 3);
         for (value, transfer) in returned {
-            assert_eq!(
-                checking.transfers.get(&value.id),
-                Some(&transfer)
-            );
+            assert_eq!(checking.transfers.get(&value.id), Some(&transfer));
         }
         assert!(checking.errors.is_empty());
     }
@@ -5626,14 +5432,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let first = function(&program.declarations[0]);
         let second = function(&program.declarations[1]);
         let invoke = function(&program.declarations[2]);
@@ -5671,14 +5470,7 @@ mod tests {
             "fn main() { count(); user(); shared(); }\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[4]);
         for (statement, declaration, category) in [
             (&main.body.statements[0], 1, ValueCategory::FreshTemporary),
@@ -5693,7 +5485,10 @@ mod tests {
             let signature = signatures
                 .callable(function(&program.declarations[declaration]).id)
                 .expect("called function should have a signature");
-            assert_eq!(checking.expressions[&called.id].type_id, signature.return_type);
+            assert_eq!(
+                checking.expressions[&called.id].type_id,
+                signature.return_type
+            );
             assert_eq!(checking.expressions[&called.id].category, category);
         }
         assert!(checking.errors.is_empty());
@@ -5710,14 +5505,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let inspect = function(&program.declarations[2]);
         let (_, arguments) = call(expression(&inspect.body.statements[0]));
         assert_eq!(arguments.len(), 4);
@@ -5747,14 +5535,7 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[3]);
         assert_eq!(main.body.statements.len(), 5);
 
@@ -5857,14 +5638,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let inspect = function(&program.declarations[2]);
         assert_eq!(inspect.body.statements.len(), 4);
         let StatementKind::Binding {
@@ -5908,18 +5682,9 @@ mod tests {
                 types.types().recovery()
             );
         }
-        assert!(checking
-            .transfers
-            .get(&local.id)
-            .is_none());
-        assert!(checking
-            .transfers
-            .get(&parameter.id)
-            .is_none());
-        assert!(checking
-            .transfers
-            .get(&overflow_value.id)
-            .is_none());
+        assert!(checking.transfers.get(&local.id).is_none());
+        assert!(checking.transfers.get(&parameter.id).is_none());
+        assert!(checking.transfers.get(&overflow_value.id).is_none());
     }
 
     #[test]
@@ -5935,14 +5700,7 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[1]);
         let StatementKind::Binding { initializer, .. } = &main.body.statements[0].kind else {
             panic!("expected recovered binding")
@@ -5998,12 +5756,12 @@ mod tests {
                 types.types().recovery()
             );
         }
-        assert!(recovered_callee_arguments.iter().all(|argument| {
-            checking.expressions.contains_key(&argument.id)
-        }));
-        assert!(!checking
-            .transfers
-            .contains_key(&mismatched_arguments[0].id));
+        assert!(
+            recovered_callee_arguments
+                .iter()
+                .all(|argument| { checking.expressions.contains_key(&argument.id) })
+        );
+        assert!(!checking.transfers.contains_key(&mismatched_arguments[0].id));
         let (_, surplus_arguments) = call(expression(&main.body.statements[3]));
         assert!(!checking.transfers.contains_key(&surplus_arguments[2].id));
     }
@@ -6021,14 +5779,7 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let main = function(&program.declarations[0]);
         let add = binding_initializer(&main.body.statements[1]);
@@ -6090,7 +5841,10 @@ mod tests {
             PrimitiveType::Int,
             AccessCapability::Const,
         );
-        assert_eq!(checking.transfers[&arguments[0].id], ValueTransfer::TrivialCopy);
+        assert_eq!(
+            checking.transfers[&arguments[0].id],
+            ValueTransfer::TrivialCopy
+        );
     }
 
     #[test]
@@ -6112,19 +5866,14 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 3);
-        assert!(checking.errors.iter().all(|error| matches!(
-            error.kind,
-            ExpressionCheckingErrorKind::TypeMismatch { .. }
-        )));
+        assert!(
+            checking.errors.iter().all(|error| matches!(
+                error.kind,
+                ExpressionCheckingErrorKind::TypeMismatch { .. }
+            ))
+        );
         let invalid_return = body_value(function(&program.declarations[2]));
         assert_eq!(checking.errors[0].span, invalid_return.span);
         let main = function(&program.declarations[3]);
@@ -6132,7 +5881,10 @@ mod tests {
         let valid = binding_initializer(&main.body.statements[3]);
         let valid_shared = binding_initializer(&main.body.statements[4]);
         assert_eq!(checking.errors[1].span, invalid.span);
-        assert_eq!(checking.expressions[&invalid.id].type_id, types.types().recovery());
+        assert_eq!(
+            checking.expressions[&invalid.id].type_id,
+            types.types().recovery()
+        );
         for closure in [valid, valid_shared] {
             assert!(matches!(
                 types.types().get(checking.expressions[&closure.id].type_id),
@@ -6168,14 +5920,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let inspect = function(&program.declarations[0]);
         let duplicate = binding_initializer(&inspect.body.statements[1]);
@@ -6211,14 +5956,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let item = structure(&program.declarations[0]);
         let methods: Vec<_> = item
@@ -6257,14 +5995,7 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 2);
         assert!(matches!(
             checking.errors[0].kind,
@@ -6278,9 +6009,18 @@ mod tests {
         let returned = binding_initializer(&main.body.statements[0]);
         let missing = binding_initializer(&main.body.statements[1]);
         let invalid = binding_initializer(&main.body.statements[2]);
-        assert_eq!(checking.transfers[&returned.id], ValueTransfer::MoveTemporary);
-        assert_eq!(checking.expressions[&missing.id].type_id, types.types().recovery());
-        assert_eq!(checking.expressions[&invalid.id].type_id, types.types().recovery());
+        assert_eq!(
+            checking.transfers[&returned.id],
+            ValueTransfer::MoveTemporary
+        );
+        assert_eq!(
+            checking.expressions[&missing.id].type_id,
+            types.types().recovery()
+        );
+        assert_eq!(
+            checking.expressions[&invalid.id].type_id,
+            types.types().recovery()
+        );
         assert!(!checking.transfers.contains_key(&missing.id));
         assert!(!checking.transfers.contains_key(&invalid.id));
     }
@@ -6294,14 +6034,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let item = structure(&program.declarations[0]);
         let StructMember::Function(method) = &item.members[0] else {
@@ -6313,11 +6046,17 @@ mod tests {
         let local = expression(&roots.body.statements[2]);
         let named = expression(&roots.body.statements[3]);
         let parameter_place = checking.places[&parameter.id];
-        assert_eq!(parameter_place.binding_mutability, Some(BindingMutability::Mut));
+        assert_eq!(
+            parameter_place.binding_mutability,
+            Some(BindingMutability::Mut)
+        );
         assert_eq!(parameter_place.value_capability, ValueCapability::Const);
         assert_eq!(parameter_place.category, ValueCategory::BorrowedPlace);
         let local_place = checking.places[&local.id];
-        assert_eq!(local_place.binding_mutability, Some(BindingMutability::Const));
+        assert_eq!(
+            local_place.binding_mutability,
+            Some(BindingMutability::Const)
+        );
         assert_eq!(local_place.value_capability, ValueCapability::Const);
         assert_eq!(local_place.category, ValueCategory::BorrowedPlace);
         let self_place = checking.places[&self_value.id];
@@ -6341,18 +6080,13 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let inspect = function(&program.declarations[2]);
         let StatementKind::Expression(Expression {
-            kind: ExpressionKind::Assignment { value: borrowed, .. },
+            kind: ExpressionKind::Assignment {
+                value: borrowed, ..
+            },
             ..
         }) = &inspect.body.statements[0].kind
         else {
@@ -6395,14 +6129,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let choose = function(&program.declarations[2]);
         let current = expression(&choose.body.statements[1]);
@@ -6425,17 +6152,16 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 3);
-        assert_eq!(checking.errors[0].kind, ExpressionCheckingErrorKind::ImmutableValue);
-        assert_eq!(checking.errors[1].kind, ExpressionCheckingErrorKind::ImmutableBinding);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ImmutableValue
+        );
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::ImmutableBinding
+        );
         assert!(matches!(
             checking.errors[2].kind,
             ExpressionCheckingErrorKind::InvalidAssignmentOperand {
@@ -6465,16 +6191,12 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 2);
-        assert_eq!(checking.errors[0].kind, ExpressionCheckingErrorKind::ImmutableBinding);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ImmutableBinding
+        );
         assert_eq!(
             checking.errors[1].kind,
             ExpressionCheckingErrorKind::InvalidAssignmentTarget
@@ -6493,22 +6215,20 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 2);
-        assert!(checking.errors.iter().all(|error| matches!(
-            error.kind,
-            ExpressionCheckingErrorKind::TypeMismatch { .. }
-        )));
+        assert!(
+            checking.errors.iter().all(|error| matches!(
+                error.kind,
+                ExpressionCheckingErrorKind::TypeMismatch { .. }
+            ))
+        );
         let copied = function(&program.declarations[2]);
         let returned = body_value(copied);
-        assert_eq!(checking.transfers[&returned.id], ValueTransfer::RecursiveCopy);
+        assert_eq!(
+            checking.transfers[&returned.id],
+            ValueTransfer::RecursiveCopy
+        );
         let redirect = function(&program.declarations[4]);
         let StatementKind::Expression(Expression {
             kind: ExpressionKind::Assignment { value, .. },
@@ -6554,14 +6274,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
 
         let inspect = function(&program.declarations[3]);
@@ -6569,8 +6282,14 @@ mod tests {
         let ExpressionKind::StructConstruction { fields, .. } = &constructed.kind else {
             panic!("expected named construction")
         };
-        assert_eq!(checking.transfers[&fields[0].value.id], ValueTransfer::TrivialCopy);
-        assert_eq!(checking.transfers[&fields[1].value.id], ValueTransfer::MoveTemporary);
+        assert_eq!(
+            checking.transfers[&fields[0].value.id],
+            ValueTransfer::TrivialCopy
+        );
+        assert_eq!(
+            checking.transfers[&fields[1].value.id],
+            ValueTransfer::MoveTemporary
+        );
 
         let associated = binding_initializer(&inspect.body.statements[1]);
         assert!(matches!(
@@ -6583,11 +6302,17 @@ mod tests {
             checking.resolved_members[&total.id],
             ResolvedMember::Field { .. }
         ));
-        assert_eq!(checking.places[&total.id].category, ValueCategory::OwnedInlinePlace);
+        assert_eq!(
+            checking.places[&total.id].category,
+            ValueCategory::OwnedInlinePlace
+        );
 
         let add = expression(&inspect.body.statements[6]);
         let (add_callee, _) = call(add);
-        let ExpressionKind::MemberAccess { object: add_object, .. } = &add_callee.kind else {
+        let ExpressionKind::MemberAccess {
+            object: add_object, ..
+        } = &add_callee.kind
+        else {
             panic!("expected method member")
         };
         assert!(matches!(
@@ -6598,7 +6323,10 @@ mod tests {
 
         let borrowed_read = binding_initializer(&inspect.body.statements[7]);
         let (borrowed_callee, _) = call(borrowed_read);
-        let ExpressionKind::MemberAccess { object: borrowed_object, .. } = &borrowed_callee.kind
+        let ExpressionKind::MemberAccess {
+            object: borrowed_object,
+            ..
+        } = &borrowed_callee.kind
         else {
             panic!("expected method member")
         };
@@ -6609,7 +6337,10 @@ mod tests {
 
         let gc_read = binding_initializer(&inspect.body.statements[8]);
         let (gc_callee, _) = call(gc_read);
-        let ExpressionKind::MemberAccess { object: gc_object, .. } = &gc_callee.kind else {
+        let ExpressionKind::MemberAccess {
+            object: gc_object, ..
+        } = &gc_callee.kind
+        else {
             panic!("expected method member")
         };
         assert_eq!(
@@ -6619,14 +6350,21 @@ mod tests {
 
         let copied = binding_initializer(&inspect.body.statements[9]);
         let (copy_callee, _) = call(copied);
-        let ExpressionKind::MemberAccess { object: copy_source, .. } = &copy_callee.kind else {
+        let ExpressionKind::MemberAccess {
+            object: copy_source,
+            ..
+        } = &copy_callee.kind
+        else {
             panic!("expected copy member")
         };
         assert!(matches!(
             checking.resolved_members[&copy_callee.id],
             ResolvedMember::Copy { .. }
         ));
-        assert_eq!(checking.transfers[&copy_source.id], ValueTransfer::RecursiveCopy);
+        assert_eq!(
+            checking.transfers[&copy_source.id],
+            ValueTransfer::RecursiveCopy
+        );
 
         let fresh_assignment = expression(&inspect.body.statements[5]);
         let ExpressionKind::Assignment { value, .. } = &fresh_assignment.kind else {
@@ -6659,14 +6397,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 11, "{:#?}", checking.errors);
         assert!(matches!(
             checking.errors[0].kind,
@@ -6729,14 +6460,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty());
         let inspect = function(&program.declarations[2]);
         let holder = binding_initializer(&inspect.body.statements[0]);
@@ -6770,14 +6494,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 3);
         assert_eq!(
             checking.errors[0].kind,
@@ -6804,14 +6521,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 2);
         assert_eq!(
             checking.errors[0].kind,
@@ -6848,14 +6558,7 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
         let main = function(&program.declarations[0]);
         let anonymous = binding_initializer(&main.body.statements[1]);
@@ -6895,10 +6598,7 @@ mod tests {
         let ExpressionKind::MemberAccess { object, .. } = &copy_callee.kind else {
             panic!("expected anonymous copy member")
         };
-        assert_eq!(
-            checking.transfers[&object.id],
-            ValueTransfer::RecursiveCopy
-        );
+        assert_eq!(checking.transfers[&object.id], ValueTransfer::RecursiveCopy);
     }
 
     #[test]
@@ -6927,14 +6627,7 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
         let main = function(&program.declarations[5]);
         let named_conversion = binding_initializer(&main.body.statements[1]);
@@ -6961,9 +6654,11 @@ mod tests {
             checking.interface_conversions[&fresh_conversion.id].backing_transfer,
             ValueTransfer::MoveTemporary
         );
-        assert!(checking.interface_conversions[&empty_conversion.id]
-            .methods
-            .is_empty());
+        assert!(
+            checking.interface_conversions[&empty_conversion.id]
+                .methods
+                .is_empty()
+        );
         let read_call = expression(&main.body.statements[8]);
         let (read_callee, _) = call(read_call);
         assert!(matches!(
@@ -7004,14 +6699,7 @@ mod tests {
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 5, "{:#?}", checking.errors);
         assert!(matches!(
             checking.errors[0].kind,
@@ -7061,14 +6749,7 @@ mod tests {
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
-        let checking = check(
-            &module,
-            &program,
-            &names,
-            &context,
-            &mut types,
-            &signatures,
-        );
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 3, "{:#?}", checking.errors);
         assert!(checking.errors.iter().all(|error| matches!(
             error.kind,

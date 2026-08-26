@@ -188,7 +188,8 @@ impl SemanticType {
         match self {
             Self::GarbageCollected { .. } => Some(CopySemantics::GarbageCollectedPayload),
             Self::Primitive {
-                primitive: PrimitiveType::Unit
+                primitive:
+                    PrimitiveType::Unit
                     | PrimitiveType::None
                     | PrimitiveType::Int
                     | PrimitiveType::Float
@@ -323,7 +324,10 @@ impl TypeStore {
     /// GC ownership itself mutable.
     pub fn garbage_collected(&mut self, target: TypeId) -> Option<TypeId> {
         let semantic_type = self.get(target)?.clone();
-        if matches!(semantic_type, SemanticType::Recovery | SemanticType::Divergence) {
+        if matches!(
+            semantic_type,
+            SemanticType::Recovery | SemanticType::Divergence
+        ) {
             return Some(target);
         }
         if matches!(semantic_type, SemanticType::GarbageCollected { .. }) {
@@ -722,7 +726,10 @@ mod tests {
                 semantic_type.storage_semantics(),
                 Some(StorageSemantics::Inline)
             );
-            assert_eq!(semantic_type.copy_semantics(), Some(CopySemantics::Recursive));
+            assert_eq!(
+                semantic_type.copy_semantics(),
+                Some(CopySemantics::Recursive)
+            );
         }
     }
 
@@ -774,7 +781,10 @@ mod tests {
         assert_eq!(types.garbage_collected_target(plain), None);
         assert_ne!(gc, mutable_gc);
         assert_eq!(types.has_same_shape(gc, mutable_gc), Some(true));
-        assert_eq!(types.with_capability(gc, AccessCapability::Mut), Some(mutable_gc));
+        assert_eq!(
+            types.with_capability(gc, AccessCapability::Mut),
+            Some(mutable_gc)
+        );
         assert_eq!(
             types.get(gc).and_then(SemanticType::storage_semantics),
             Some(StorageSemantics::GarbageCollected)
@@ -863,7 +873,10 @@ mod tests {
                 semantic_type.storage_semantics(),
                 Some(StorageSemantics::Inline)
             );
-            assert_eq!(semantic_type.copy_semantics(), Some(CopySemantics::Recursive));
+            assert_eq!(
+                semantic_type.copy_semantics(),
+                Some(CopySemantics::Recursive)
+            );
         }
 
         for id in [callable, interface] {

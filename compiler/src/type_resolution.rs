@@ -194,8 +194,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 ),
                 Declaration::Interface(interface) => (
                     interface.id,
-                    self.types
-                        .interface(interface.id, AccessCapability::Const),
+                    self.types.interface(interface.id, AccessCapability::Const),
                 ),
                 Declaration::Function(_) => continue,
             };
@@ -291,9 +290,8 @@ impl<'source, 'names> Resolver<'source, 'names> {
 
     fn visit_expression(&mut self, expression: &Expression) {
         match &expression.kind {
-            ExpressionKind::Identifier
-            | ExpressionKind::SelfValue
-            | ExpressionKind::Literal(_) => {}
+            ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {
+            }
             ExpressionKind::Group(inner)
             | ExpressionKind::GarbageCollect(inner)
             | ExpressionKind::PrimitiveConversion { value: inner, .. }
@@ -538,7 +536,10 @@ impl<'source, 'names> Resolver<'source, 'names> {
         for member in members {
             let resolved = self.resolve_type(member);
             if !self.is_plain_interface_type(resolved) {
-                self.error(TypeResolutionErrorKind::InvalidIntersectionMember, member.span);
+                self.error(
+                    TypeResolutionErrorKind::InvalidIntersectionMember,
+                    member.span,
+                );
                 invalid = true;
             }
             resolved_members.push(resolved);
@@ -779,10 +780,12 @@ mod tests {
         // distinct annotation-bearing AST locations. Nested type syntax would
         // add further entries to this same map.
         assert_eq!(resolution.syntax_types().len(), 15);
-        assert!(resolution
-            .syntax_types()
-            .values()
-            .all(|type_id| resolution.types().contains(*type_id)));
+        assert!(
+            resolution
+                .syntax_types()
+                .values()
+                .all(|type_id| resolution.types().contains(*type_id))
+        );
         assert_eq!(program.declarations.len(), 3);
     }
 
@@ -799,8 +802,7 @@ mod tests {
             ") {}\n",
         ));
         let names = resolve_program(&module, &program).expect("test names should resolve");
-        let errors =
-            resolve_types(&module, &program, &names).expect_err("types should be invalid");
+        let errors = resolve_types(&module, &program, &names).expect_err("types should be invalid");
 
         assert_eq!(errors.len(), 4);
         assert!(matches!(
@@ -819,7 +821,11 @@ mod tests {
             errors[3].kind,
             TypeResolutionErrorKind::InvalidIntersectionMember
         );
-        assert!(errors.windows(2).all(|pair| pair[0].span.start < pair[1].span.start));
+        assert!(
+            errors
+                .windows(2)
+                .all(|pair| pair[0].span.start < pair[1].span.start)
+        );
     }
 
     #[test]
@@ -842,8 +848,7 @@ mod tests {
         arguments.clear();
         let annotation_span = type_annotation.span;
 
-        let errors =
-            resolve_types(&module, &program, &names).expect_err("arity should be invalid");
+        let errors = resolve_types(&module, &program, &names).expect_err("arity should be invalid");
         assert_eq!(
             errors,
             vec![TypeResolutionError {
