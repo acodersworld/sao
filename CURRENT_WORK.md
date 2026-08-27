@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-26
+Last reviewed: 2026-08-27
 
 ## Current phase
 
@@ -125,8 +125,23 @@ reviewable phases:
      resolved `break` and `continue`, result typing, `else`, divergence,
      range-binding typing and mutability, expected unions, transfers, and
      flow-sensitive binding-provenance merging.
-   - Next: general union and intersection assignability, contextual
-     conversions, type tests, and flow-sensitive narrowing.
+   - Complete: expression type ascription with `expression: Type`, using
+     parentheses only when grouping is required. Ascription binds below
+     ordinary binary operators and above assignment, consumes a complete union
+     or intersection type after `:`, and cannot be chained even through
+     parentheses. It checks the expression under the stated expected type,
+     allowing an explicit interface or interface-intersection view to
+     disambiguate a destination union member.
+     Such a view borrows the underlying object without copying or moving it,
+     preserves concrete type and vtable identity, permits capability
+     preservation or reduction but not escalation, and performs neither
+     runtime downcasts nor primitive conversions.
+   - Next change: general union and intersection assignability and
+     contextual conversions. This includes converting `A | B` to an interface
+     `I` when every possible union member satisfies `I`. A plain interface
+     result borrows the active object rather than copying or moving it,
+     preserving the object's concrete type and vtable for interface dispatch.
+   - Later change in this phase: `is` type tests and flow-sensitive narrowing.
 7. Built-ins and completion
    - Check strings, bytes, indexing and index-place mutability, slicing,
      primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`,

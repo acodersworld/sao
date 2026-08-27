@@ -14,6 +14,17 @@ A value of `A | B` is accepted when it is an `A`, a `B`, or both where the
 types overlap. Operations require narrowing unless they are valid for every
 member of the union.
 
+When one source value could satisfy more than one destination member, an
+expression type ascription selects the intended member explicitly:
+
+```text
+const selected: Reader | Writer = file: Reader;
+```
+
+Here `file: Reader` forms a borrowed interface view; it does not copy or move
+the concrete file. The surrounding union stores the `Reader` member choice
+while preserving the concrete type and vtable used for dispatch.
+
 SAO uses the built-in singleton `none` to represent the absence of a value.
 `none` is both the spelling of the singleton type in a type expression and its
 only value. Types are not implicitly optional: absence must be included

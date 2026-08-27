@@ -48,7 +48,8 @@ and distinguishes the `..` and `..=` range delimiters, and the `..` slice
 delimiter, from member-access `.`. Consequently, `0..10` is an integer, `..`,
 and another integer rather than a floating-point literal. The `..=` token is
 valid for inclusive range headers but is rejected as an inclusive slice
-delimiter.
+delimiter. A single `:` separates names from declared types in declarations
+and introduces an expression type ascription in expression grammar.
 
 `&` remains one token with context-dependent grammar roles: infix bitwise-and
 in expressions, infix intersection in types, prefix GC allocation in

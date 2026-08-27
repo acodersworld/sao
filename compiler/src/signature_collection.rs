@@ -1126,7 +1126,8 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     self.visit_expression(end);
                 }
             }
-            ExpressionKind::TypeTest { value, .. } => self.visit_expression(value),
+            ExpressionKind::TypeTest { value, .. }
+            | ExpressionKind::TypeAscription { value, .. } => self.visit_expression(value),
             ExpressionKind::Binary { left, right, .. }
             | ExpressionKind::Assignment {
                 target: left,

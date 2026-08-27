@@ -531,6 +531,15 @@ fn format_expression_into(
             child_expression(output, source, "value", value, depth);
             child_type(output, source, "type", type_syntax, depth);
         }
+        ExpressionKind::TypeAscription { value, type_syntax } => {
+            line(
+                output,
+                depth,
+                format_args!("TypeAscription {}", location(span)),
+            );
+            child_expression(output, source, "value", value, depth);
+            child_type(output, source, "type", type_syntax, depth);
+        }
         ExpressionKind::Unary { operator, operand } => {
             line(
                 output,
@@ -1079,6 +1088,17 @@ mod tests {
         assert_eq!(
             format_expression(&module(source), &expression),
             "TypeTest @ 0..30\n  value:\n    Identifier \"result\" @ 0..6\n  type:\n    Union @ 10..30\n      members:\n        [0]:\n          Builtin Error @ 10..23\n            arguments:\n              [0]:\n                Primitive String @ 16..22\n        [1]:\n          Primitive None @ 26..30"
+        );
+    }
+
+    #[test]
+    fn formats_type_ascription_expressions() {
+        let source = "file: Reader & Writer";
+        let expression = parse_expression_source(source);
+
+        assert_eq!(
+            format_expression(&module(source), &expression),
+            "TypeAscription @ 0..21\n  value:\n    Identifier \"file\" @ 0..4\n  type:\n    Intersection @ 6..21\n      members:\n        [0]:\n          Named \"Reader\" @ 6..12\n        [1]:\n          Named \"Writer\" @ 15..21"
         );
     }
 

@@ -458,6 +458,7 @@ impl LexicalIndex {
             | ExpressionKind::MemberAccess { object: inner, .. }
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::TypeTest { value: inner, .. }
+            | ExpressionKind::TypeAscription { value: inner, .. }
             | ExpressionKind::Unary { operand: inner, .. } => {
                 self.visit_expression(inner, callable, names);
             }
@@ -1206,12 +1207,7 @@ impl<'semantic> Analyzer<'semantic> {
             };
             ExpressionOutcome {
                 typed,
-                explicitly_produces_value: self
-                    .checking
-                    .explicit_values
-                    .get(&value.id)
-                    .copied()
-                    .unwrap_or(true),
+                explicitly_produces_value: self.explicitly_produces_value(value),
             }
         };
         Some(BlockOutcome {
@@ -1226,12 +1222,7 @@ impl<'semantic> Analyzer<'semantic> {
         let outcome = match &expression.kind {
             ExpressionKind::Group(inner) => {
                 let typed = self.synthesize_discarded(inner)?;
-                let explicitly_produces_value = self
-                    .checking
-                    .explicit_values
-                    .get(&inner.id)
-                    .copied()
-                    .unwrap_or(true);
+                let explicitly_produces_value = self.explicitly_produces_value(inner);
                 ExpressionOutcome {
                     typed,
                     explicitly_produces_value,
@@ -1246,6 +1237,13 @@ impl<'semantic> Analyzer<'semantic> {
             }
             ExpressionKind::If { .. } => {
                 self.synthesize_conditional_expression(expression, ConditionalUse::Discarded)?
+            }
+            ExpressionKind::TypeAscription { value, type_syntax } => {
+                let typed = self.synthesize_type_ascription(expression, value, type_syntax)?;
+                ExpressionOutcome {
+                    typed,
+                    explicitly_produces_value: self.explicitly_produces_value(expression),
+                }
             }
             _ => ExpressionOutcome {
                 typed: self.synthesize(expression)?,
@@ -2122,12 +2120,7 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::SelfValue => self.synthesize_self(expression),
             ExpressionKind::Group(inner) => {
                 let typed = self.synthesize(inner)?;
-                let explicitly_produces_value = self
-                    .checking
-                    .explicit_values
-                    .get(&inner.id)
-                    .copied()
-                    .unwrap_or(true);
+                let explicitly_produces_value = self.explicitly_produces_value(inner);
                 self.checking
                     .explicit_values
                     .insert(expression.id, explicitly_produces_value);
@@ -2168,6 +2161,9 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::AssociatedAccess { owner, member } => {
                 self.synthesize_named_associated_access(expression, owner, *member)?
             }
+            ExpressionKind::TypeAscription { value, type_syntax } => {
+                self.synthesize_type_ascription(expression, value, type_syntax)?
+            }
             ExpressionKind::Unary { operator, operand } => {
                 self.synthesize_unary(*operator, operand)?
             }
@@ -2198,6 +2194,39 @@ impl<'semantic> Analyzer<'semantic> {
             .entry(expression.id)
             .or_insert(true);
         Some(typed)
+    }
+
+    /// Checks an expression under a source-written expected type and exposes
+    /// exactly that type to its surrounding expression.
+    ///
+    /// For example, `file: Reader` creates a borrowed `Reader` view when the
+    /// concrete file satisfies that interface. In
+    /// `const selected: Reader | Writer = file: Reader`, the surrounding union
+    /// therefore sees the unambiguous `Reader` member. This never performs a
+    /// runtime cast, primitive conversion, or implicit object copy.
+    fn synthesize_type_ascription(
+        &mut self,
+        expression: &Expression,
+        value: &Expression,
+        type_syntax: &TypeSyntax,
+    ) -> Option<TypedExpression> {
+        let expected = self
+            .types
+            .type_for_syntax(type_syntax.id)
+            .expect("ascribed source type must have been resolved");
+        let checked = self.check(value, expected)?;
+        let explicitly_produces_value = self.explicitly_produces_value(value);
+        self.checking
+            .explicit_values
+            .insert(expression.id, explicitly_produces_value);
+
+        if self.is_recovery(checked.type_id) || self.is_divergence(checked.type_id) {
+            return Some(checked);
+        }
+        Some(TypedExpression {
+            type_id: expected,
+            category: checked.category,
+        })
     }
 
     fn synthesize_lambda(
@@ -2351,6 +2380,7 @@ impl<'semantic> Analyzer<'semantic> {
             | ExpressionKind::MemberAccess { object: inner, .. }
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::TypeTest { value: inner, .. }
+            | ExpressionKind::TypeAscription { value: inner, .. }
             | ExpressionKind::Unary { operand: inner, .. } => {
                 self.collect_captures_from_expression(lambda, inner, captures, seen);
             }
@@ -2528,12 +2558,7 @@ impl<'semantic> Analyzer<'semantic> {
         {
             let typed = self.check_with_capability(inner, expected, allow_recursive_copy)?;
             self.checking.expressions.insert(expression.id, typed);
-            let explicitly_produces_value = self
-                .checking
-                .explicit_values
-                .get(&inner.id)
-                .copied()
-                .unwrap_or(true);
+            let explicitly_produces_value = self.explicitly_produces_value(inner);
             self.checking
                 .explicit_values
                 .insert(expression.id, explicitly_produces_value);
@@ -4694,6 +4719,17 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("semantic type belongs to the program type store")
     }
 
+    /// Returns whether an already analyzed expression explicitly produces a
+    /// value. For example, `{ 1 }` does, while `{ 1; }` completes implicitly
+    /// with unit. Successful expression analysis must always record this fact.
+    fn explicitly_produces_value(&self, expression: &Expression) -> bool {
+        self.checking
+            .explicit_values
+            .get(&expression.id)
+            .copied()
+            .expect("analyzed expression must record explicit-value status")
+    }
+
     fn is_recovery(&self, type_id: TypeId) -> bool {
         type_id == self.types.types().recovery()
     }
@@ -4938,6 +4974,13 @@ mod tests {
             panic!("expected garbage-collection expression")
         };
         value
+    }
+
+    fn ascription(expression: &Expression) -> (&Expression, &TypeSyntax) {
+        let ExpressionKind::TypeAscription { value, type_syntax } = &expression.kind else {
+            panic!("expected type-ascription expression")
+        };
+        (value, type_syntax)
     }
 
     fn lambda(expression: &Expression) -> (&[FunctionParameter], &Block) {
@@ -7330,6 +7373,158 @@ mod tests {
     }
 
     #[test]
+    fn checks_ascriptions_and_uses_them_to_select_union_members() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "interface Writer { fn write(self) -> int; }\n",
+            "struct File {\n",
+            "    fn read(self) -> int { 1 }\n",
+            "    fn write(self) -> int { 2 }\n",
+            "}\n",
+            "fn main() {\n",
+            "    const file = File {};\n",
+            "    const selected: Reader | Writer = file: Reader;\n",
+            "    const fresh = File {}: Reader;\n",
+            "    const vmut inferred = 1: mut int;\n",
+            "    const direct_union = 1: int | float;\n",
+            "    const existing: int | float = 2;\n",
+            "    const preserved = existing: int | float;\n",
+            "    const both = file: Reader & Writer;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let main = function(&program.declarations[3]);
+        let selected = binding_initializer(&main.body.statements[1]);
+        let (selected_value, selected_type) = ascription(selected);
+        let conversion = &checking.interface_conversions[&selected_value.id];
+        let injection = &checking.union_injections[&selected.id];
+        assert_eq!(conversion.destination_type, injection.member_type);
+        assert_eq!(conversion.backing_transfer, ValueTransfer::Borrow);
+        assert_eq!(checking.expressions[&selected.id].category, ValueCategory::BorrowedPlace);
+        assert_eq!(injection.union_type, checking.expressions[&selected.id].type_id);
+        assert_eq!(
+            types.type_for_syntax(selected_type.id),
+            Some(injection.member_type)
+        );
+
+        let fresh = binding_initializer(&main.body.statements[2]);
+        let (fresh_value, _) = ascription(fresh);
+        assert_eq!(
+            checking.interface_conversions[&fresh_value.id].backing_transfer,
+            ValueTransfer::MoveTemporary
+        );
+        assert_eq!(checking.expressions[&fresh.id].category, ValueCategory::BorrowedPlace);
+
+        let mutable_int = binding_initializer(&main.body.statements[3]);
+        assert!(matches!(
+            types.types().get(checking.expressions[&mutable_int.id].type_id),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                capability: AccessCapability::Mut,
+            })
+        ));
+
+        let direct_union = binding_initializer(&main.body.statements[4]);
+        let (direct_value, direct_type) = ascription(direct_union);
+        assert_eq!(
+            checking.union_injections[&direct_value.id].union_type,
+            types.type_for_syntax(direct_type.id).expect("ascribed union should resolve")
+        );
+        let preserved = binding_initializer(&main.body.statements[6]);
+        let (preserved_value, _) = ascription(preserved);
+        assert!(!checking.union_injections.contains_key(&preserved_value.id));
+        let both = binding_initializer(&main.body.statements[7]);
+        let (both_value, _) = ascription(both);
+        assert_eq!(checking.interface_conversions[&both_value.id].methods.len(), 2);
+    }
+
+    #[test]
+    fn ascriptions_preserve_explicit_values_divergence_and_recovery() {
+        let source = concat!(
+            "fn inspect() {\n",
+            "    const implicit = { (); }: ();\n",
+            "    const wrong: int | float = true: int;\n",
+            "}\n",
+            "fn diverges() -> int { loop {}: int }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+
+        let inspect = function(&program.declarations[0]);
+        let implicit = binding_initializer(&inspect.body.statements[0]);
+        assert_eq!(checking.explicit_values[&implicit.id], false);
+        let wrong = binding_initializer(&inspect.body.statements[1]);
+        let (wrong_value, _) = ascription(wrong);
+        assert_eq!(checking.errors[0].span, wrong_value.span);
+        assert_eq!(checking.expressions[&wrong.id].type_id, types.types().recovery());
+        assert!(!checking.union_injections.contains_key(&wrong.id));
+
+        let diverges = body_value(function(&program.declarations[1]));
+        assert!(matches!(
+            types.types().get(checking.expressions[&diverges.id].type_id),
+            Some(SemanticType::Divergence)
+        ));
+    }
+
+    #[test]
+    fn ascriptions_reject_casts_escalation_and_ambiguous_union_selection() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "interface Writer { fn write(self) -> int; }\n",
+            "struct File {\n",
+            "    fn read(self) -> int { 1 }\n",
+            "    fn write(self) -> int { 2 }\n",
+            "}\n",
+            "fn inspect(reader: Reader) {\n",
+            "    const file = File {};\n",
+            "    const ambiguous: Reader | Writer = file;\n",
+            "    const downcast = reader: File;\n",
+            "    const escalation = reader: mut Reader;\n",
+            "    const numeric = 1: float;\n",
+            "    const anonymous = struct { fn read(self) -> int { 3 } }: Reader;\n",
+            "    const heap = &File {};\n",
+            "    const heap_reader = heap: &Reader;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 4, "{:#?}", checking.errors);
+        for error in &checking.errors {
+            assert!(matches!(
+                error.kind,
+                ExpressionCheckingErrorKind::TypeMismatch { .. }
+            ));
+        }
+
+        let inspect = function(&program.declarations[3]);
+        let anonymous = binding_initializer(&inspect.body.statements[5]);
+        let (anonymous_value, _) = ascription(anonymous);
+        assert_eq!(
+            checking.interface_conversions[&anonymous_value.id].backing_transfer,
+            ValueTransfer::MoveTemporary
+        );
+        assert_eq!(checking.expressions[&anonymous.id].category, ValueCategory::BorrowedPlace);
+
+        let heap_reader = binding_initializer(&inspect.body.statements[7]);
+        let (heap_value, _) = ascription(heap_reader);
+        assert_eq!(
+            checking.interface_conversions[&heap_value.id].backing_transfer,
+            ValueTransfer::CopyGcReference
+        );
+        assert_eq!(checking.expressions[&heap_reader.id].category, ValueCategory::GcReference);
+    }
+
+    #[test]
     fn checks_gc_interface_backing_and_structural_failures() {
         let source = concat!(
             "interface Need { fn run(self, value: int) -> int; }\n",
@@ -7603,7 +7798,7 @@ mod tests {
     fn reaches_a_fixed_point_for_loop_binding_provenance() {
         let source = concat!(
             "struct Item {}\n",
-            "fn main(mut borrowed: Item) {\n",
+            "fn inspect(mut borrowed: Item) {\n",
             "    mut x = Item {};\n",
             "    mut y = Item {};\n",
             "    while true {\n",
@@ -7613,12 +7808,13 @@ mod tests {
             "    };\n",
             "    x;\n",
             "}\n",
+            "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
         let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
-        let main = function(&program.declarations[1]);
-        let x = expression(&main.body.statements[3]);
+        let inspect = function(&program.declarations[1]);
+        let x = expression(&inspect.body.statements[3]);
         assert_eq!(
             checking.expressions[&x.id].category,
             ValueCategory::BorrowedPlace

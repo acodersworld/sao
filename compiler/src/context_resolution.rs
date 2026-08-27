@@ -547,7 +547,8 @@ impl ContextResolver {
                 }
             }
             ExpressionKind::Try { expression } => self.visit_expression(expression),
-            ExpressionKind::TypeTest { value, .. } => self.visit_expression(value),
+            ExpressionKind::TypeTest { value, .. }
+            | ExpressionKind::TypeAscription { value, .. } => self.visit_expression(value),
             ExpressionKind::Unary { operand, .. } => self.visit_expression(operand),
             ExpressionKind::Binary { left, right, .. } => {
                 self.visit_expression(left);

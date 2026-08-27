@@ -460,7 +460,8 @@ impl<'source> Resolver<'source> {
                 }
             }
             ExpressionKind::Try { expression } => self.resolve_expression(scope, expression),
-            ExpressionKind::TypeTest { value, type_syntax } => {
+            ExpressionKind::TypeTest { value, type_syntax }
+            | ExpressionKind::TypeAscription { value, type_syntax } => {
                 self.resolve_expression(scope, value);
                 self.resolve_type(scope, type_syntax);
             }

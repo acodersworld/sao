@@ -116,6 +116,7 @@ fn main() {
         }
     };
     const vmut capabilities: Formatter & Accumulator = formatter_implementation;
+    const selected_capability: Formatter | Accumulator = formatter_implementation: Formatter;
     const optional: int | none = none;
 
     const queue: Queue<int> = Queue<int>::new();

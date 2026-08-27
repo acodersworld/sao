@@ -568,6 +568,13 @@ pub enum ExpressionKind {
         value: Box<Expression>,
         type_syntax: TypeSyntax,
     },
+    /// Checks `value` under an explicitly stated type, as in `value: Reader`.
+    /// This is a static checking boundary rather than a runtime cast or an
+    /// owning conversion; any accepted interface view still borrows its source.
+    TypeAscription {
+        value: Box<Expression>,
+        type_syntax: TypeSyntax,
+    },
     Unary {
         operator: UnaryOperator,
         operand: Box<Expression>,

@@ -65,6 +65,7 @@ pub enum ParseErrorKind {
     InvalidGcCapabilitySyntax,
     BindingValueCapabilityMustPrecedeName,
     AggregateMemberCapabilityNotSupported,
+    ChainedTypeAscription,
     ExpectedToken {
         expected: TokenKind,
         found: TokenKind,
@@ -1125,7 +1126,7 @@ where
                 break;
             }
 
-            self.advance()?;
+            let operator_token = self.advance()?;
             let (kind, span) = match binding_power.operator {
                 InfixOperator::Binary(operator) => {
                     let right = self
@@ -1158,6 +1159,24 @@ where
                     let span = Span::new(self.module_id, left.span.start, type_syntax.span.end);
                     (
                         ExpressionKind::TypeTest {
+                            value: Box::new(left),
+                            type_syntax,
+                        },
+                        span,
+                    )
+                }
+                InfixOperator::TypeAscription => {
+                    if directly_ascribes_type(&left) {
+                        return Err(ParseError {
+                            kind: ParseErrorKind::ChainedTypeAscription,
+                            span: operator_token.span,
+                        }
+                        .into());
+                    }
+                    let type_syntax = self.type_expression()?;
+                    let span = Span::new(self.module_id, left.span.start, type_syntax.span.end);
+                    (
+                        ExpressionKind::TypeAscription {
                             value: Box::new(left),
                             type_syntax,
                         },
@@ -2183,7 +2202,8 @@ fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext
             }
         }
         ExpressionKind::Try { expression } => assign_expression_ids(expression, context),
-        ExpressionKind::TypeTest { value, type_syntax } => {
+        ExpressionKind::TypeTest { value, type_syntax }
+        | ExpressionKind::TypeAscription { value, type_syntax } => {
             assign_expression_ids(value, context);
             assign_type_ids(type_syntax, context);
         }
@@ -2254,6 +2274,18 @@ fn outer_mutable_type(type_syntax: &TypeSyntax) -> bool {
     }
 }
 
+/// Reports whether an ascription would be applied directly to another
+/// ascription. Parentheses do not make a chain valid: both `value: A: B` and
+/// `(value: A): B` are rejected. An intervening operation does, however,
+/// produce a distinct value which may be ascribed independently.
+fn directly_ascribes_type(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::TypeAscription { .. } => true,
+        ExpressionKind::Group(inner) => directly_ascribes_type(inner),
+        _ => false,
+    }
+}
+
 const fn builtin_type_argument_count(builtin: BuiltinType) -> usize {
     match builtin {
         BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Error => 1,
@@ -2305,6 +2337,7 @@ fn range_bound_is_simple(expression: &Expression) -> bool {
 
 const LOWEST_BINDING_POWER: u8 = 0;
 const ASSIGNMENT_BINDING_POWER: u8 = 1;
+const TYPE_ASCRIPTION_BINDING_POWER: u8 = 2;
 const LOGICAL_OR_BINDING_POWER: u8 = 3;
 const LOGICAL_AND_BINDING_POWER: u8 = 5;
 const BITWISE_OR_BINDING_POWER: u8 = 7;
@@ -2329,6 +2362,7 @@ enum InfixOperator {
     Binary(BinaryOperator),
     Assignment(AssignmentOperator),
     TypeTest,
+    TypeAscription,
 }
 
 struct InfixBindingPower {
@@ -2370,6 +2404,10 @@ const fn infix_binding_power(kind: TokenKind) -> Option<InfixBindingPower> {
         TokenKind::Assign => Some(InfixBindingPower::assignment(
             ASSIGNMENT_BINDING_POWER,
             AssignmentOperator::Assign,
+        )),
+        TokenKind::Colon => Some(InfixBindingPower::left_associative(
+            TYPE_ASCRIPTION_BINDING_POWER,
+            InfixOperator::TypeAscription,
         )),
         TokenKind::PlusAssign => Some(InfixBindingPower::assignment(
             ASSIGNMENT_BINDING_POWER,
@@ -6405,6 +6443,53 @@ mod tests {
         };
         assert!(matches!(value.kind, ExpressionKind::Call { .. }));
         assert_eq!(value.span, span(0, 14));
+    }
+
+    #[test]
+    fn parses_type_ascription_with_its_complete_type_and_precedence() {
+        let expression = parse("target = left + right: Reader | Writer")
+            .expect("type ascription should parse");
+        let ExpressionKind::Assignment { value, .. } = expression.kind else {
+            panic!("assignment should remain the outer expression");
+        };
+        let ExpressionKind::TypeAscription { value, type_syntax } = value.kind else {
+            panic!("assignment value should be ascribed");
+        };
+        assert!(matches!(value.kind, ExpressionKind::Binary { .. }));
+        assert!(matches!(type_syntax.kind, TypeKind::Union { .. }));
+    }
+
+    #[test]
+    fn grouped_ascription_composes_with_postfix_operations() {
+        let expression = parse("(value: Reader).read(): bytes")
+            .expect("a postfix result should permit its own ascription");
+        let ExpressionKind::TypeAscription { value, .. } = expression.kind else {
+            panic!("call result should be ascribed");
+        };
+        let ExpressionKind::Call { callee, .. } = value.kind else {
+            panic!("the outer ascription should apply to the call result");
+        };
+        let ExpressionKind::MemberAccess { object, .. } = callee.kind else {
+            panic!("call should select a member");
+        };
+        let ExpressionKind::Group(inner) = object.kind else {
+            panic!("member receiver should retain its grouping");
+        };
+        assert!(matches!(inner.kind, ExpressionKind::TypeAscription { .. }));
+    }
+
+    #[test]
+    fn rejects_direct_and_parenthesized_ascription_chains() {
+        for source in ["value: A: B", "(value: A): B", "(((value: A))): B"] {
+            let error = parse(source).expect_err("ascription chains should be rejected");
+            assert!(matches!(
+                error,
+                FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::ChainedTypeAscription,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

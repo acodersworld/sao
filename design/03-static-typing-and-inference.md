@@ -276,6 +276,40 @@ also available for `int`. A compound-assignment destination is evaluated once,
 before its right operand. `+=` through mut access to a string appends the right
 string to the existing object; all aliases observe the mutation.
 
+### Expression type ascription
+
+An expression may be checked under an explicitly stated type with
+`expression: Type`:
+
+```text
+const reader = file: Reader;
+const selected: Reader | Writer = file: Reader;
+```
+
+This is a type ascription, not a runtime cast. It does not downcast, perform a
+primitive conversion, copy an object, or move an existing object. In the first
+example, a satisfying concrete `file` is exposed as a borrowed `Reader` view.
+In the second, that exact view selects the `Reader` member of the destination
+union while retaining the concrete object and its dispatch metadata.
+
+Ascription accepts the same safe contextual conversions as an expected type.
+It may preserve or reduce access capability but cannot escalate it. The
+expression's value category and control-flow behavior are otherwise preserved.
+
+Ascription binds below ordinary binary operators and above assignment. The
+type after `:` consumes a complete union or intersection type. Parentheses are
+therefore used to ascribe an operand or to continue with postfix syntax:
+
+```text
+left + (right: int)
+(file: Reader).read()
+(value: int) | mask
+```
+
+Type ascriptions cannot be chained, even through parentheses: both
+`value: A: B` and `(value: A): B` are invalid. A later result may be ascribed
+independently, as in `(file: Reader).read(): bytes`.
+
 Examples of rejected implicit conversions include:
 
 ```text

@@ -209,6 +209,9 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::AggregateMemberCapabilityNotSupported => {
             "qualify the complete union or intersection instead of one member".to_owned()
         }
+        ParseErrorKind::ChainedTypeAscription => {
+            "type ascriptions cannot be chained".to_owned()
+        }
         ParseErrorKind::ExpectedToken { expected, found } => {
             format!("expected {expected:?}, found {found:?}")
         }

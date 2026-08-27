@@ -408,7 +408,8 @@ impl<'source, 'names> Resolver<'source, 'names> {
                     self.visit_expression(end);
                 }
             }
-            ExpressionKind::TypeTest { value, type_syntax } => {
+            ExpressionKind::TypeTest { value, type_syntax }
+            | ExpressionKind::TypeAscription { value, type_syntax } => {
                 self.visit_expression(value);
                 self.resolve_type(type_syntax);
             }
