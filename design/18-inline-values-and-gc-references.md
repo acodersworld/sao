@@ -66,6 +66,12 @@ without allocation. Plain interfaces and intersections containing them cannot
 be stored in fields, captured, or returned; those positions require a GC-
 qualified interface.
 
+Interface satisfaction never promotes inline storage into GC storage. A plain
+struct, field, or active inline union payload may form a plain borrowed
+interface view, but a GC-qualified interface requires an existing GC reference.
+Creating an independent GC object from inline storage requires an explicit copy
+and allocation such as `&value.copy()`.
+
 A capturing callable is similarly plain and non-escaping by default. Storing,
 capturing, or returning it requires `&fn(...)`. Named functions and
 non-capturing callables have no environment and may remain plain.

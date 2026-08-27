@@ -22,8 +22,8 @@ use crate::{
     context_resolution::ContextResolution,
     name_resolution::NameResolution,
     semantic_types::{
-        AccessCapability, CopySemantics, SemanticType, StorageSemantics, TypeId, ValueCategory,
-        ValueTransfer,
+        AccessCapability, CopySemantics, SemanticType, StorageSemantics, TypeId, TypeStore,
+        ValueCategory, ValueTransfer,
     },
     signature_collection::{
         InterfaceRequirementSignature, MethodId, ReceiverSignature, SignatureCollection,
@@ -124,15 +124,71 @@ struct UnionInjection {
     union_type: TypeId,
 }
 
-/// Describes a structural conversion from a concrete struct to an erased
-/// interface view. Lowering uses the matched method identities to select the
-/// concrete vtable and the backing transfer to keep the viewed object alive.
+/// Records widening from one union to another whose member set is a superset.
+/// Every source member has the identical canonical `TypeId` in the destination;
+/// lowering uses those shared identities to remap only the runtime tag and
+/// shallow-copy the active payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct InterfaceConversion {
+struct UnionWidening {
+    source_union: TypeId,
+    destination_union: TypeId,
+}
+
+/// Describes formation of an erased interface view. This is not a conversion
+/// of the concrete object: lowering preserves its address and concrete vtable.
+/// Source alternatives and destination method requirements remain canonical
+/// type metadata and are recovered through the two `TypeId`s. Only the source
+/// expression's provenance must be retained separately because it is not part
+/// of its semantic type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InterfaceView {
     source_type: TypeId,
+    source_category: ValueCategory,
     destination_type: TypeId,
-    methods: Vec<MethodId>,
-    backing_transfer: ValueTransfer,
+}
+
+impl InterfaceView {
+    fn source_members(&self, types: &TypeStore) -> Vec<TypeId> {
+        match types.get(self.source_type) {
+            Some(SemanticType::Union { members, .. }) => members.clone(),
+            _ => vec![self.source_type],
+        }
+    }
+
+    /// Derives the storage operation for one possible source alternative.
+    /// This is lowering information, not an independently recorded type fact.
+    fn backing_transfer_for(&self, types: &TypeStore, member: TypeId) -> ValueTransfer {
+        if types
+            .get(self.destination_type)
+            .is_some_and(|semantic| semantic.storage_semantics() == Some(StorageSemantics::Gc))
+        {
+            ValueTransfer::CopyGcReference
+        } else if types
+            .get(member)
+            .is_some_and(|semantic| semantic.storage_semantics() == Some(StorageSemantics::Gc))
+        {
+            ValueTransfer::Borrow
+        } else if self.source_category == ValueCategory::FreshTemporary {
+            ValueTransfer::MoveTemporary
+        } else {
+            ValueTransfer::Borrow
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextualAssignment {
+    /// The source representation already has the required shape.
+    Exact,
+    /// Existing concrete storage is exposed through an interface view.
+    InterfaceView(InterfaceView),
+    /// One value is wrapped with the selected destination-union tag.
+    UnionInjection {
+        member_type: TypeId,
+        interface_view: Option<InterfaceView>,
+    },
+    /// An existing union needs active-tag remapping into a strict superset.
+    UnionWidening(UnionWidening),
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +308,12 @@ enum ExpressionCheckingErrorKind {
         expected: TypeId,
         found: TypeId,
     },
+    /// One source alternative satisfies multiple destination-union members.
+    /// A source ascription such as `value: Reader` selects the intended member.
+    AmbiguousUnionConversion {
+        source: TypeId,
+        destination: TypeId,
+    },
     InvalidUnaryOperand {
         operator: UnaryOperator,
         found: TypeId,
@@ -331,7 +393,8 @@ struct ExpressionChecking {
     bindings: HashMap<SymbolId, BindingSemantics>,
     transfers: HashMap<NodeId, ValueTransfer>,
     union_injections: HashMap<NodeId, UnionInjection>,
-    interface_conversions: HashMap<NodeId, InterfaceConversion>,
+    union_widenings: HashMap<NodeId, UnionWidening>,
+    interface_views: HashMap<NodeId, InterfaceView>,
     /// Final semantic types of anonymous fields, including types inferred from
     /// their initializers after signature collection.
     anonymous_field_types: HashMap<NodeId, TypeId>,
@@ -835,7 +898,7 @@ impl<'semantic> Analyzer<'semantic> {
                 let _ = self.synthesize_discarded(value);
                 self.current_path_reachable = enclosing_reachability;
             }
-            (None, true) => self.check_absent_value(expected, block.span),
+            (None, true) => self.check_absent_value(block.id, expected, block.span),
             (None, false) => {}
         }
     }
@@ -887,7 +950,7 @@ impl<'semantic> Analyzer<'semantic> {
                 if let Some(value) = value {
                     self.analyze_return_value(value, expected);
                 } else {
-                    self.check_absent_value(expected, statement.span);
+                    self.check_absent_value(statement.id, expected, statement.span);
                 }
                 StatementFlow::Returns
             }
@@ -1083,7 +1146,11 @@ impl<'semantic> Analyzer<'semantic> {
             .types()
             .get(source.type_id)
             .expect("return type belongs to the program type store");
-        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+        let transfer = if source.category == ValueCategory::BorrowedPlace
+            && self.contains_non_escaping_erased_view(source.type_id)
+        {
+            None
+        } else if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
             Some(ValueTransfer::CopyGcReference)
         } else {
             match semantic.copy_semantics() {
@@ -1130,7 +1197,7 @@ impl<'semantic> Analyzer<'semantic> {
 
     /// Checks an implicit unit result, such as a bare return or a callable body
     /// that reaches its closing brace without a final expression.
-    fn check_absent_value(&mut self, expected: TypeId, span: Span) {
+    fn check_absent_value(&mut self, node: NodeId, expected: TypeId, span: Span) {
         if self.is_recovery(expected) {
             return;
         }
@@ -1138,21 +1205,16 @@ impl<'semantic> Analyzer<'semantic> {
             .types
             .types_mut()
             .primitive(PrimitiveType::Unit, AccessCapability::Const);
-        if self
-            .types
-            .types()
-            .has_same_shape(unit, expected)
-            .expect("return types belong to the program type store")
-        {
-            return;
+        let found = TypedExpression {
+            type_id: unit,
+            category: ValueCategory::FreshTemporary,
+        };
+        match self.classify_contextual_assignment(found, expected, false) {
+            Ok(assignment) => {
+                let _ = self.apply_contextual_assignment(node, expected, found, assignment);
+            }
+            Err(kind) => self.checking.errors.push(ExpressionCheckingError { kind, span }),
         }
-        self.checking.errors.push(ExpressionCheckingError {
-            kind: ExpressionCheckingErrorKind::TypeMismatch {
-                expected,
-                found: unit,
-            },
-            span,
-        });
     }
 
     /// Analyzes one executable block while preserving the distinction between
@@ -1360,11 +1422,7 @@ impl<'semantic> Analyzer<'semantic> {
             ConditionalUse::Discarded | ConditionalUse::BranchCompletion => true,
             ConditionalUse::CallableCompletion => expected.is_some_and(|expected| {
                 self.is_recovery(expected)
-                    || self
-                        .types
-                        .types()
-                        .has_same_shape(expected, unit_type)
-                        .expect("callable result types belong to the program type store")
+                    || self.accepts_implicit_unit(expected, unit_type)
             }),
             ConditionalUse::Value => false,
         };
@@ -1913,11 +1971,7 @@ impl<'semantic> Analyzer<'semantic> {
         if naturally_terminating && !has_else {
             let requires_else = expected.is_some_and(|expected| {
                 !self.is_recovery(expected)
-                    && !self
-                        .types
-                        .types()
-                        .has_same_shape(expected, unit.type_id)
-                        .expect("loop result types belong to the program type store")
+                    && !self.accepts_implicit_unit(expected, unit.type_id)
             }) || expected.is_none()
                 && paths.iter().any(|path| {
                     !self.is_recovery(path.typed.type_id)
@@ -2069,44 +2123,15 @@ impl<'semantic> Analyzer<'semantic> {
         if self.is_recovery(expected) || self.is_recovery(found.type_id) {
             return found;
         }
-        if self
-            .types
-            .types()
-            .has_same_shape(found.type_id, expected)
-            .expect("implicit values belong to the program type store")
-        {
-            return found;
+        match self.classify_contextual_assignment(found, expected, false) {
+            Ok(assignment) => {
+                self.apply_contextual_assignment(node, expected, found, assignment)
+            }
+            Err(kind) => {
+                self.checking.errors.push(ExpressionCheckingError { kind, span });
+                self.recovery_temporary()
+            }
         }
-        let union_member = match self.types.types().get(expected) {
-            Some(SemanticType::Union { members, .. }) => members.iter().copied().find(|member| {
-                self.types
-                    .types()
-                    .has_same_shape(found.type_id, *member)
-                    .expect("union members belong to the program type store")
-            }),
-            _ => None,
-        };
-        if let Some(member_type) = union_member {
-            self.checking.union_injections.insert(
-                node,
-                UnionInjection {
-                    member_type,
-                    union_type: expected,
-                },
-            );
-            return TypedExpression {
-                type_id: expected,
-                category: ValueCategory::FreshTemporary,
-            };
-        }
-        self.checking.errors.push(ExpressionCheckingError {
-            kind: ExpressionCheckingErrorKind::TypeMismatch {
-                expected,
-                found: found.type_id,
-            },
-            span,
-        });
-        self.recovery_temporary()
     }
 
     fn synthesize(&mut self, expression: &Expression) -> Option<TypedExpression> {
@@ -2582,156 +2607,281 @@ impl<'semantic> Analyzer<'semantic> {
         {
             return Some(found);
         }
+        match self.classify_contextual_assignment(found, expected, allow_recursive_copy) {
+            Ok(assignment) => {
+                let assigned = self.apply_contextual_assignment(
+                    expression.id,
+                    expected,
+                    found,
+                    assignment,
+                );
+                if assigned != found {
+                    self.checking.expressions.insert(expression.id, assigned);
+                }
+                Some(assigned)
+            }
+            Err(kind) => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind,
+                    span: expression.span,
+                });
+                Some(self.recover_expression(expression, found.category))
+            }
+        }
+    }
+
+    /// Classifies one expected-type boundary without mutating checker state.
+    /// This separation lets destination-union matching probe every candidate
+    /// before it commits to one unambiguous conversion and emits diagnostics.
+    fn classify_contextual_assignment(
+        &self,
+        found: TypedExpression,
+        expected: TypeId,
+        allow_recursive_copy: bool,
+    ) -> Result<ContextualAssignment, ExpressionCheckingErrorKind> {
         if self
             .types
             .types()
             .has_same_shape(found.type_id, expected)
             .expect("checked types must belong to the program type store")
         {
-            if self.value_capability_is_compatible(found, expected, allow_recursive_copy) {
-                return Some(found);
-            }
-            return Some(self.report_type_mismatch(expression, expected, found));
-        }
-        if let Some(converted) = self.check_structural_interface_conversion(
-            expression,
-            expected,
-            found,
-            allow_recursive_copy,
-        ) {
-            return Some(converted);
-        }
-        let union_member = match self.types.types().get(expected) {
-            Some(SemanticType::Union { members, .. }) => members.iter().copied().find(|member| {
-                self.types
-                    .types()
-                    .has_same_shape(found.type_id, *member)
-                    .expect("union members belong to the program type store")
-                    && self.value_capability_is_compatible(found, *member, allow_recursive_copy)
-            }),
-            _ => None,
-        };
-        if let Some(member_type) = union_member {
-            self.checking.union_injections.insert(
-                expression.id,
-                UnionInjection {
-                    member_type,
-                    union_type: expected,
-                },
-            );
-            let borrowed_erased_view = found.category == ValueCategory::BorrowedPlace
-                && self
-                    .types
-                    .types()
-                    .get(found.type_id)
-                    .is_some_and(|semantic| {
-                        semantic.copy_semantics() == Some(CopySemantics::NonEscapingErasedView)
-                    });
-            let injected = TypedExpression {
-                type_id: expected,
-                category: if borrowed_erased_view {
-                    ValueCategory::BorrowedPlace
-                } else {
-                    ValueCategory::FreshTemporary
-                },
+            return if self.value_capability_is_compatible(
+                found,
+                expected,
+                allow_recursive_copy,
+            ) {
+                Ok(ContextualAssignment::Exact)
+            } else {
+                Err(ExpressionCheckingErrorKind::TypeMismatch {
+                    expected,
+                    found: found.type_id,
+                })
             };
-            self.checking.expressions.insert(expression.id, injected);
-            return Some(injected);
         }
 
-        Some(self.report_type_mismatch(expression, expected, found))
+        if let Some(destination_members) = self.union_members(expected) {
+            if !self.value_capability_is_compatible(found, expected, allow_recursive_copy) {
+                return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                    expected,
+                    found: found.type_id,
+                });
+            }
+            return self.classify_destination_union(
+                found,
+                expected,
+                destination_members,
+                allow_recursive_copy,
+            );
+        }
+
+        if let Some(source_members) = self.union_members(found.type_id) {
+            if self.interface_destination(expected).is_none() {
+                return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                    expected,
+                    found: found.type_id,
+                });
+            }
+            for source_member in source_members {
+                let source = TypedExpression {
+                    type_id: source_member,
+                    category: self.union_member_category(found.category, source_member),
+                };
+                self.validate_interface_view_source(
+                    source,
+                    expected,
+                    self.union_member_capability(found.type_id, source_member),
+                )?;
+            }
+            return Ok(ContextualAssignment::InterfaceView(InterfaceView {
+                source_type: found.type_id,
+                source_category: found.category,
+                destination_type: expected,
+            }));
+        }
+
+        self.classify_non_union_assignment(found, expected, allow_recursive_copy, None)
     }
 
-    fn report_type_mismatch(
-        &mut self,
-        expression: &Expression,
-        expected: TypeId,
+    /// Widens a union only when its canonical member set is a subset of the
+    /// destination. Otherwise the complete source may still form one
+    /// unambiguous interface view which is then injected as a single member;
+    /// that separate composition never changes members during widening.
+    fn classify_destination_union(
+        &self,
         found: TypedExpression,
-    ) -> TypedExpression {
-        self.checking.errors.push(ExpressionCheckingError {
-            kind: ExpressionCheckingErrorKind::TypeMismatch {
+        expected: TypeId,
+        destination_members: Vec<TypeId>,
+        allow_recursive_copy: bool,
+    ) -> Result<ContextualAssignment, ExpressionCheckingErrorKind> {
+        if let Some(source_members) = self.union_members(found.type_id)
+            && source_members
+                .iter()
+                .all(|source| destination_members.contains(source))
+        {
+            return Ok(ContextualAssignment::UnionWidening(UnionWidening {
+                source_union: found.type_id,
+                destination_union: expected,
+            }));
+        }
+
+        let mut candidates = Vec::new();
+        for destination_member in destination_members {
+            let assignment = if self.union_members(found.type_id).is_some() {
+                self.classify_contextual_assignment(
+                    found,
+                    destination_member,
+                    allow_recursive_copy,
+                )
+            } else {
+                self.classify_non_union_assignment(
+                    found,
+                    destination_member,
+                    allow_recursive_copy,
+                    None,
+                )
+            };
+            if let Ok(assignment) = assignment {
+                candidates.push((destination_member, assignment));
+            }
+        }
+        if candidates.len() > 1 {
+            return Err(ExpressionCheckingErrorKind::AmbiguousUnionConversion {
+                source: found.type_id,
+                destination: expected,
+            });
+        }
+        let Some((member_type, assignment)) = candidates.pop() else {
+            return Err(ExpressionCheckingErrorKind::TypeMismatch {
                 expected,
                 found: found.type_id,
-            },
-            span: expression.span,
-        });
-        let recovered = TypedExpression {
-            type_id: self.types.types().recovery(),
-            category: found.category,
+            });
         };
-        self.checking.expressions.insert(expression.id, recovered);
-        recovered
-    }
-
-    /// Converts a concrete named or anonymous struct into an explicitly
-    /// expected structural interface view. Returning `None` means ordinary
-    /// exact-shape or union checking should handle the pair instead.
-    fn check_structural_interface_conversion(
-        &mut self,
-        expression: &Expression,
-        expected: TypeId,
-        found: TypedExpression,
-        _allow_recursive_copy: bool,
-    ) -> Option<TypedExpression> {
-        let (interface_type, destination_capability, destination_is_gc) =
-            self.interface_destination(expected)?;
-        let Some((owner, source_capability, source_is_gc)) = self.aggregate_parts(found.type_id)
-        else {
-            return None;
-        };
-        let requirements = match self.interface_requirements(interface_type) {
-            Ok(requirements) => requirements,
-            Err((first, second)) => {
-                self.checking.errors.push(ExpressionCheckingError {
-                    kind: ExpressionCheckingErrorKind::ConflictingInterfaceRequirement {
-                        first,
-                        second,
-                    },
-                    span: expression.span,
-                });
-                return Some(self.recover_expression(expression, found.category));
+        let interface_view = match assignment {
+            ContextualAssignment::Exact => None,
+            ContextualAssignment::InterfaceView(view) => Some(view),
+            ContextualAssignment::UnionInjection { .. }
+            | ContextualAssignment::UnionWidening(_) => {
+                unreachable!("a normalized union member is not a destination union")
             }
         };
+        Ok(ContextualAssignment::UnionInjection {
+            member_type,
+            interface_view,
+        })
+    }
 
+    fn classify_non_union_assignment(
+        &self,
+        found: TypedExpression,
+        expected: TypeId,
+        allow_recursive_copy: bool,
+        source_capability: Option<AccessCapability>,
+    ) -> Result<ContextualAssignment, ExpressionCheckingErrorKind> {
+        if self
+            .types
+            .types()
+            .has_same_shape(found.type_id, expected)
+            .expect("assignability candidates belong to the program type store")
+        {
+            return if self.value_capability_is_compatible(
+                found,
+                expected,
+                allow_recursive_copy,
+            ) {
+                Ok(ContextualAssignment::Exact)
+            } else {
+                Err(ExpressionCheckingErrorKind::TypeMismatch {
+                    expected,
+                    found: found.type_id,
+                })
+            };
+        }
+
+        self.validate_interface_view_source(found, expected, source_capability)?;
+        Ok(ContextualAssignment::InterfaceView(InterfaceView {
+            source_type: found.type_id,
+            source_category: found.category,
+            destination_type: expected,
+        }))
+    }
+
+    /// Forms an interface view over existing storage. Concrete structs expose
+    /// their method dictionary, while interface and intersection sources prove
+    /// compatibility from the methods they already guarantee. Neither case
+    /// copies or changes the concrete object.
+    fn validate_interface_view_source(
+        &self,
+        found: TypedExpression,
+        expected: TypeId,
+        source_capability: Option<AccessCapability>,
+    ) -> Result<(), ExpressionCheckingErrorKind> {
+        let (interface_type, destination_capability, destination_is_gc) = self
+            .interface_destination(expected)
+            .ok_or(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            })?;
+        let requirements = self.interface_requirements(interface_type).map_err(
+            |(first, second)| ExpressionCheckingErrorKind::ConflictingInterfaceRequirement {
+                first,
+                second,
+            },
+        )?;
+
+        let concrete = self.aggregate_parts(found.type_id);
+        let erased = self.interface_source(found.type_id);
+        let (declared_source_capability, source_is_gc) = match (concrete, erased) {
+            (Some((_, capability, is_gc)), _) => (capability, is_gc),
+            (_, Some((_, capability, is_gc))) => (capability, is_gc),
+            _ => {
+                return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                    expected,
+                    found: found.type_id,
+                });
+            }
+        };
         let requires_gc_receiver = requirements.iter().any(|required| {
             self.signatures
                 .method_signature(required.requirement.method_id)
-                .is_some_and(|signature| {
-                    signature.receiver.storage == ReceiverStorage::Gc
-                })
+                .is_some_and(|signature| signature.receiver.storage == ReceiverStorage::Gc)
         });
         if (destination_is_gc || requires_gc_receiver) && !source_is_gc {
-            self.checking.errors.push(ExpressionCheckingError {
-                kind: ExpressionCheckingErrorKind::InterfaceRequiresGcSource,
-                span: expression.span,
-            });
-            return Some(self.recover_expression(expression, found.category));
+            return Err(ExpressionCheckingErrorKind::InterfaceRequiresGcSource);
         }
-
-        if source_capability == AccessCapability::Const
+        if source_capability.unwrap_or(declared_source_capability) == AccessCapability::Const
             && destination_capability == AccessCapability::Mut
             && found.category != ValueCategory::FreshTemporary
         {
-            return Some(self.report_type_mismatch(expression, expected, found));
+            return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            });
         }
 
+        if let Some((owner, _, _)) = concrete {
+            self.match_concrete_interface_methods(owner, &requirements)?
+        } else {
+            let (source_interface, _, _) =
+                erased.expect("an erased interface source was classified above");
+            self.match_erased_interface_methods(source_interface, &requirements)?
+        };
+        Ok(())
+    }
+
+    fn match_concrete_interface_methods(
+        &self,
+        owner: NodeId,
+        requirements: &[RequiredInterfaceMethod],
+    ) -> Result<(), ExpressionCheckingErrorKind> {
         let signature = self
             .aggregate_signature(owner)
-            .expect("concrete interface source must have a struct signature")
-            .clone();
-        let mut matched = Vec::with_capacity(requirements.len());
-        let mut valid = true;
-        for required in &requirements {
-            let Some(implementation) = signature.member(&required.name).copied() else {
-                self.checking.errors.push(ExpressionCheckingError {
-                    kind: ExpressionCheckingErrorKind::MissingInterfaceMethod {
-                        declaration: required.requirement.declaration,
-                    },
-                    span: expression.span,
-                });
-                valid = false;
-                continue;
-            };
+            .expect("concrete interface source must have a struct signature");
+        for required in requirements {
+            let implementation = signature.member(&required.name).copied().ok_or(
+                ExpressionCheckingErrorKind::MissingInterfaceMethod {
+                    declaration: required.requirement.declaration,
+                },
+            )?;
             let (implementation_declaration, implementation_method) = match implementation.kind {
                 StructMemberSignatureKind::Method {
                     declaration,
@@ -2743,49 +2893,189 @@ impl<'semantic> Analyzer<'semantic> {
                 }
             };
             if implementation_method != Some(required.requirement.method_id) {
-                self.checking.errors.push(ExpressionCheckingError {
-                    kind: ExpressionCheckingErrorKind::IncompatibleInterfaceMethod {
-                        requirement: required.requirement.declaration,
-                        implementation: implementation_declaration,
-                    },
-                    span: implementation.span,
+                return Err(ExpressionCheckingErrorKind::IncompatibleInterfaceMethod {
+                    requirement: required.requirement.declaration,
+                    implementation: implementation_declaration,
                 });
-                valid = false;
-                continue;
             }
-            matched.push(required.requirement.method_id);
         }
-        if !valid {
-            return Some(self.recover_expression(expression, found.category));
-        }
+        Ok(())
+    }
 
-        let (category, backing_transfer) = if destination_is_gc {
-            (
-                ValueCategory::GcReference,
-                ValueTransfer::CopyGcReference,
-            )
-        } else if source_is_gc {
-            (ValueCategory::BorrowedPlace, ValueTransfer::Borrow)
-        } else if found.category == ValueCategory::FreshTemporary {
-            (ValueCategory::BorrowedPlace, ValueTransfer::MoveTemporary)
+    fn match_erased_interface_methods(
+        &self,
+        source: TypeId,
+        requirements: &[RequiredInterfaceMethod],
+    ) -> Result<(), ExpressionCheckingErrorKind> {
+        let guaranteed = self.interface_requirements(source).map_err(|(first, second)| {
+            ExpressionCheckingErrorKind::ConflictingInterfaceRequirement { first, second }
+        })?;
+        let by_name: HashMap<_, _> = guaranteed
+            .iter()
+            .map(|required| (required.name.as_str(), required.requirement))
+            .collect();
+        for required in requirements {
+            let implementation = by_name.get(required.name.as_str()).copied().ok_or(
+                ExpressionCheckingErrorKind::MissingInterfaceMethod {
+                    declaration: required.requirement.declaration,
+                },
+            )?;
+            if implementation.method_id != required.requirement.method_id {
+                return Err(ExpressionCheckingErrorKind::IncompatibleInterfaceMethod {
+                    requirement: required.requirement.declaration,
+                    implementation: implementation.declaration,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn interface_source(&self, type_id: TypeId) -> Option<(TypeId, AccessCapability, bool)> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Interface { capability, .. }
+            | SemanticType::Intersection { capability, .. } => {
+                Some((type_id, *capability, false))
+            }
+            SemanticType::Gc { target, capability }
+                if matches!(
+                    self.types.types().get(*target),
+                    Some(SemanticType::Interface { .. } | SemanticType::Intersection { .. })
+                ) => Some((*target, *capability, true)),
+            _ => None,
+        }
+    }
+
+    fn union_members(&self, type_id: TypeId) -> Option<Vec<TypeId>> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Union { members, .. } => Some(members.clone()),
+            _ => None,
+        }
+    }
+
+    fn union_member_category(
+        &self,
+        union_category: ValueCategory,
+        member: TypeId,
+    ) -> ValueCategory {
+        if self
+            .types
+            .types()
+            .get(member)
+            .is_some_and(|semantic| semantic.storage_semantics() == Some(StorageSemantics::Gc))
+        {
+            ValueCategory::GcReference
         } else {
-            (ValueCategory::BorrowedPlace, ValueTransfer::Borrow)
-        };
-        self.checking.interface_conversions.insert(
-            expression.id,
-            InterfaceConversion {
-                source_type: found.type_id,
-                destination_type: expected,
-                methods: matched,
-                backing_transfer,
-            },
-        );
-        let converted = TypedExpression {
-            type_id: expected,
-            category,
-        };
-        self.checking.expressions.insert(expression.id, converted);
-        Some(converted)
+            union_category
+        }
+    }
+
+    /// Inline alternatives inherit access through the union container. GC and
+    /// erased-view alternatives retain their own nested target capability, so
+    /// mutable access to the union cannot recover mutable access to a const
+    /// reference stored inside it.
+    fn union_member_capability(
+        &self,
+        union: TypeId,
+        member: TypeId,
+    ) -> Option<AccessCapability> {
+        let member_semantic = self.types.types().get(member)?;
+        if matches!(
+            member_semantic.storage_semantics(),
+            Some(StorageSemantics::Gc | StorageSemantics::BorrowedView)
+        ) {
+            return None;
+        }
+        self.types
+            .types()
+            .get(union)
+            .and_then(|semantic| semantic.capability())
+    }
+
+    fn apply_contextual_assignment(
+        &mut self,
+        node: NodeId,
+        expected: TypeId,
+        found: TypedExpression,
+        assignment: ContextualAssignment,
+    ) -> TypedExpression {
+        match assignment {
+            ContextualAssignment::Exact => found,
+            ContextualAssignment::InterfaceView(view) => {
+                let destination_is_gc = self
+                    .interface_destination(expected)
+                    .is_some_and(|(_, _, is_gc)| is_gc);
+                self.checking.interface_views.insert(node, view);
+                TypedExpression {
+                    type_id: expected,
+                    category: if destination_is_gc {
+                        ValueCategory::GcReference
+                    } else {
+                        ValueCategory::BorrowedPlace
+                    },
+                }
+            }
+            ContextualAssignment::UnionInjection {
+                member_type,
+                interface_view,
+            } => {
+                let borrowed_view = interface_view.is_some()
+                    || (found.category == ValueCategory::BorrowedPlace
+                        && self
+                            .types
+                            .types()
+                            .get(found.type_id)
+                            .is_some_and(|semantic| {
+                                semantic.copy_semantics()
+                                    == Some(CopySemantics::NonEscapingErasedView)
+                            }));
+                if let Some(view) = interface_view {
+                    self.checking.interface_views.insert(node, view);
+                }
+                self.checking.union_injections.insert(
+                    node,
+                    UnionInjection {
+                        member_type,
+                        union_type: expected,
+                    },
+                );
+                TypedExpression {
+                    type_id: expected,
+                    category: if borrowed_view {
+                        ValueCategory::BorrowedPlace
+                    } else {
+                        ValueCategory::FreshTemporary
+                    },
+                }
+            }
+            ContextualAssignment::UnionWidening(widening) => {
+                let borrowed_payload = found.category != ValueCategory::FreshTemporary
+                    && self
+                        .union_members(widening.source_union)
+                        .expect("union widening starts from a union")
+                        .iter()
+                        .any(|member| {
+                            self.types.types().get(*member).is_some_and(|semantic| {
+                                semantic.storage_semantics() != Some(StorageSemantics::Gc)
+                                    && matches!(
+                                        semantic.copy_semantics(),
+                                        Some(
+                                            CopySemantics::Recursive
+                                                | CopySemantics::NonEscapingErasedView
+                                        )
+                                    )
+                            })
+                        });
+                self.checking.union_widenings.insert(node, widening);
+                TypedExpression {
+                    type_id: expected,
+                    category: if borrowed_payload {
+                        ValueCategory::BorrowedPlace
+                    } else {
+                        ValueCategory::FreshTemporary
+                    },
+                }
+            }
+        }
     }
 
     /// Peels plain or GC-qualified interface destinations while preserving
@@ -4730,6 +5020,41 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("analyzed expression must record explicit-value status")
     }
 
+    /// Tests whether natural fallthrough can supply unit to an expected type,
+    /// including injection into a union such as `() | int`.
+    fn accepts_implicit_unit(&self, expected: TypeId, unit: TypeId) -> bool {
+        self.classify_contextual_assignment(
+            TypedExpression {
+                type_id: unit,
+                category: ValueCategory::FreshTemporary,
+            },
+            expected,
+            false,
+        )
+        .is_ok()
+    }
+
+    /// Detects borrowed callable/interface alternatives hidden inside a union,
+    /// so wrapping a view in a tag cannot make it legal to return or retain.
+    fn contains_non_escaping_erased_view(&self, type_id: TypeId) -> bool {
+        match self.types.types().get(type_id) {
+            Some(SemanticType::Callable { .. }
+            | SemanticType::Interface { .. }
+            | SemanticType::Intersection { .. }) => true,
+            Some(SemanticType::Union { members, .. }) => members
+                .iter()
+                .any(|member| self.contains_non_escaping_erased_view(*member)),
+            Some(SemanticType::Gc { .. }
+            | SemanticType::Primitive { .. }
+            | SemanticType::NamedStruct { .. }
+            | SemanticType::AnonymousStruct { .. }
+            | SemanticType::Builtin { .. }
+            | SemanticType::Recovery
+            | SemanticType::Divergence)
+            | None => false,
+        }
+    }
+
     fn is_recovery(&self, type_id: TypeId) -> bool {
         type_id == self.types.types().recovery()
     }
@@ -6054,6 +6379,7 @@ mod tests {
             "fn return_interface(value: Reader) -> Reader { value }\n",
             "fn return_intersection(value: Reader & Writer) -> Reader & Writer { value }\n",
             "fn return_callable(value: fn() -> ()) -> fn() -> () { value }\n",
+            "fn return_union(value: Reader) -> Reader | int { value }\n",
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
@@ -6062,6 +6388,7 @@ mod tests {
             body_value(function(&program.declarations[2])),
             body_value(function(&program.declarations[3])),
             body_value(function(&program.declarations[4])),
+            body_value(function(&program.declarations[5])),
         ];
         assert_eq!(checking.errors.len(), returned.len());
         for (error, value) in checking.errors.iter().zip(returned) {
@@ -7345,18 +7672,23 @@ mod tests {
                 ValueCategory::BorrowedPlace
             );
             assert_eq!(
-                checking.interface_conversions[&converted.id].backing_transfer,
+                checking.interface_views[&converted.id]
+                    .backing_transfer_for(types.types(), checking.interface_views[&converted.id].source_type),
                 ValueTransfer::Borrow
             );
         }
         assert_eq!(
-            checking.interface_conversions[&fresh_conversion.id].backing_transfer,
+            checking.interface_views[&fresh_conversion.id].backing_transfer_for(
+                types.types(),
+                checking.interface_views[&fresh_conversion.id].source_type,
+            ),
             ValueTransfer::MoveTemporary
         );
-        assert!(
-            checking.interface_conversions[&empty_conversion.id]
-                .methods
-                .is_empty()
+        assert_eq!(
+            checking.interface_views[&empty_conversion.id]
+                .source_members(types.types())
+                .len(),
+            1
         );
         let read_call = expression(&main.body.statements[8]);
         let (read_callee, _) = call(read_call);
@@ -7399,10 +7731,13 @@ mod tests {
         let main = function(&program.declarations[3]);
         let selected = binding_initializer(&main.body.statements[1]);
         let (selected_value, selected_type) = ascription(selected);
-        let conversion = &checking.interface_conversions[&selected_value.id];
+        let conversion = &checking.interface_views[&selected_value.id];
         let injection = &checking.union_injections[&selected.id];
         assert_eq!(conversion.destination_type, injection.member_type);
-        assert_eq!(conversion.backing_transfer, ValueTransfer::Borrow);
+        assert_eq!(
+            conversion.backing_transfer_for(types.types(), conversion.source_type),
+            ValueTransfer::Borrow
+        );
         assert_eq!(checking.expressions[&selected.id].category, ValueCategory::BorrowedPlace);
         assert_eq!(injection.union_type, checking.expressions[&selected.id].type_id);
         assert_eq!(
@@ -7412,8 +7747,9 @@ mod tests {
 
         let fresh = binding_initializer(&main.body.statements[2]);
         let (fresh_value, _) = ascription(fresh);
+        let fresh_view = &checking.interface_views[&fresh_value.id];
         assert_eq!(
-            checking.interface_conversions[&fresh_value.id].backing_transfer,
+            fresh_view.backing_transfer_for(types.types(), fresh_view.source_type),
             ValueTransfer::MoveTemporary
         );
         assert_eq!(checking.expressions[&fresh.id].category, ValueCategory::BorrowedPlace);
@@ -7438,7 +7774,12 @@ mod tests {
         assert!(!checking.union_injections.contains_key(&preserved_value.id));
         let both = binding_initializer(&main.body.statements[7]);
         let (both_value, _) = ascription(both);
-        assert_eq!(checking.interface_conversions[&both_value.id].methods.len(), 2);
+        assert!(matches!(
+            types
+                .types()
+                .get(checking.interface_views[&both_value.id].destination_type),
+            Some(SemanticType::Intersection { members, .. }) if members.len() == 2
+        ));
     }
 
     #[test]
@@ -7499,7 +7840,11 @@ mod tests {
         let (module, program, names, context, mut types, signatures) = prepare(source);
         let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         assert_eq!(checking.errors.len(), 4, "{:#?}", checking.errors);
-        for error in &checking.errors {
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::AmbiguousUnionConversion { .. }
+        ));
+        for error in &checking.errors[1..] {
             assert!(matches!(
                 error.kind,
                 ExpressionCheckingErrorKind::TypeMismatch { .. }
@@ -7509,16 +7854,18 @@ mod tests {
         let inspect = function(&program.declarations[3]);
         let anonymous = binding_initializer(&inspect.body.statements[5]);
         let (anonymous_value, _) = ascription(anonymous);
+        let anonymous_view = &checking.interface_views[&anonymous_value.id];
         assert_eq!(
-            checking.interface_conversions[&anonymous_value.id].backing_transfer,
+            anonymous_view.backing_transfer_for(types.types(), anonymous_view.source_type),
             ValueTransfer::MoveTemporary
         );
         assert_eq!(checking.expressions[&anonymous.id].category, ValueCategory::BorrowedPlace);
 
         let heap_reader = binding_initializer(&inspect.body.statements[7]);
         let (heap_value, _) = ascription(heap_reader);
+        let heap_view = &checking.interface_views[&heap_value.id];
         assert_eq!(
-            checking.interface_conversions[&heap_value.id].backing_transfer,
+            heap_view.backing_transfer_for(types.types(), heap_view.source_type),
             ValueTransfer::CopyGcReference
         );
         assert_eq!(checking.expressions[&heap_reader.id].category, ValueCategory::GcReference);
@@ -7584,9 +7931,258 @@ mod tests {
             ValueCategory::BorrowedPlace
         );
         assert_eq!(
-            checking.interface_conversions[&borrowed.id].backing_transfer,
+            checking.interface_views[&borrowed.id].backing_transfer_for(
+                types.types(),
+                checking.interface_views[&borrowed.id].source_type,
+            ),
             ValueTransfer::Borrow
         );
+    }
+
+    #[test]
+    fn widens_unions_with_deterministic_tag_remapping() {
+        let source = concat!(
+            "fn accept(value: int | float | none) {}\n",
+            "fn inspect(value: int | float) {\n",
+            "    const widened: int | float | none = value;\n",
+            "    const exact: float | int = value;\n",
+            "    accept(value);\n",
+            "}\n",
+            "fn optional_unit() -> () | int { return; }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let inspect = function(&program.declarations[1]);
+        let widened = binding_initializer(&inspect.body.statements[0]);
+        let exact = binding_initializer(&inspect.body.statements[1]);
+        let called = expression(&inspect.body.statements[2]);
+        let (_, arguments) = call(called);
+        let widening = &checking.union_widenings[&widened.id];
+        let Some(SemanticType::Union {
+            members: source_members,
+            ..
+        }) = types.types().get(widening.source_union)
+        else {
+            panic!("widening source should be a union")
+        };
+        let Some(SemanticType::Union {
+            members: destination_members,
+            ..
+        }) = types.types().get(widening.destination_union)
+        else {
+            panic!("widening destination should be a union")
+        };
+        assert!(source_members
+            .iter()
+            .all(|member| destination_members.contains(member)));
+        assert_eq!(
+            checking.expressions[&widened.id].category,
+            ValueCategory::FreshTemporary
+        );
+        assert!(!checking.union_widenings.contains_key(&exact.id));
+        assert!(checking.union_widenings.contains_key(&arguments[0].id));
+        let optional_unit = function(&program.declarations[2]);
+        assert!(checking
+            .union_injections
+            .contains_key(&optional_unit.body.statements[0].id));
+    }
+
+    #[test]
+    fn borrows_structural_views_from_interfaces_and_union_members() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "interface ReaderAlias { fn read(self) -> int; }\n",
+            "interface Writer { fn write(self, value: int); }\n",
+            "struct File { fn read(self) -> int { 1 } }\n",
+            "struct Socket { fn read(self) -> int { 2 } }\n",
+            "fn inspect(\n",
+            "    both: Reader & Writer,\n",
+            "    alias: ReaderAlias,\n",
+            "    choice: File | Socket,\n",
+            "    managed: &File | &Socket,\n",
+            "    mixed: File | &Socket,\n",
+            "    boxed: &(File | Socket)\n",
+            ") {\n",
+            "    const reduced: Reader = both;\n",
+            "    const equivalent: Reader = alias;\n",
+            "    const selected: Reader = choice;\n",
+            "    const exact_widened: File | Socket | Reader = choice;\n",
+            "    const injected_view: Reader | none = choice;\n",
+            "    const retained: &Reader = managed;\n",
+            "    const mixed_view: Reader = mixed;\n",
+            "    const injected: Reader | Writer = File {};\n",
+            "    const vmut mutable_choice: File | Socket = if true {\n",
+            "        File {}\n",
+            "    } else {\n",
+            "        Socket {}\n",
+            "    };\n",
+            "    const vmut mutable_view: Reader = mutable_choice;\n",
+            "    const invalid_inline: &Reader = choice;\n",
+            "    const invalid_boxed: &Reader = boxed;\n",
+            "    const vmut invalid_escalation: Reader = choice;\n",
+            "    const vmut invalid_gc_escalation: &Reader = managed;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 4, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::InterfaceRequiresGcSource
+        );
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+
+        let inspect = function(&program.declarations[5]);
+        let reduced = binding_initializer(&inspect.body.statements[0]);
+        let equivalent = binding_initializer(&inspect.body.statements[1]);
+        let selected = binding_initializer(&inspect.body.statements[2]);
+        let exact_widened = binding_initializer(&inspect.body.statements[3]);
+        let injected_view = binding_initializer(&inspect.body.statements[4]);
+        let retained = binding_initializer(&inspect.body.statements[5]);
+        let mixed = binding_initializer(&inspect.body.statements[6]);
+        let injected = binding_initializer(&inspect.body.statements[7]);
+        let mutable_view = binding_initializer(&inspect.body.statements[9]);
+        for view in [reduced, equivalent] {
+            let metadata = &checking.interface_views[&view.id];
+            let members = metadata.source_members(types.types());
+            assert_eq!(members.len(), 1);
+            assert_eq!(
+                metadata.backing_transfer_for(types.types(), members[0]),
+                ValueTransfer::Borrow
+            );
+        }
+        let selected_view = &checking.interface_views[&selected.id];
+        let selected_members = selected_view.source_members(types.types());
+        assert_eq!(selected_members.len(), 2);
+        assert!(selected_members
+            .iter()
+            .all(|member| selected_view.backing_transfer_for(types.types(), *member)
+                == ValueTransfer::Borrow));
+        assert!(checking.union_widenings.contains_key(&exact_widened.id));
+        assert!(!checking.interface_views.contains_key(&exact_widened.id));
+        assert!(checking.union_injections.contains_key(&injected_view.id));
+        assert_eq!(
+            checking.interface_views[&injected_view.id]
+                .source_members(types.types())
+                .len(),
+            2
+        );
+        assert_eq!(
+            checking.expressions[&injected_view.id].category,
+            ValueCategory::BorrowedPlace
+        );
+        let retained_view = &checking.interface_views[&retained.id];
+        assert!(retained_view
+            .source_members(types.types())
+            .iter()
+            .all(|member| retained_view.backing_transfer_for(types.types(), *member)
+                == ValueTransfer::CopyGcReference));
+        let mixed_view = &checking.interface_views[&mixed.id];
+        assert!(mixed_view
+            .source_members(types.types())
+            .iter()
+            .all(|member| mixed_view.backing_transfer_for(types.types(), *member)
+                == ValueTransfer::Borrow));
+        assert!(checking.union_injections.contains_key(&injected.id));
+        let injected_metadata = &checking.interface_views[&injected.id];
+        assert_eq!(
+            injected_metadata.backing_transfer_for(
+                types.types(),
+                injected_metadata.source_type,
+            ),
+            ValueTransfer::MoveTemporary
+        );
+        assert_eq!(
+            checking.expressions[&injected.id].category,
+            ValueCategory::BorrowedPlace
+        );
+        assert_eq!(
+            checking.interface_views[&mutable_view.id]
+                .source_members(types.types())
+                .len(),
+            2
+        );
+        assert_eq!(
+            checking.expressions[&retained.id].category,
+            ValueCategory::GcReference
+        );
+    }
+
+    #[test]
+    fn diagnoses_ambiguous_union_interface_injections() {
+        let source = concat!(
+            "interface Reader { fn read(self); }\n",
+            "interface Writer { fn write(self); }\n",
+            "struct File { fn read(self) {} fn write(self) {} }\n",
+            "struct Socket { fn read(self) {} fn write(self) {} }\n",
+            "fn inspect(value: File | Socket) {\n",
+            "    const selected: Reader | Writer = value: Reader;\n",
+            "    const ambiguous: Reader | Writer = value;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::AmbiguousUnionConversion { .. }
+        ));
+        let inspect = function(&program.declarations[4]);
+        let selected = binding_initializer(&inspect.body.statements[0]);
+        let (selected_value, _) = ascription(selected);
+        assert_eq!(
+            checking.interface_views[&selected_value.id]
+                .source_members(types.types())
+                .len(),
+            2
+        );
+        assert!(checking.union_injections.contains_key(&selected.id));
+        let ambiguous = binding_initializer(&inspect.body.statements[1]);
+        assert_eq!(
+            checking.expressions[&ambiguous.id].type_id,
+            types.types().recovery()
+        );
+        assert!(!checking.union_widenings.contains_key(&ambiguous.id));
+    }
+
+    #[test]
+    fn rejects_union_widening_when_one_source_member_has_no_destination() {
+        let source = concat!(
+            "fn inspect(value: int | bool) {\n",
+            "    const invalid: int | float = value;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        let inspect = function(&program.declarations[0]);
+        let invalid = binding_initializer(&inspect.body.statements[0]);
+        assert_eq!(
+            checking.expressions[&invalid.id].type_id,
+            types.types().recovery()
+        );
+        assert!(!checking.union_widenings.contains_key(&invalid.id));
     }
 
     #[test]

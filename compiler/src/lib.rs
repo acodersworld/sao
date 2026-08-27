@@ -52,6 +52,18 @@ struct Summary {
     }
 }
 
+struct BriefFormatter {
+    fn format(self, prefix: string) -> string {
+        prefix + "brief"
+    }
+}
+
+struct DetailedFormatter {
+    fn format(self, prefix: string) -> string {
+        prefix + "detailed"
+    }
+}
+
 fn cleanup(summary: Summary) {
     print(summary.name);
 }
@@ -116,7 +128,14 @@ fn main() {
         }
     };
     const vmut capabilities: Formatter & Accumulator = formatter_implementation;
+    const formatter_only: Formatter = capabilities;
     const selected_capability: Formatter | Accumulator = formatter_implementation: Formatter;
+    const formatter_choice: BriefFormatter | DetailedFormatter = if true {
+        BriefFormatter {}
+    } else {
+        DetailedFormatter {}
+    };
+    const formatter_view: Formatter = formatter_choice;
     const optional: int | none = none;
 
     const queue: Queue<int> = Queue<int>::new();
@@ -133,6 +152,7 @@ fn main() {
     } else {
         decimal
     };
+    const wider_numeric: int | float | none = numeric;
     const grouped_initial = { initial };
     const character = char(65);
     const text = string(character);
@@ -158,6 +178,9 @@ fn main() {
     notify();
     heap_summary.format("shared: ");
     capabilities.format("capabilities: ");
+    formatter_only.format("reduced: ");
+    formatter_view.format("union: ");
+    wider_numeric;
     queue.length();
     table.length();
 

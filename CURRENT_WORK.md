@@ -136,12 +136,15 @@ reviewable phases:
      preserves concrete type and vtable identity, permits capability
      preservation or reduction but not escalation, and performs neither
      runtime downcasts nor primitive conversions.
-   - Next change: general union and intersection assignability and
-     contextual conversions. This includes converting `A | B` to an interface
-     `I` when every possible union member satisfies `I`. A plain interface
-     result borrows the active object rather than copying or moving it,
-     preserving the object's concrete type and vtable for interface dispatch.
-   - Later change in this phase: `is` type tests and flow-sensitive narrowing.
+   - Complete: general union and intersection contextual assignability,
+     including unambiguous member injection, narrow-to-wide union tag
+     remapping when the source member set is an exact `TypeId` subset of the
+     destination, structural interface requirement reduction, and member-wise
+     union-to-interface views. Plain interface results borrow the active object
+     without copying or moving it; GC-qualified results require and reuse an
+     existing active GC reference. Inline payloads are never implicitly copied
+     or promoted into GC storage.
+   - Next change: `is` type tests and flow-sensitive narrowing.
 7. Built-ins and completion
    - Check strings, bytes, indexing and index-place mutability, slicing,
      primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`,

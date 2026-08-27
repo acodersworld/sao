@@ -20,11 +20,17 @@ functions. A named struct's associated functions therefore do not participate
 in interface satisfaction.
 
 When an expression is expected to have an interface or interface-intersection
-type, a satisfying named or anonymous struct value is implicitly converted to a
-non-escaping view of that type. GC-qualified interface contexts require a
+type, a satisfying named or anonymous struct value is implicitly exposed
+through a non-escaping view of that type. GC-qualified interface contexts require a
 GC-qualified implementation. Interface names do not provide construction expressions of their
 own. An interface with no method requirements is valid and is satisfied by
 every struct.
+
+The same structural rule applies to existing interface and intersection
+values. A source may be viewed through a destination whose canonical method
+requirements are a subset of those already guaranteed by the source. This
+preserves the same borrowed object reference and concrete dispatch metadata;
+it does not copy or convert the concrete object.
 
 ```text
 struct User {

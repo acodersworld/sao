@@ -295,6 +295,10 @@ union while retaining the concrete object and its dispatch metadata.
 Ascription accepts the same safe contextual conversions as an expected type.
 It may preserve or reduce access capability but cannot escalate it. The
 expression's value category and control-flow behavior are otherwise preserved.
+Structural interface relationships form borrowed views over existing aggregate
+storage. They never copy or transform the concrete object, and GC-qualified
+destinations require an existing GC reference rather than implicitly allocating
+one.
 
 Ascription binds below ordinary binary operators and above assignment. The
 type after `:` consumes a complete union or intersection type. Parentheses are

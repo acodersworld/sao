@@ -25,6 +25,36 @@ Here `file: Reader` forms a borrowed interface view; it does not copy or move
 the concrete file. The surrounding union stores the `Reader` member choice
 while preserving the concrete type and vtable used for dispatch.
 
+Union widening is an exact member-set relation. A source union `S` may be used
+as a destination union `D` when `S` is a subset of `D` (`S ⊆ D`), meaning
+every source member has the identical canonical type identity in the
+destination. The runtime remaps the active tag and shallow-copies its payload;
+it does not recursively copy an active object.
+
+Contextual interface viewing is a separate operation. If a whole source value
+could form more than one interface member of a destination union, the result is
+ambiguous and requires an expression type ascription to select the intended
+view.
+
+A union may also be viewed through a structural interface when every possible
+member satisfies that interface:
+
+```text
+const source: File | Socket = choose_source();
+const reader: Reader = source;
+```
+
+`reader` borrows whichever inline object is selected by `source`'s active tag.
+It preserves that object's concrete type and dispatch metadata. Likewise,
+`&File | &Socket` may be used as `&Reader` by reusing the active GC reference.
+Neither relationship copies or converts the concrete object.
+
+GC qualification is not introduced implicitly. A plain or inline alternative
+cannot become a GC-qualified interface merely because it satisfies the
+interface. In particular, neither `File | Socket` nor `&(File | Socket)` may be
+used directly as `&Reader`: the active inline payload would first need to be
+copied explicitly into its own GC allocation.
+
 SAO uses the built-in singleton `none` to represent the absence of a value.
 `none` is both the spelling of the singleton type in a type expression and its
 only value. Types are not implicitly optional: absence must be included
@@ -64,6 +94,14 @@ mut stream: Reader & Writer = struct {
 
 SAO has no named interface-composition syntax. Call sites express combined
 requirements directly with intersection types such as `Reader & Writer`.
+
+Interface and intersection values are themselves structurally assignable. A
+source may be viewed as any interface or intersection whose canonical method
+requirements are a subset of those already guaranteed by the source. Thus a
+`Reader & Writer` may be passed as `Reader`, and two separately declared
+interfaces with the same canonical method requirements are interchangeable.
+This only changes the statically visible requirements; the borrowed object
+reference and its concrete vtable remain unchanged.
 
 Runtime interface narrowing, such as narrowing a `Reader` to
 `Reader & Writer` after `value is Writer`, uses the runtime method metadata
