@@ -144,7 +144,45 @@ reviewable phases:
      without copying or moving it; GC-qualified results require and reuse an
      existing active GC reference. Inline payloads are never implicitly copied
      or promoted into GC storage.
-   - Next change: `is` type tests and flow-sensitive narrowing.
+   - Next change: union-only `is` type tests, TypeScript-style flow-sensitive
+     narrowing, and non-lexical runtime tag locks.
+     - Accept only an exact normalized member or member subset of the tested
+       union. Do not use structural overlap, runtime interface tests, or
+       interface downcasts for `is`.
+     - Compose narrowing through grouping, `!`, `&&`, and `||`, respecting
+       short-circuit evaluation, impossible paths, progressive `else if`
+       subtraction, and guard facts that remain valid after a conditional.
+     - Track narrowed identifier and resolved-field places by stable symbol and
+       field identities. Preserve source capabilities and lexical shadowing.
+     - Record private narrowing facts and control-flow-edge lock operations for
+       typed IR and lowering. Entering a narrower state increments the physical
+       union storage's narrowing counter; the lock remains active while the
+       fact is valid, including beyond its originating `if` and across calls.
+       Joins retain only facts guaranteed on every reaching path. Reassignment,
+       `return`, `break`, `continue`, loop backedges, and callable completion
+       release locks that no longer apply. Nested tests and aliases acquire and
+       release the same runtime counter independently.
+     - Permit mutation of the active payload and replacement by the same union
+       member while locked. A replacement that changes the active tag panics
+       when the counter is nonzero. A statically visible tag-changing assignment
+       first releases its own flow fact; independent locks held through aliases
+       remain active and may still reject the mutation.
+     - Add thorough metadata tests for true and false branch acquisition,
+       normal release, surviving guard locks, returning and diverging paths,
+       joins that retain or discard facts, nested and aliased locks, exact
+       subset tests, impossible paths, and complete `!`/`&&`/`||` composition.
+     - Cover assignment and place invalidation, including same-tag replacement,
+       visible tag changes, root rebinding, field replacement and descendant
+       facts, unrelated fields, shadowed symbols, and capability preservation.
+     - Cover lock preservation across ordinary arguments and receivers;
+       balanced cleanup for `return`, `break`, `continue`, loop backedges, loop
+       `else`, callable completion, recovery, and unreachable tails; and
+       runtime-facing metadata that distinguishes payload mutation, same-tag
+       replacement, and guarded tag changes.
+     - Add invariant-style helpers that simulate every recorded control-flow
+       path, prove counters never become negative, and prove every terminating
+       path returns its acquired counters to zero. Extend the complex-program
+       test with direct, negated, compound, field, and post-guard narrowing.
 7. Built-ins and completion
    - Check strings, bytes, indexing and index-place mutability, slicing,
      primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`,
