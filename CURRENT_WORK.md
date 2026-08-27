@@ -183,9 +183,24 @@ reviewable phases:
        destination lock depths. The complex-program test exercises direct,
        compound, and post-guard narrowing.
 7. Built-ins and completion (next)
-   - Check strings, bytes, indexing and index-place mutability, slicing,
-     primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`,
-     output, `panic`, `yield`, `co`, and `defer`.
+   - Phase 7.1, string and byte sequences (next):
+     - Check `string` and `bytes` indexing. Indices must have type `int`.
+     - Record mutable index places and check indexed assignment. `string`
+       elements accept `char`; `bytes` elements accept `int`.
+     - Support the existing integer compound-assignment operators on mutable
+       `bytes` elements.
+     - Check end-exclusive slicing with optional `int` bounds. Every slice
+       creates a fresh mutable sequence with an independent copied buffer.
+     - Check `string.length()`, `bytes.length()`, and the first-class
+       `bytes::concat` associated function.
+     - Record private resolved sequence-operation metadata and the runtime
+       checks needed by lowering. Indexing and indexed assignment panic when
+       the index is out of bounds; slicing normalizes negative bounds and
+       panics for invalid normalized ranges; byte assignment and compound
+       assignment panic when the stored result is outside `0..=255`.
+     - Constant evaluation and compile-time range diagnostics remain deferred.
+   - Then check primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`,
+     `ascii`, output, `panic`, `yield`, `co`, and `defer`.
    - Aggregate deterministic diagnostics and expose successful semantic
      metadata for expressions, bindings, declarations, and callable signatures.
    - Add comprehensive tests and update implementation-status documents only
