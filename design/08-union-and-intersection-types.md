@@ -103,15 +103,14 @@ interfaces with the same canonical method requirements are interchangeable.
 This only changes the statically visible requirements; the borrowed object
 reference and its concrete vtable remain unchanged.
 
-Runtime interface narrowing, such as narrowing a `Reader` to
-`Reader & Writer` after `value is Writer`, uses the runtime method metadata
-described in Section 6.1.
+Interface relationships are resolved statically through contextual
+assignability. `is` does not perform runtime interface tests or downcasts.
 
 ## 8.1 Flow-sensitive type narrowing
 
 The initial language uses `is` tests and ordinary `if` expressions rather than
-a general pattern-matching construct. A successful test narrows the tested
-binding within the true branch:
+a general pattern-matching construct. A successful test narrows an identifier
+or resolved field place within the true control-flow path:
 
 ```text
 fn display(value: int | float | none) -> () {
@@ -141,12 +140,30 @@ if result is none {
 }
 ```
 
-A union-member test inspects the union's active tag. A nominal type test on an
-interface value compares its concrete runtime vtable pointer. An interface
-test on another interface value consults the concrete type's method metadata and
-narrows the true branch to an intersection. A failed runtime interface test
-does not create a negative interface type, so its false branch retains the
-original interface type.
+A type test is valid only when its left operand is a union value and its tested
+type is an exact normalized member or exact member subset of that union. It
+inspects the union's active tag; stable identifier and field places additionally
+receive flow-sensitive narrowing. Structural overlap, nominal tests on
+interface values, runtime interface tests, and interface downcasts are not
+supported.
+
+Narrowing composes through grouping, `!`, `&&`, and `||`, including their
+short-circuit paths. Facts may survive an `if` after a guard branch exits:
+
+```text
+if !(value is int) {
+    return;
+}
+// value has type int here.
+```
+
+Each live narrowing acquires a non-lexical lock on the physical union storage's
+tag. The lock remains active for as long as the flow fact is valid, including
+across calls, and is released on invalidation or control-flow exit. Payload
+mutation and replacement by the same active member remain valid while locked.
+Changing the active member panics when another narrowed reference still holds a
+lock. SAO is single-threaded, so the lock is a counter rather than an atomic or
+thread-synchronization primitive.
 
 Narrowing applies to the existing binding, does not evaluate its initializer
 again, and preserves its access capability. It can never recover `mut` access

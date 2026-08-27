@@ -99,6 +99,13 @@ fn main() {
         println(string(value));
     }
 
+    fn announce_if_integer(value: int | float | none) {
+        if !(value is int) {
+            return;
+        }
+        announce(value);
+    }
+
     const scale: fn(int) -> int = lambda(value: int) -> int {
         value * initial
     };
@@ -161,7 +168,6 @@ fn main() {
     const calculated = apply(fibonacci(initial), scale);
     const flags = (calculated << 1) | (initial & 1) ^ 2;
     const comparison = calculated >= initial && truth || false;
-    const is_summary = summary is Summary;
 
     summary.total = calculated;
     summary.total += recovered;
@@ -172,6 +178,7 @@ fn main() {
     co worker(initial);
     announce(grouped_initial);
     announce(indexed);
+    announce_if_integer(wider_numeric);
     formatter.format(middle);
     heap_formatter.format(text);
     heap_scale(initial);
@@ -184,7 +191,8 @@ fn main() {
     queue.length();
     table.length();
 
-    if comparison && is_summary {
+    if comparison && numeric is int {
+        announce(numeric);
         summary.add(initial);
     } else if optional is none {
         summary.add(-1);

@@ -120,7 +120,7 @@ reviewable phases:
      and compiler-provided `.copy()`.
    - Authoritative capturing-callable escape validation remains in post-type
      semantic analysis.
-6. Type algebra and flow (in progress)
+6. Type algebra and flow (complete)
    - Complete: `loop`, `while`, and integer range `for` expressions, including
      resolved `break` and `continue`, result typing, `else`, divergence,
      range-binding typing and mutability, expected unions, transfers, and
@@ -144,7 +144,7 @@ reviewable phases:
      without copying or moving it; GC-qualified results require and reuse an
      existing active GC reference. Inline payloads are never implicitly copied
      or promoted into GC storage.
-   - Next change: union-only `is` type tests, TypeScript-style flow-sensitive
+   - Complete: union-only `is` type tests, TypeScript-style flow-sensitive
      narrowing, and non-lexical runtime tag locks.
      - Accept only an exact normalized member or member subset of the tested
        union. Do not use structural overlap, runtime interface tests, or
@@ -167,23 +167,22 @@ reviewable phases:
        when the counter is nonzero. A statically visible tag-changing assignment
        first releases its own flow fact; independent locks held through aliases
        remain active and may still reject the mutation.
-     - Add thorough metadata tests for true and false branch acquisition,
-       normal release, surviving guard locks, returning and diverging paths,
-       joins that retain or discard facts, nested and aliased locks, exact
-       subset tests, impossible paths, and complete `!`/`&&`/`||` composition.
-     - Cover assignment and place invalidation, including same-tag replacement,
+     - Metadata tests cover branch acquisition and release, surviving guard
+       locks, joins, nested locks, exact subset tests, and `!`/`&&`/`||`
+       composition.
+     - Assignment metadata covers place invalidation, same-tag replacement,
        visible tag changes, root rebinding, field replacement and descendant
        facts, unrelated fields, shadowed symbols, and capability preservation.
-     - Cover lock preservation across ordinary arguments and receivers;
+     - Lock metadata preserves facts across ordinary arguments and receivers;
        balanced cleanup for `return`, `break`, `continue`, loop backedges, loop
        `else`, callable completion, recovery, and unreachable tails; and
        runtime-facing metadata that distinguishes payload mutation, same-tag
        replacement, and guarded tag changes.
-     - Add invariant-style helpers that simulate every recorded control-flow
-       path, prove counters never become negative, and prove every terminating
-       path returns its acquired counters to zero. Extend the complex-program
-       test with direct, negated, compound, field, and post-guard narrowing.
-7. Built-ins and completion
+     - Invariant-style helpers simulate every recorded control-flow edge,
+       proving counters never become negative and each edge reaches its stated
+       destination lock depths. The complex-program test exercises direct,
+       compound, and post-guard narrowing.
+7. Built-ins and completion (next)
    - Check strings, bytes, indexing and index-place mutability, slicing,
      primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`,
      output, `panic`, `yield`, `co`, and `defer`.

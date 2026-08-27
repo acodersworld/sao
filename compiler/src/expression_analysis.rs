@@ -2,8 +2,9 @@
 //!
 //! This module intentionally has no public whole-program entry point yet. It
 //! records expression, binding, call, callable-result, control-flow, and
-//! contextual union facts needed by later increments without treating
-//! not-yet-implemented expression forms as source errors.
+//! contextual union, narrowing, and runtime tag-lock facts needed by later
+//! increments without treating not-yet-implemented expression forms as source
+//! errors.
 
 // The whole-program entry point remains intentionally private and unconnected
 // until the core-expression phase covers every expression form in its scope.
@@ -86,6 +87,7 @@ struct LoopResultPath {
     span: Span,
     typed: TypedExpression,
     categories: HashMap<SymbolId, ValueCategory>,
+    narrowings: NarrowingState,
 }
 
 #[derive(Debug, Clone)]
@@ -96,13 +98,15 @@ struct ActiveLoop {
     expression: NodeId,
     expected_result_type: Option<TypeId>,
     breaks: Vec<LoopResultPath>,
-    continues: Vec<HashMap<SymbolId, ValueCategory>>,
+    continues: Vec<(HashMap<SymbolId, ValueCategory>, NarrowingState)>,
+    entry_narrowings: NarrowingState,
 }
 
 #[derive(Debug, Clone)]
 struct LoopIterationOutcome {
     breaks: Vec<LoopResultPath>,
     natural_categories: Option<HashMap<SymbolId, ValueCategory>>,
+    natural_narrowings: Option<NarrowingState>,
     invalid: bool,
 }
 
@@ -145,6 +149,91 @@ struct InterfaceView {
     source_type: TypeId,
     source_category: ValueCategory,
     destination_type: TypeId,
+}
+
+/// A stable source-level route to physical union storage. Expression node IDs
+/// are deliberately absent: two reads such as `holder.value` must identify the
+/// same place so a narrowing established by one read applies to the other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NarrowingPlace {
+    root: NarrowingRoot,
+    fields: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NarrowingRoot {
+    Symbol(SymbolId),
+    SelfValue(NodeId),
+}
+
+/// One live proof that a union place has the indicated member or member subset.
+/// Multiple entries for one place are intentional: nested tests and aliases
+/// acquire independent runtime tag locks even when they prove the same type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NarrowingFact {
+    source_union: TypeId,
+    narrowed_type: TypeId,
+}
+
+type NarrowingState = HashMap<NarrowingPlace, Vec<NarrowingFact>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NarrowingLockKind {
+    Acquire,
+    Release,
+}
+
+/// A lowering-visible counter update on one control-flow edge. Acquiring a
+/// fact increments the addressed union storage's tag-lock counter; releasing
+/// it decrements the same counter. Lowering emits these operations on the edge,
+/// not merely at lexical block boundaries, so guard-clause facts can outlive
+/// the `if` which established them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NarrowingLockOperation {
+    place: NarrowingPlace,
+    narrowed_type: TypeId,
+    kind: NarrowingLockKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NarrowingEdgeKind {
+    True,
+    False,
+    Join,
+    Invalidate,
+    Return,
+    Break,
+    Continue,
+    CallableCompletion,
+    LoopBackedge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NarrowingEdge {
+    source: NodeId,
+    kind: NarrowingEdgeKind,
+    /// Retained for invariant tests and for lowering to verify edge placement.
+    from: NarrowingState,
+    to: NarrowingState,
+    operations: Vec<NarrowingLockOperation>,
+}
+
+/// Runtime behavior required when writing storage which may currently have
+/// outstanding narrowed references. Payload-only mutation never changes the
+/// tag; same-tag replacement keeps the lock; a guarded tag change releases the
+/// writer's own fact and asks lowering to panic if any alias still holds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnionMutationKind {
+    PayloadMutation,
+    SameTagReplacement,
+    GuardedTagChange,
+}
+
+#[derive(Debug, Clone)]
+struct BooleanFlow {
+    when_true: Option<NarrowingState>,
+    when_false: Option<NarrowingState>,
+    invalid: bool,
 }
 
 impl InterfaceView {
@@ -249,6 +338,8 @@ struct BindingSemantics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Place {
     symbol: Option<SymbolId>,
+    /// Fixed declared shape before any flow-sensitive union narrowing.
+    declared_type_id: TypeId,
     type_id: TypeId,
     category: ValueCategory,
     binding_mutability: Option<BindingMutability>,
@@ -313,6 +404,13 @@ enum ExpressionCheckingErrorKind {
     AmbiguousUnionConversion {
         source: TypeId,
         destination: TypeId,
+    },
+    InvalidTypeTestSource {
+        found: TypeId,
+    },
+    InvalidTypeTestMember {
+        union: TypeId,
+        tested: TypeId,
     },
     InvalidUnaryOperand {
         operator: UnaryOperator,
@@ -395,6 +493,11 @@ struct ExpressionChecking {
     union_injections: HashMap<NodeId, UnionInjection>,
     union_widenings: HashMap<NodeId, UnionWidening>,
     interface_views: HashMap<NodeId, InterfaceView>,
+    /// Runtime tag-counter updates, retained in control-flow order for typed IR.
+    narrowing_edges: Vec<NarrowingEdge>,
+    /// The narrowed type produced by each valid `is` expression on each edge.
+    type_test_facts: HashMap<NodeId, (Option<TypeId>, Option<TypeId>)>,
+    union_mutations: HashMap<NodeId, UnionMutationKind>,
     /// Final semantic types of anonymous fields, including types inferred from
     /// their initializers after signature collection.
     anonymous_field_types: HashMap<NodeId, TypeId>,
@@ -663,6 +766,9 @@ struct Analyzer<'semantic> {
     /// Flow-sensitive provenance of the storage currently denoted by each
     /// binding. Declared type and qualifiers remain in `checking.bindings`.
     current_binding_categories: HashMap<SymbolId, ValueCategory>,
+    /// Flow facts currently guaranteed on this path. Each stack entry owns one
+    /// runtime tag lock and therefore must be released exactly once.
+    current_narrowings: NarrowingState,
     /// Whether the expression currently being analyzed is reachable from the
     /// beginning of its enclosing block. Unreachable syntax is still checked,
     /// but its loop transfers cannot contribute runtime exits.
@@ -781,6 +887,7 @@ impl<'semantic> Analyzer<'semantic> {
             aggregate_order,
             aggregate_layouts,
             current_binding_categories: HashMap::new(),
+            current_narrowings: HashMap::new(),
             current_path_reachable: true,
             active_loops: Vec::new(),
             checking: ExpressionChecking::default(),
@@ -811,6 +918,7 @@ impl<'semantic> Analyzer<'semantic> {
 
     fn visit_function(&mut self, function: &Function) {
         let enclosing_categories = self.current_binding_categories.clone();
+        let enclosing_narrowings = std::mem::take(&mut self.current_narrowings);
         let enclosing_reachability = self.current_path_reachable;
         let enclosing_loops = std::mem::take(&mut self.active_loops);
         self.current_path_reachable = true;
@@ -821,7 +929,9 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("function signature must have been collected")
             .return_type;
         self.visit_callable_body(&function.body, return_type);
+        self.release_all_narrowings(function.body.id, NarrowingEdgeKind::CallableCompletion);
         self.current_binding_categories = enclosing_categories;
+        self.current_narrowings = enclosing_narrowings;
         self.current_path_reachable = enclosing_reachability;
         self.active_loops = enclosing_loops;
     }
@@ -952,6 +1062,7 @@ impl<'semantic> Analyzer<'semantic> {
                 } else {
                     self.check_absent_value(statement.id, expected, statement.span);
                 }
+                self.release_all_narrowings(statement.id, NarrowingEdgeKind::Return);
                 StatementFlow::Returns
             }
             StatementKind::Break(value) => self.analyze_break(statement, value.as_ref()),
@@ -986,6 +1097,17 @@ impl<'semantic> Analyzer<'semantic> {
             None => Some(self.check_bare_break(statement, expected_result_type)),
         };
         let Some(typed) = typed else {
+            let destination = self
+                .active_loops
+                .last()
+                .expect("break statement must be checked inside an active loop")
+                .entry_narrowings
+                .clone();
+            self.transition_current_narrowings(
+                statement.id,
+                NarrowingEdgeKind::Break,
+                destination,
+            );
             return StatementFlow::Breaks(target);
         };
         if self.is_divergence(typed.type_id) {
@@ -993,6 +1115,12 @@ impl<'semantic> Analyzer<'semantic> {
         }
         if self.current_path_reachable {
             let categories = self.current_binding_categories.clone();
+            let narrowings = self
+                .active_loops
+                .last()
+                .expect("break statement must be checked inside an active loop")
+                .entry_narrowings
+                .clone();
             let active = self
                 .active_loops
                 .last_mut()
@@ -1006,8 +1134,16 @@ impl<'semantic> Analyzer<'semantic> {
                 span: value.map_or(statement.span, |value| value.span),
                 typed,
                 categories,
+                narrowings,
             });
         }
+        let destination = self
+            .active_loops
+            .last()
+            .expect("break statement must be checked inside an active loop")
+            .entry_narrowings
+            .clone();
+        self.transition_current_narrowings(statement.id, NarrowingEdgeKind::Break, destination);
         StatementFlow::Breaks(target)
     }
 
@@ -1029,6 +1165,7 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("continue statement must have a resolved loop target");
         if self.current_path_reachable {
             let categories = self.current_binding_categories.clone();
+            let narrowings = self.current_narrowings.clone();
             let active = self
                 .active_loops
                 .last_mut()
@@ -1037,8 +1174,15 @@ impl<'semantic> Analyzer<'semantic> {
                 active.expression, target,
                 "resolved continue target must be the innermost active loop"
             );
-            active.continues.push(categories);
+            active.continues.push((categories, narrowings));
         }
+        let destination = self
+            .active_loops
+            .last()
+            .expect("continue statement must be checked inside an active loop")
+            .entry_narrowings
+            .clone();
+        self.transition_current_narrowings(statement.id, NarrowingEdgeKind::Continue, destination);
         StatementFlow::Continues(target)
     }
 
@@ -1049,7 +1193,17 @@ impl<'semantic> Analyzer<'semantic> {
         let mut can_reach_block_end = true;
         for statement in &block.statements {
             self.current_path_reachable = enclosing_reachability && can_reach_block_end;
+            let unreachable_categories =
+                (!self.current_path_reachable).then(|| self.current_binding_categories.clone());
+            let unreachable_narrowings =
+                (!self.current_path_reachable).then(|| self.current_narrowings.clone());
             let flow = self.visit_statement(statement);
+            if let Some(categories) = unreachable_categories {
+                self.current_binding_categories = categories;
+            }
+            if let Some(narrowings) = unreachable_narrowings {
+                self.current_narrowings = narrowings;
+            }
             can_reach_block_end &= flow.can_complete_normally();
         }
         self.current_path_reachable = enclosing_reachability;
@@ -1235,6 +1389,7 @@ impl<'semantic> Analyzer<'semantic> {
                 let _ = self.synthesize_discarded(value);
                 self.current_path_reachable = enclosing_reachability;
             }
+            self.release_block_local_narrowings(block);
             return Some(BlockOutcome {
                 typed: TypedExpression {
                     type_id: self.types.types().divergence(),
@@ -1245,6 +1400,7 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         let Some(value) = &block.value else {
+            self.release_block_local_narrowings(block);
             return Some(BlockOutcome {
                 typed: self.fresh_primitive(PrimitiveType::Unit),
                 explicit_value: None,
@@ -1272,10 +1428,35 @@ impl<'semantic> Analyzer<'semantic> {
                 explicitly_produces_value: self.explicitly_produces_value(value),
             }
         };
-        Some(BlockOutcome {
+        let outcome = BlockOutcome {
             typed: outcome.typed,
             explicit_value: outcome.explicitly_produces_value.then_some(value.id),
-        })
+        };
+        self.release_block_local_narrowings(block);
+        Some(outcome)
+    }
+
+    fn release_block_local_narrowings(&mut self, block: &Block) {
+        let local_symbols: HashSet<_> = block
+            .statements
+            .iter()
+            .filter_map(|statement| {
+                matches!(&statement.kind, StatementKind::Binding { .. }).then(|| {
+                    self.names
+                        .symbol_for_declaration(statement.id)
+                        .expect("block binding must have a resolved symbol")
+                })
+            })
+            .collect();
+        if local_symbols.is_empty() {
+            return;
+        }
+        let from = self.current_narrowings.clone();
+        self.current_narrowings.retain(|place, _| {
+            !matches!(place.root, NarrowingRoot::Symbol(symbol) if local_symbols.contains(&symbol))
+        });
+        let to = self.current_narrowings.clone();
+        self.record_narrowing_transition(block.id, NarrowingEdgeKind::Join, &from, &to);
     }
 
     /// Analyzes an expression whose result is discarded by its containing
@@ -1338,6 +1519,274 @@ impl<'semantic> Analyzer<'semantic> {
         self.analyze_conditional_expression(expression, Some(expected), usage, false)
     }
 
+    /// Analyzes a boolean as a pair of control-flow outcomes. Ordinary boolean
+    /// expressions preserve the incoming facts; `is`, grouping, `!`, `&&`, and
+    /// `||` refine and combine them with their real short-circuit semantics.
+    fn analyze_boolean_condition(&mut self, expression: &Expression) -> Option<BooleanFlow> {
+        let incoming = self.current_narrowings.clone();
+        let bool_type = self
+            .types
+            .types_mut()
+            .primitive(PrimitiveType::Bool, AccessCapability::Const);
+        let flow = match &expression.kind {
+            ExpressionKind::Group(inner) => {
+                let flow = self.analyze_boolean_condition(inner)?;
+                self.checking.expressions.insert(
+                    expression.id,
+                    TypedExpression {
+                        type_id: if flow.invalid {
+                            self.types.types().recovery()
+                        } else {
+                            bool_type
+                        },
+                        category: ValueCategory::FreshTemporary,
+                    },
+                );
+                self.checking.explicit_values.insert(expression.id, true);
+                flow
+            }
+            ExpressionKind::Unary {
+                operator: UnaryOperator::Not,
+                operand,
+            } => {
+                let inner = self.analyze_boolean_condition(operand)?;
+                self.checking.expressions.insert(
+                    expression.id,
+                    TypedExpression {
+                        type_id: if inner.invalid {
+                            self.types.types().recovery()
+                        } else {
+                            bool_type
+                        },
+                        category: ValueCategory::FreshTemporary,
+                    },
+                );
+                self.checking.explicit_values.insert(expression.id, true);
+                BooleanFlow {
+                    when_true: inner.when_false,
+                    when_false: inner.when_true,
+                    invalid: inner.invalid,
+                }
+            }
+            ExpressionKind::Binary {
+                left,
+                operator: BinaryOperator::LogicalAnd,
+                right,
+            } => {
+                let left_flow = self.analyze_boolean_condition(left)?;
+                let right_flow = self.analyze_short_circuit_operand(
+                    right,
+                    left_flow.when_true.as_ref(),
+                    &incoming,
+                )?;
+                let when_false = self.merge_optional_narrowing_states([
+                    left_flow.when_false.as_ref(),
+                    right_flow.when_false.as_ref(),
+                ]);
+                if let Some(merged) = &when_false {
+                    for state in [left_flow.when_false.as_ref(), right_flow.when_false.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.record_narrowing_transition(
+                            expression.id,
+                            NarrowingEdgeKind::False,
+                            state,
+                            merged,
+                        );
+                    }
+                }
+                let invalid = left_flow.invalid || right_flow.invalid;
+                self.record_boolean_expression(expression, bool_type, invalid);
+                BooleanFlow {
+                    when_true: right_flow.when_true,
+                    when_false,
+                    invalid,
+                }
+            }
+            ExpressionKind::Binary {
+                left,
+                operator: BinaryOperator::LogicalOr,
+                right,
+            } => {
+                let left_flow = self.analyze_boolean_condition(left)?;
+                let right_flow = self.analyze_short_circuit_operand(
+                    right,
+                    left_flow.when_false.as_ref(),
+                    &incoming,
+                )?;
+                let when_true = self.merge_optional_narrowing_states([
+                    left_flow.when_true.as_ref(),
+                    right_flow.when_true.as_ref(),
+                ]);
+                if let Some(merged) = &when_true {
+                    for state in [left_flow.when_true.as_ref(), right_flow.when_true.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.record_narrowing_transition(
+                            expression.id,
+                            NarrowingEdgeKind::True,
+                            state,
+                            merged,
+                        );
+                    }
+                }
+                let invalid = left_flow.invalid || right_flow.invalid;
+                self.record_boolean_expression(expression, bool_type, invalid);
+                BooleanFlow {
+                    when_true,
+                    when_false: right_flow.when_false,
+                    invalid,
+                }
+            }
+            ExpressionKind::TypeTest { value, type_syntax } => {
+                self.analyze_type_test_flow(expression, value, type_syntax, &incoming)?
+            }
+            _ => {
+                let checked = self.check(expression, bool_type)?;
+                let invalid = self.is_recovery(checked.type_id);
+                BooleanFlow {
+                    when_true: Some(incoming.clone()),
+                    when_false: Some(incoming.clone()),
+                    invalid,
+                }
+            }
+        };
+        self.current_narrowings = incoming;
+        Some(flow)
+    }
+
+    fn analyze_short_circuit_operand(
+        &mut self,
+        expression: &Expression,
+        incoming: Option<&NarrowingState>,
+        fallback: &NarrowingState,
+    ) -> Option<BooleanFlow> {
+        let reachable = incoming.is_some();
+        self.current_narrowings = incoming.cloned().unwrap_or_else(|| fallback.clone());
+        let enclosing_reachability = self.current_path_reachable;
+        self.current_path_reachable &= reachable;
+        let flow = self.analyze_boolean_condition(expression);
+        self.current_path_reachable = enclosing_reachability;
+        flow.map(|flow| {
+            if reachable {
+                flow
+            } else {
+                BooleanFlow {
+                    when_true: None,
+                    when_false: None,
+                    invalid: flow.invalid,
+                }
+            }
+        })
+    }
+
+    fn record_boolean_expression(&mut self, expression: &Expression, bool_type: TypeId, invalid: bool) {
+        self.checking.expressions.insert(
+            expression.id,
+            TypedExpression {
+                type_id: if invalid {
+                    self.types.types().recovery()
+                } else {
+                    bool_type
+                },
+                category: ValueCategory::FreshTemporary,
+            },
+        );
+        self.checking.explicit_values.insert(expression.id, true);
+    }
+
+    fn merge_optional_narrowing_states<'state>(
+        &mut self,
+        states: impl IntoIterator<Item = Option<&'state NarrowingState>>,
+    ) -> Option<NarrowingState> {
+        let reachable: Vec<_> = states.into_iter().flatten().collect();
+        (!reachable.is_empty()).then(|| self.merge_narrowing_states(&reachable))
+    }
+
+    fn analyze_type_test_flow(
+        &mut self,
+        expression: &Expression,
+        value: &Expression,
+        type_syntax: &TypeSyntax,
+        incoming: &NarrowingState,
+    ) -> Option<BooleanFlow> {
+        let typed = self.synthesize_type_test(expression, value, type_syntax)?;
+        self.checking.expressions.insert(expression.id, typed);
+        self.checking.explicit_values.insert(expression.id, true);
+        if self.is_recovery(typed.type_id) {
+            return Some(BooleanFlow {
+                when_true: Some(incoming.clone()),
+                when_false: Some(incoming.clone()),
+                invalid: true,
+            });
+        }
+
+        let place = self.narrowing_place(value);
+        let source = self
+            .synthesize(value)
+            .expect("a valid type-test value was already synthesized");
+        let previous = place
+            .as_ref()
+            .and_then(|place| self.effective_narrowing(place));
+        let source_union = previous.map_or(source.type_id, |fact| fact.source_union);
+        let possible_type = previous.map_or(source_union, |fact| fact.narrowed_type);
+        let possible = self
+            .union_members(possible_type)
+            .unwrap_or_else(|| vec![possible_type]);
+        let tested = self
+            .types
+            .type_for_syntax(type_syntax.id)
+            .expect("type-test syntax must have been resolved");
+        let tested_members = self.union_members(tested).unwrap_or_else(|| vec![tested]);
+        let matching: Vec<_> = possible
+            .iter()
+            .copied()
+            .filter(|member| tested_members.contains(member))
+            .collect();
+        let remaining: Vec<_> = possible
+            .iter()
+            .copied()
+            .filter(|member| !tested_members.contains(member))
+            .collect();
+
+        let true_type = (!matching.is_empty())
+            .then(|| self.narrowed_subset_type(source_union, matching));
+        let false_type = (!remaining.is_empty())
+            .then(|| self.narrowed_subset_type(source_union, remaining));
+        let make_state = |narrowed_type: Option<TypeId>| -> Option<NarrowingState> {
+            let narrowed_type = narrowed_type?;
+            let mut state = incoming.clone();
+            if narrowed_type != source_union
+                && let Some(place) = &place
+            {
+                state.entry(place.clone()).or_default().push(NarrowingFact {
+                    source_union,
+                    narrowed_type,
+                });
+            }
+            Some(state)
+        };
+        let when_true = make_state(true_type);
+        let when_false = make_state(false_type);
+        self.checking.type_test_facts.insert(
+            expression.id,
+            (true_type, false_type),
+        );
+        if let Some(state) = &when_true {
+            self.record_narrowing_transition(expression.id, NarrowingEdgeKind::True, incoming, state);
+        }
+        if let Some(state) = &when_false {
+            self.record_narrowing_transition(expression.id, NarrowingEdgeKind::False, incoming, state);
+        }
+        Some(BooleanFlow {
+            when_true,
+            when_false,
+            invalid: false,
+        })
+    }
+
     /// Checks a complete `if`/`else if`/`else` chain as one expression.
     fn analyze_conditional_expression(
         &mut self,
@@ -1349,20 +1798,20 @@ impl<'semantic> Analyzer<'semantic> {
         let first_error = self.checking.errors.len();
         let mut arms = Vec::new();
         let final_else = collect_conditional_arms(expression, &mut arms);
-        let bool_type = self
-            .types
-            .types_mut()
-            .primitive(PrimitiveType::Bool, AccessCapability::Const);
         let unit_type = self
             .types
             .types_mut()
             .primitive(PrimitiveType::Unit, AccessCapability::Const);
         let mut condition_invalid = false;
         let incoming_categories = self.current_binding_categories.clone();
+        let incoming_narrowings = self.current_narrowings.clone();
         let mut fallthrough_categories = incoming_categories.clone();
+        let mut fallthrough_narrowings = Some(incoming_narrowings.clone());
         let mut branches =
             Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
         let mut branch_categories =
+            Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
+        let mut branch_narrowings =
             Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
         let conditional_nodes: Vec<_> = arms
             .iter()
@@ -1370,33 +1819,84 @@ impl<'semantic> Analyzer<'semantic> {
             .collect();
         for (_, condition, branch) in arms {
             self.current_binding_categories = fallthrough_categories;
-            let checked_condition = self.check(condition, bool_type)?;
-            condition_invalid |= self.is_recovery(checked_condition.type_id);
+            let condition_reachable = fallthrough_narrowings.is_some();
+            self.current_narrowings = fallthrough_narrowings
+                .clone()
+                .unwrap_or_else(|| incoming_narrowings.clone());
+            let enclosing_reachability = self.current_path_reachable;
+            self.current_path_reachable &= condition_reachable;
+            let condition_flow = self.analyze_boolean_condition(condition)?;
+            self.current_path_reachable = enclosing_reachability;
+            condition_invalid |= condition_flow.invalid;
             fallthrough_categories = self.current_binding_categories.clone();
+            fallthrough_narrowings = if condition_reachable {
+                condition_flow.when_false
+            } else {
+                None
+            };
             self.current_binding_categories = fallthrough_categories.clone();
-            branches.push((
+            let true_narrowings = if condition_reachable {
+                condition_flow.when_true
+            } else {
+                None
+            };
+            self.current_narrowings = true_narrowings
+                .clone()
+                .unwrap_or_else(|| incoming_narrowings.clone());
+            self.current_path_reachable = enclosing_reachability && true_narrowings.is_some();
+            let mut branch_outcome = self.analyze_block(
                 branch,
-                self.analyze_block(
-                    branch,
-                    expected,
-                    ConditionalUse::BranchCompletion,
-                    allow_recursive_copy,
-                )?,
-            ));
+                expected,
+                ConditionalUse::BranchCompletion,
+                allow_recursive_copy,
+            )?;
+            self.current_path_reachable = enclosing_reachability;
+            if true_narrowings.is_none() {
+                branch_outcome = BlockOutcome {
+                    typed: TypedExpression {
+                        type_id: self.types.types().divergence(),
+                        category: ValueCategory::FreshTemporary,
+                    },
+                    explicit_value: None,
+                };
+            }
+            branches.push((branch, branch_outcome));
             branch_categories.push(self.current_binding_categories.clone());
+            branch_narrowings.push(
+                (!self.is_divergence(branch_outcome.typed.type_id))
+                    .then(|| self.current_narrowings.clone()),
+            );
         }
         if let Some(branch) = final_else {
             self.current_binding_categories = fallthrough_categories.clone();
-            branches.push((
+            let else_reachable = fallthrough_narrowings.is_some();
+            self.current_narrowings = fallthrough_narrowings
+                .clone()
+                .unwrap_or_else(|| incoming_narrowings.clone());
+            let enclosing_reachability = self.current_path_reachable;
+            self.current_path_reachable &= else_reachable;
+            let mut branch_outcome = self.analyze_block(
                 branch,
-                self.analyze_block(
-                    branch,
-                    expected,
-                    ConditionalUse::BranchCompletion,
-                    allow_recursive_copy,
-                )?,
-            ));
+                expected,
+                ConditionalUse::BranchCompletion,
+                allow_recursive_copy,
+            )?;
+            self.current_path_reachable = enclosing_reachability;
+            if !else_reachable {
+                branch_outcome = BlockOutcome {
+                    typed: TypedExpression {
+                        type_id: self.types.types().divergence(),
+                        category: ValueCategory::FreshTemporary,
+                    },
+                    explicit_value: None,
+                };
+            }
+            branches.push((branch, branch_outcome));
             branch_categories.push(self.current_binding_categories.clone());
+            branch_narrowings.push(
+                (!self.is_divergence(branch_outcome.typed.type_id))
+                    .then(|| self.current_narrowings.clone()),
+            );
         }
 
         let has_else = final_else.is_some();
@@ -1411,6 +1911,37 @@ impl<'semantic> Analyzer<'semantic> {
         }
         self.current_binding_categories =
             self.merge_binding_categories(&incoming_categories, &completing_categories);
+        let mut completing_narrowings: Vec<_> = branch_narrowings
+            .iter()
+            .filter_map(Option::as_ref)
+            .collect();
+        if !has_else
+            && let Some(fallthrough) = &fallthrough_narrowings
+        {
+            completing_narrowings.push(fallthrough);
+        }
+        let merged_narrowings = self.merge_narrowing_states(&completing_narrowings);
+        for (index, state) in branch_narrowings.iter().enumerate() {
+            if let Some(state) = state {
+                self.record_narrowing_transition(
+                    branches[index].0.id,
+                    NarrowingEdgeKind::Join,
+                    state,
+                    &merged_narrowings,
+                );
+            }
+        }
+        if let Some(state) = &fallthrough_narrowings
+            && !has_else
+        {
+            self.record_narrowing_transition(
+                expression.id,
+                NarrowingEdgeKind::Join,
+                state,
+                &merged_narrowings,
+            );
+        }
+        self.current_narrowings = merged_narrowings;
         let branch_invalid = branches
             .iter()
             .any(|(_, branch)| self.is_recovery(branch.typed.type_id));
@@ -1709,6 +2240,7 @@ impl<'semantic> Analyzer<'semantic> {
     ) -> Option<TypedExpression> {
         let first_error = self.checking.errors.len();
         let incoming_categories = self.current_binding_categories.clone();
+        let incoming_narrowings = self.current_narrowings.clone();
         let mut invalid = false;
         let (iteration, else_branch, naturally_terminating) = match &expression.kind {
             ExpressionKind::Loop { body } => (
@@ -1790,6 +2322,10 @@ impl<'semantic> Analyzer<'semantic> {
         if naturally_terminating {
             if let Some(natural_categories) = iteration.natural_categories {
                 self.current_binding_categories = natural_categories;
+                self.current_narrowings = iteration
+                    .natural_narrowings
+                    .clone()
+                    .unwrap_or_else(|| incoming_narrowings.clone());
                 if let Some(else_branch) = else_branch {
                     let outcome = self.analyze_block(
                         else_branch,
@@ -1819,6 +2355,7 @@ impl<'semantic> Analyzer<'semantic> {
                                 .map_or(else_branch.span, |value| value.span),
                             typed,
                             categories: self.current_binding_categories.clone(),
+                            narrowings: self.current_narrowings.clone(),
                         });
                     }
                 }
@@ -1850,6 +2387,12 @@ impl<'semantic> Analyzer<'semantic> {
             .collect();
         self.current_binding_categories =
             self.merge_binding_categories(&incoming_categories, &completing_categories);
+        let completing_narrowings: Vec<_> = paths
+            .iter()
+            .filter(|path| !self.is_divergence(path.typed.type_id))
+            .map(|path| &path.narrowings)
+            .collect();
+        self.current_narrowings = self.merge_narrowing_states(&completing_narrowings);
         self.checking.expressions.insert(expression.id, typed);
         self.checking.explicit_values.insert(expression.id, true);
         self.checking.errors[first_error..]
@@ -1870,6 +2413,7 @@ impl<'semantic> Analyzer<'semantic> {
         header_can_complete: bool,
     ) -> Option<LoopIterationOutcome> {
         let base_categories = self.current_binding_categories.clone();
+        let base_narrowings = self.current_narrowings.clone();
         let baseline_checking = self.checking.clone();
         let baseline_loops = self.active_loops.clone();
         let enclosing_reachability = self.current_path_reachable;
@@ -1879,14 +2423,20 @@ impl<'semantic> Analyzer<'semantic> {
             self.checking = baseline_checking.clone();
             self.active_loops = baseline_loops.clone();
             self.current_binding_categories = loop_head.clone();
+            self.current_narrowings = base_narrowings.clone();
             self.current_path_reachable = enclosing_reachability;
 
-            let mut header_completes = header_can_complete;
+            let mut body_reachable = header_can_complete;
             let mut invalid = false;
-            if let Some((condition, bool_type)) = condition {
-                let checked = self.check(condition, bool_type)?;
-                invalid |= self.is_recovery(checked.type_id);
-                header_completes &= !self.is_divergence(checked.type_id);
+            let mut natural_narrowings = header_can_complete.then(|| base_narrowings.clone());
+            if let Some((condition, _)) = condition {
+                let flow = self.analyze_boolean_condition(condition)?;
+                invalid |= flow.invalid;
+                natural_narrowings = flow.when_false;
+                body_reachable &= flow.when_true.is_some();
+                self.current_narrowings = flow
+                    .when_true
+                    .unwrap_or_else(|| base_narrowings.clone());
             }
             if let Some((symbol, int_type)) = range_binding {
                 let qualifiers = BindingQualifiers::new(
@@ -1904,24 +2454,37 @@ impl<'semantic> Analyzer<'semantic> {
                 self.current_binding_categories
                     .insert(symbol, ValueCategory::OwnedInlinePlace);
             }
-            let mut natural_categories = header_completes
+            let mut natural_categories = natural_narrowings
+                .is_some()
                 .then(|| self.current_binding_categories.clone());
             self.active_loops.push(ActiveLoop {
                 expression,
                 expected_result_type,
                 breaks: Vec::new(),
                 continues: Vec::new(),
+                entry_narrowings: base_narrowings.clone(),
             });
-            self.current_path_reachable = enclosing_reachability && header_completes;
+            self.current_path_reachable = enclosing_reachability && body_reachable;
             let body_completes = self.visit_loop_iteration_body(body);
-            let normal_state = (header_completes && body_completes)
+            let normal_state = (body_reachable && body_completes)
                 .then(|| self.current_binding_categories.clone());
+            if normal_state.is_some() {
+                self.transition_current_narrowings(
+                    body.id,
+                    NarrowingEdgeKind::LoopBackedge,
+                    base_narrowings.clone(),
+                );
+            }
             let active = self
                 .active_loops
                 .pop()
                 .expect("loop analysis must retain its active loop context");
 
-            let mut looping_states: Vec<_> = active.continues.iter().collect();
+            let mut looping_states: Vec<_> = active
+                .continues
+                .iter()
+                .map(|(categories, _)| categories)
+                .collect();
             if let Some(normal_state) = &normal_state {
                 looping_states.push(normal_state);
             }
@@ -1936,6 +2499,7 @@ impl<'semantic> Analyzer<'semantic> {
                 return Some(LoopIterationOutcome {
                     breaks: active.breaks,
                     natural_categories,
+                    natural_narrowings,
                     invalid,
                 });
             }
@@ -1993,6 +2557,7 @@ impl<'semantic> Analyzer<'semantic> {
                 span: expression.span,
                 typed: unit,
                 categories: self.current_binding_categories.clone(),
+                narrowings: self.current_narrowings.clone(),
             });
             if !requires_else {
                 comparable_paths = paths.len();
@@ -2189,6 +2754,9 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::TypeAscription { value, type_syntax } => {
                 self.synthesize_type_ascription(expression, value, type_syntax)?
             }
+            ExpressionKind::TypeTest { value, type_syntax } => {
+                self.synthesize_type_test(expression, value, type_syntax)?
+            }
             ExpressionKind::Unary { operator, operand } => {
                 self.synthesize_unary(*operator, operand)?
             }
@@ -2254,6 +2822,67 @@ impl<'semantic> Analyzer<'semantic> {
         })
     }
 
+    /// Checks the value-facing portion of `value is Member` and returns bool.
+    /// Branch-specific member selection is performed by boolean-flow analysis;
+    /// synthesis alone still validates that the test names only exact members
+    /// (or an exact member subset) of a real union.
+    fn synthesize_type_test(
+        &mut self,
+        expression: &Expression,
+        value: &Expression,
+        type_syntax: &TypeSyntax,
+    ) -> Option<TypedExpression> {
+        let source = self.synthesize(value)?;
+        if self.is_recovery(source.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        let place = self.narrowing_place(value);
+        let source_union = place
+            .as_ref()
+            .and_then(|place| self.effective_narrowing(place))
+            .map_or(source.type_id, |fact| fact.source_union);
+        let Some(source_members) = self.union_members(source_union) else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidTypeTestSource {
+                    found: source.type_id,
+                },
+                span: value.span,
+            });
+            return Some(self.recovery_temporary());
+        };
+        let tested = self
+            .types
+            .type_for_syntax(type_syntax.id)
+            .expect("type-test syntax must have been resolved");
+        let tested_members = self.union_members(tested).unwrap_or_else(|| vec![tested]);
+        if tested_members.is_empty()
+            || tested_members
+                .iter()
+                .any(|member| !source_members.contains(member))
+        {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidTypeTestMember {
+                    union: source_union,
+                    tested,
+                },
+                span: type_syntax.span,
+            });
+            return Some(self.recovery_temporary());
+        }
+        let remaining: Vec<_> = source_members
+            .iter()
+            .copied()
+            .filter(|member| !tested_members.contains(member))
+            .collect();
+        let true_type = self.narrowed_subset_type(source_union, tested_members);
+        let false_type = (!remaining.is_empty())
+            .then(|| self.narrowed_subset_type(source_union, remaining));
+        self.checking
+            .type_test_facts
+            .insert(expression.id, (Some(true_type), false_type));
+        Some(self.fresh_primitive(PrimitiveType::Bool))
+    }
+
     fn synthesize_lambda(
         &mut self,
         expression: &Expression,
@@ -2280,12 +2909,15 @@ impl<'semantic> Analyzer<'semantic> {
 
         let first_body_error = self.checking.errors.len();
         let enclosing_categories = self.current_binding_categories.clone();
+        let enclosing_narrowings = std::mem::take(&mut self.current_narrowings);
         let enclosing_reachability = self.current_path_reachable;
         let enclosing_loops = std::mem::take(&mut self.active_loops);
         self.current_path_reachable = true;
         self.seed_callable_parameters(expression.id, parameters);
         self.visit_callable_body(body, signature.return_type);
+        self.release_all_narrowings(body.id, NarrowingEdgeKind::CallableCompletion);
         self.current_binding_categories = enclosing_categories;
+        self.current_narrowings = enclosing_narrowings;
         self.current_path_reachable = enclosing_reachability;
         self.active_loops = enclosing_loops;
         if self.checking.errors.len() != first_body_error {
@@ -2950,6 +3582,227 @@ impl<'semantic> Analyzer<'semantic> {
             SemanticType::Union { members, .. } => Some(members.clone()),
             _ => None,
         }
+    }
+
+    fn narrowing_place(&self, expression: &Expression) -> Option<NarrowingPlace> {
+        match &expression.kind {
+            ExpressionKind::Identifier => Some(NarrowingPlace {
+                root: NarrowingRoot::Symbol(
+                    self.names
+                        .symbol_for_reference(expression.id)
+                        .expect("narrowed identifier must have a resolved symbol"),
+                ),
+                fields: Vec::new(),
+            }),
+            ExpressionKind::SelfValue => Some(NarrowingPlace {
+                root: NarrowingRoot::SelfValue(
+                    self.context
+                        .method_for_self(expression.id)
+                        .expect("narrowed self must have a resolved method"),
+                ),
+                fields: Vec::new(),
+            }),
+            ExpressionKind::Group(inner) => self.narrowing_place(inner),
+            ExpressionKind::MemberAccess { object, .. } => {
+                let mut place = self.narrowing_place(object)?;
+                let ResolvedMember::Field { declaration } =
+                    self.checking.resolved_members.get(&expression.id).copied()?
+                else {
+                    return None;
+                };
+                place.fields.push(declaration);
+                Some(place)
+            }
+            _ => None,
+        }
+    }
+
+    fn effective_narrowing(&self, place: &NarrowingPlace) -> Option<NarrowingFact> {
+        self.current_narrowings
+            .get(place)
+            .and_then(|facts| facts.last())
+            .copied()
+    }
+
+    /// Converts one narrowing state into another and records the exact counter
+    /// updates required on that control-flow edge. Common stack prefixes are
+    /// retained, which prevents an inner identical test from releasing its
+    /// enclosing lock and prevents joins from double-acquiring a shared fact.
+    fn record_narrowing_transition(
+        &mut self,
+        source: NodeId,
+        kind: NarrowingEdgeKind,
+        from: &NarrowingState,
+        to: &NarrowingState,
+    ) {
+        if !self.current_path_reachable {
+            return;
+        }
+        let mut places: Vec<_> = from.keys().chain(to.keys()).cloned().collect();
+        places.sort_by_key(|place| format!("{place:?}"));
+        places.dedup();
+        let mut operations = Vec::new();
+        for place in places {
+            let old = from.get(&place).map(Vec::as_slice).unwrap_or(&[]);
+            let new = to.get(&place).map(Vec::as_slice).unwrap_or(&[]);
+            let common = old
+                .iter()
+                .zip(new)
+                .take_while(|(left, right)| left == right)
+                .count();
+            for fact in old[common..].iter().rev() {
+                operations.push(NarrowingLockOperation {
+                    place: place.clone(),
+                    narrowed_type: fact.narrowed_type,
+                    kind: NarrowingLockKind::Release,
+                });
+            }
+            for fact in &new[common..] {
+                operations.push(NarrowingLockOperation {
+                    place: place.clone(),
+                    narrowed_type: fact.narrowed_type,
+                    kind: NarrowingLockKind::Acquire,
+                });
+            }
+        }
+        if !operations.is_empty() {
+            self.checking.narrowing_edges.push(NarrowingEdge {
+                source,
+                kind,
+                from: from.clone(),
+                to: to.clone(),
+                operations,
+            });
+        }
+    }
+
+    fn release_all_narrowings(&mut self, source: NodeId, kind: NarrowingEdgeKind) {
+        if self.current_narrowings.is_empty() {
+            return;
+        }
+        let from = std::mem::take(&mut self.current_narrowings);
+        self.record_narrowing_transition(source, kind, &from, &HashMap::new());
+    }
+
+    fn transition_current_narrowings(
+        &mut self,
+        source: NodeId,
+        kind: NarrowingEdgeKind,
+        destination: NarrowingState,
+    ) {
+        let from = std::mem::replace(&mut self.current_narrowings, destination.clone());
+        self.record_narrowing_transition(source, kind, &from, &destination);
+    }
+
+    fn invalidate_place_narrowings(&mut self, source: NodeId, place: &NarrowingPlace) {
+        let from = self.current_narrowings.clone();
+        self.current_narrowings.retain(|candidate, _| {
+            candidate.root != place.root
+                || candidate.fields.len() < place.fields.len()
+                || candidate.fields[..place.fields.len()] != place.fields
+        });
+        let to = self.current_narrowings.clone();
+        self.record_narrowing_transition(source, NarrowingEdgeKind::Invalidate, &from, &to);
+    }
+
+    fn assignment_preserves_narrowing(
+        &self,
+        place: &NarrowingPlace,
+        value: NodeId,
+    ) -> bool {
+        let Some(fact) = self.effective_narrowing(place) else {
+            return true;
+        };
+        let narrowed_members = self
+            .union_members(fact.narrowed_type)
+            .unwrap_or_else(|| vec![fact.narrowed_type]);
+        if narrowed_members.len() != 1 {
+            return false;
+        }
+        self.checking
+            .union_injections
+            .get(&value)
+            .is_some_and(|injection| {
+                // The narrowed expression inherits the union place's outer
+                // access capability, while an injection identifies the
+                // canonical member stored in the union. `mut int` and `int`
+                // therefore denote the same runtime tag here even though their
+                // complete TypeIds differ.
+                self.types
+                    .types()
+                    .has_same_shape(injection.member_type, narrowed_members[0])
+                    .expect("assignment member types belong to the program type store")
+            })
+    }
+
+    fn merge_narrowing_states(&mut self, states: &[&NarrowingState]) -> NarrowingState {
+        let Some(first) = states.first() else {
+            return HashMap::new();
+        };
+        let mut places: Vec<_> = states
+            .iter()
+            .flat_map(|state| state.keys().cloned())
+            .collect();
+        places.sort_by_key(|place| format!("{place:?}"));
+        places.dedup();
+        let mut merged = HashMap::new();
+        for place in places {
+            let first_facts = first.get(&place).map(Vec::as_slice).unwrap_or(&[]);
+            let common_length = states[1..].iter().fold(first_facts.len(), |length, state| {
+                let other = state.get(&place).map(Vec::as_slice).unwrap_or(&[]);
+                first_facts[..length]
+                    .iter()
+                    .zip(other)
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            });
+            let mut facts = first_facts[..common_length].to_vec();
+            let alternatives: Option<Vec<_>> = states
+                .iter()
+                .map(|state| state.get(&place).and_then(|facts| facts.last()).copied())
+                .collect();
+            if let Some(alternatives) = alternatives {
+                let source_union = alternatives[0].source_union;
+                if alternatives
+                    .iter()
+                    .all(|fact| fact.source_union == source_union)
+                {
+                    let mut members = Vec::new();
+                    for fact in &alternatives {
+                        for member in self
+                            .union_members(fact.narrowed_type)
+                            .unwrap_or_else(|| vec![fact.narrowed_type])
+                        {
+                            if !members.contains(&member) {
+                                members.push(member);
+                            }
+                        }
+                    }
+                    let narrowed_type = self.narrowed_subset_type(source_union, members);
+                    let common_effective = facts.last().map(|fact| fact.narrowed_type);
+                    if narrowed_type != source_union && common_effective != Some(narrowed_type) {
+                        facts.push(NarrowingFact {
+                            source_union,
+                            narrowed_type,
+                        });
+                    }
+                }
+            }
+            if !facts.is_empty() {
+                merged.insert(place, facts);
+            }
+        }
+        merged
+    }
+
+    fn narrowed_subset_type(&mut self, source_union: TypeId, members: Vec<TypeId>) -> TypeId {
+        let capability = self
+            .types
+            .types()
+            .get(source_union)
+            .and_then(SemanticType::capability)
+            .expect("narrowed union has an outer capability");
+        self.types.types_mut().union(members, capability)
     }
 
     fn union_member_category(
@@ -3747,7 +4600,15 @@ impl<'semantic> Analyzer<'semantic> {
                     } else {
                         object_capability
                     };
-                let type_id = self.field_access_type(declared, object_capability);
+                let declared_type_id = self.field_access_type(declared, object_capability);
+                let mut narrowing_place = self.narrowing_place(object);
+                if let Some(place) = &mut narrowing_place {
+                    place.fields.push(field.declaration);
+                }
+                let type_id = narrowing_place
+                    .as_ref()
+                    .and_then(|place| self.effective_narrowing(place))
+                    .map_or(declared_type_id, |fact| fact.narrowed_type);
                 let category = self.field_category(typed_object, type_id);
                 let capability = self
                     .types
@@ -3759,6 +4620,7 @@ impl<'semantic> Analyzer<'semantic> {
                     expression.id,
                     Place {
                         symbol: None,
+                        declared_type_id,
                         type_id,
                         category,
                         binding_mutability: None,
@@ -4094,12 +4956,32 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         if operator == AssignmentOperator::Assign {
-            let checked = self.check(value, place.type_id)?;
+            let checked = self.check(value, place.declared_type_id)?;
             if self.is_recovery(checked.type_id) {
                 return Some(self.recovery_temporary());
             }
             if !self.validate_owning_transfer(value, checked, mutable) || !mutable {
                 return Some(self.recovery_temporary());
+            }
+            if let Some(narrowing_place) = self.narrowing_place(target)
+                && self.union_members(place.declared_type_id).is_some()
+            {
+                if self.effective_narrowing(&narrowing_place).is_some()
+                    && self.assignment_preserves_narrowing(&narrowing_place, value.id)
+                {
+                    self.checking.union_mutations.insert(
+                        target.id,
+                        UnionMutationKind::SameTagReplacement,
+                    );
+                } else {
+                    self.checking.union_mutations.insert(
+                        target.id,
+                        UnionMutationKind::GuardedTagChange,
+                    );
+                    if self.effective_narrowing(&narrowing_place).is_some() {
+                        self.invalidate_place_narrowings(target.id, &narrowing_place);
+                    }
+                }
             }
             return Some(self.fresh_primitive(PrimitiveType::Unit));
         }
@@ -4154,6 +5036,13 @@ impl<'semantic> Analyzer<'semantic> {
                 ValueTransfer::TrivialCopy
             },
         );
+        if let Some(narrowing_place) = self.narrowing_place(target)
+            && self.effective_narrowing(&narrowing_place).is_some()
+        {
+            self.checking
+                .union_mutations
+                .insert(target.id, UnionMutationKind::PayloadMutation);
+        }
         Some(self.fresh_primitive(PrimitiveType::Unit))
     }
 
@@ -4187,9 +5076,29 @@ impl<'semantic> Analyzer<'semantic> {
                     span: target.span,
                 });
             }
-            let checked = self.check(value, place.type_id)?;
+            let checked = self.check(value, place.declared_type_id)?;
             let valid_value = !self.is_recovery(checked.type_id);
             if mutable && valid_value {
+                if let Some(narrowing_place) = self.narrowing_place(target)
+                    && self.union_members(place.declared_type_id).is_some()
+                {
+                    if self.effective_narrowing(&narrowing_place).is_some()
+                        && self.assignment_preserves_narrowing(&narrowing_place, value.id)
+                    {
+                        self.checking.union_mutations.insert(
+                            target.id,
+                            UnionMutationKind::SameTagReplacement,
+                        );
+                    } else {
+                        self.checking.union_mutations.insert(
+                            target.id,
+                            UnionMutationKind::GuardedTagChange,
+                        );
+                        if self.effective_narrowing(&narrowing_place).is_some() {
+                            self.invalidate_place_narrowings(target.id, &narrowing_place);
+                        }
+                    }
+                }
                 let (category, transfer) = self.assignment_transfer(checked);
                 self.current_binding_categories.insert(symbol, category);
                 self.checking.reassigned_bindings.insert(symbol);
@@ -4272,6 +5181,13 @@ impl<'semantic> Analyzer<'semantic> {
             self.current_binding_categories
                 .insert(symbol, ValueCategory::OwnedInlinePlace);
             self.checking.reassigned_bindings.insert(symbol);
+        }
+        if let Some(narrowing_place) = self.narrowing_place(target)
+            && self.effective_narrowing(&narrowing_place).is_some()
+        {
+            self.checking
+                .union_mutations
+                .insert(target.id, UnionMutationKind::PayloadMutation);
         }
         Some(self.fresh_primitive(PrimitiveType::Unit))
     }
@@ -4734,15 +5650,23 @@ impl<'semantic> Analyzer<'semantic> {
                 .get(&symbol)
                 .copied()
                 .unwrap_or(binding.category);
+            let narrowing_place = NarrowingPlace {
+                root: NarrowingRoot::Symbol(symbol),
+                fields: Vec::new(),
+            };
+            let type_id = self
+                .effective_narrowing(&narrowing_place)
+                .map_or(binding.type_id, |fact| fact.narrowed_type);
             let typed = TypedExpression {
-                type_id: binding.type_id,
+                type_id,
                 category,
             };
             self.checking.places.insert(
                 expression.id,
                 Place {
                     symbol: Some(symbol),
-                    type_id: typed.type_id,
+                    declared_type_id: binding.type_id,
+                    type_id,
                     category,
                     binding_mutability: Some(binding.qualifiers.binding),
                     value_capability: binding.qualifiers.value,
@@ -4794,6 +5718,7 @@ impl<'semantic> Analyzer<'semantic> {
             expression.id,
             Place {
                 symbol: None,
+                declared_type_id: typed.type_id,
                 type_id: typed.type_id,
                 category: typed.category,
                 binding_mutability: None,
@@ -5331,6 +6256,38 @@ mod tests {
             panic!("expected return statement with a value")
         };
         value
+    }
+
+    /// Simulates every recorded control-flow edge independently. The source
+    /// fact depths initialize physical counters, each emitted operation is
+    /// applied in order, and the result must exactly equal the destination
+    /// depths without ever becoming negative.
+    fn assert_narrowing_locks_balance(checking: &ExpressionChecking) {
+        for edge in &checking.narrowing_edges {
+            let mut counters: HashMap<_, isize> = edge
+                .from
+                .iter()
+                .map(|(place, facts)| (place.clone(), facts.len() as isize))
+                .collect();
+            for operation in &edge.operations {
+                let counter = counters.entry(operation.place.clone()).or_default();
+                match operation.kind {
+                    NarrowingLockKind::Acquire => *counter += 1,
+                    NarrowingLockKind::Release => *counter -= 1,
+                }
+                assert!(
+                    *counter >= 0,
+                    "a narrowing lock was released before acquisition on {edge:#?}"
+                );
+            }
+            let destination: HashMap<_, isize> = edge
+                .to
+                .iter()
+                .map(|(place, facts)| (place.clone(), facts.len() as isize))
+                .collect();
+            counters.retain(|_, counter| *counter != 0);
+            assert_eq!(counters, destination, "unbalanced narrowing edge: {edge:#?}");
+        }
     }
 
     fn named_parameter(function: &Function, index: usize) -> &FunctionParameter {
@@ -8499,5 +9456,235 @@ mod tests {
             error.kind,
             ExpressionCheckingErrorKind::InfiniteInlineLayout { .. }
         )));
+    }
+
+    #[test]
+    fn narrows_exact_union_members_in_branches_and_after_guards() {
+        let source = concat!(
+            "fn take_int(value: int) {}\n",
+            "fn inspect(value: int | float | none) {\n",
+            "    if value is int { take_int(value); }\n",
+            "    if !(value is int) { return; }\n",
+            "    take_int(value);\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let inspect = function(&program.declarations[1]);
+        let guarded_call = expression(&inspect.body.statements[2]);
+        let (_, arguments) = call(guarded_call);
+        assert!(matches!(
+            types.types().get(checking.expressions[&arguments[0].id].type_id),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                ..
+            })
+        ));
+        assert!(checking.narrowing_edges.iter().any(|edge| {
+            edge
+                .operations
+                .iter()
+                .any(|operation| operation.kind == NarrowingLockKind::Acquire)
+        }));
+        assert!(checking.narrowing_edges.iter().any(|edge| {
+            edge
+                .operations
+                .iter()
+                .any(|operation| operation.kind == NarrowingLockKind::Release)
+        }));
+        assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn composes_subset_narrowing_through_boolean_operators() {
+        let source = concat!(
+            "fn take_number(value: int | float) {}\n",
+            "fn inspect(value: int | float | none) {\n",
+            "    if value is int || value is float { take_number(value); }\n",
+            "    if value is int && (value is int) { take_number(value); }\n",
+            "    if !(value is int | float) { return; }\n",
+            "    take_number(value);\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn narrows_resolved_field_places() {
+        let source = concat!(
+            "struct Holder { value: int | float, }\n",
+            "fn take_int(value: int) {}\n",
+            "fn inspect(holder: Holder) {\n",
+            "    if holder.value is int { take_int(holder.value); }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let inspect = function(&program.declarations[2]);
+        let conditional = body_value(inspect);
+        let ExpressionKind::If { then_branch, .. } = &conditional.kind else {
+            panic!("expected field-narrowing conditional")
+        };
+        let (_, arguments) = call(expression(&then_branch.statements[0]));
+        assert!(matches!(
+            types.types().get(checking.expressions[&arguments[0].id].type_id),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                ..
+            })
+        ));
+        assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn records_same_tag_and_guarded_tag_changing_assignments() {
+        let source = concat!(
+            "fn inspect(mut value: int | float) {\n",
+            "    if value is int {\n",
+            "        value = 2;\n",
+            "        value = 2.5;\n",
+            "    }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let inspect = function(&program.declarations[0]);
+        let conditional = body_value(inspect);
+        let ExpressionKind::If { then_branch, .. } = &conditional.kind else {
+            panic!("expected assignment conditional")
+        };
+        let same_tag = expression(&then_branch.statements[0]);
+        let changed_tag = expression(&then_branch.statements[1]);
+        let ExpressionKind::Assignment { target: same, .. } = &same_tag.kind else {
+            panic!("expected same-tag assignment")
+        };
+        let ExpressionKind::Assignment {
+            target: changed, ..
+        } = &changed_tag.kind
+        else {
+            panic!("expected tag-changing assignment")
+        };
+        assert_eq!(
+            checking.union_mutations[&same.id],
+            UnionMutationKind::SameTagReplacement
+        );
+        assert_eq!(
+            checking.union_mutations[&changed.id],
+            UnionMutationKind::GuardedTagChange
+        );
+        assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn rejects_non_union_and_nonmember_type_tests() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const number = 1;\n",
+            "    number is int;\n",
+            "    const choice: int | float = 1;\n",
+            "    choice is bool;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 2, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::InvalidTypeTestSource { .. }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::InvalidTypeTestMember { .. }
+        ));
+    }
+
+    #[test]
+    fn balances_recorded_narrowing_lock_operations() {
+        let source = concat!(
+            "fn inspect(value: int | float | none) {\n",
+            "    if value is int {\n",
+            "        if value is int { value; }\n",
+            "    } else if value is float {\n",
+            "        value;\n",
+            "    }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        assert!(checking.narrowing_edges.iter().any(|edge| {
+            edge
+                .operations
+                .iter()
+                .any(|operation| operation.kind == NarrowingLockKind::Acquire)
+        }));
+        assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn releases_narrowing_locks_on_loop_control_edges() {
+        let source = concat!(
+            "fn inspect(value: int | float | none) {\n",
+            "    while value is int { value; } else { value; };\n",
+            "    loop {\n",
+            "        if value is float { break; }\n",
+            "        continue;\n",
+            "    };\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        for kind in [
+            NarrowingEdgeKind::LoopBackedge,
+            NarrowingEdgeKind::Break,
+            NarrowingEdgeKind::Continue,
+            NarrowingEdgeKind::CallableCompletion,
+        ] {
+            assert!(
+                checking.narrowing_edges.iter().any(|edge| edge.kind == kind),
+                "missing {kind:?} lock edge: {:#?}",
+                checking.narrowing_edges
+            );
+        }
+        assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn aliases_acquire_independent_locks_on_the_same_borrowed_union() {
+        let source = concat!(
+            "fn inspect(value: int | float) {\n",
+            "    const alias = value;\n",
+            "    if value is int && alias is int { value; }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let acquired_roots: HashSet<_> = checking
+            .narrowing_edges
+            .iter()
+            .flat_map(|edge| &edge.operations)
+            .filter(|operation| operation.kind == NarrowingLockKind::Acquire)
+            .map(|operation| operation.place.root)
+            .collect();
+        assert_eq!(acquired_roots.len(), 2);
+        assert_narrowing_locks_balance(&checking);
     }
 }

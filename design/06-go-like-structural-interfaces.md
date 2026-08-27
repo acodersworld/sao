@@ -116,15 +116,7 @@ Static struct-to-interface conversions are checked by the compiler. A missing
 method during a statically valid interface call is therefore a compiler or
 runtime invariant failure, not a recoverable program condition.
 
-Runtime type tests use the same metadata:
-
-- `value is NamedStruct` compares the concrete vtable pointer with the named
-  struct's vtable and narrows to that exact nominal type on success.
-- `value is Interface` checks that the concrete method array contains every
-  required canonical method ID. On success, the value is narrowed to the
-  intersection of its existing interface type and the tested interface.
-
-Narrowing preserves the source access capability. Testing or downcasting a
-const interface reference can never recover `mut` access. Anonymous concrete
-types have vtables and can be tested against additional interfaces, but cannot
-be named for an exact concrete-type test in source code.
+Interface metadata is not used for runtime type tests. Interface satisfaction,
+requirement reduction, and concrete-to-interface view formation are all
+checked statically. The `is` operator is reserved for exact member or member-
+subset tests on unions; SAO does not provide runtime interface downcasts.
