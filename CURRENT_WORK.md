@@ -200,8 +200,40 @@ reviewable phases:
        complex-program test exercises reads, writes, slicing, length, and byte
        concatenation.
      - Constant evaluation and compile-time range diagnostics remain deferred.
-   - Next check the remaining primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`,
-     `ascii`, output, `panic`, `yield`, `co`, and `defer`.
+   - Phase 7.2, primitive conversion ascriptions (next):
+     - Remove conversion-call syntax such as `int(value)`, `float(value)`,
+       `char(value)`, and `string(value)` from the AST, parser, analyzer, tests,
+       and language design.
+     - Extend explicit type ascription to perform only the designed primitive
+       conversions: `float -> int`, `int -> float`, and `int -> char`.
+       Ordinary annotations, arguments, returns, and other expected-type
+       boundaries remain non-converting.
+     - Preserve existing exact checking, capability selection, union
+       injection/widening, and structural interface-view formation through
+       ascription. Do not turn ascription into a general cast or downcast.
+     - Record lowering metadata for each actual primitive conversion.
+       `float -> int` panics for NaN, infinity, or values outside signed 64-bit
+       range; `int -> char` panics outside ASCII `0..=127`; `int -> float` uses
+       binary64 round-to-nearest, ties-to-even.
+     - Keep constant evaluation and compile-time conversion diagnostics
+       deferred.
+   - Phase 7.3, formatted strings:
+     - Add Python-style `f"...{expression}..."` interpolation as the language's
+       primitive-to-text formatting mechanism, replacing `string(value)`.
+     - Preserve ordinary string escapes, support literal braces with `{{` and
+       `}}`, parse embedded SAO expressions with original source spans, and
+       evaluate interpolations once from left to right.
+     - Initially format `string`, `int`, `float`, `bool`, `char`, unit, and
+       `none`; reject aggregates, interfaces, unions, callables, bytes, and
+       compiler-known parameterized built-ins unless narrowed or otherwise
+       converted by an explicit operation.
+     - Produce a fresh mutable string and record resolved interpolation and
+       formatting metadata for typed IR and lowering.
+     - Reserve Python's colon format specifications, conversion flags, debug
+       syntax, and nested format specifications for a later design increment.
+   - Phase 7.4, remaining built-ins and completion:
+     - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
+       `yield`, `co`, and `defer`.
    - Aggregate deterministic diagnostics and expose successful semantic
      metadata for expressions, bindings, declarations, and callable signatures.
    - Add comprehensive tests and update implementation-status documents only
