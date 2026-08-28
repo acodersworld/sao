@@ -27,8 +27,8 @@ use crate::{
         ValueCategory, ValueTransfer,
     },
     signature_collection::{
-        InterfaceRequirementSignature, MethodId, ReceiverSignature, SignatureCollection,
-        StructMemberSignatureKind, StructSignature,
+        BuiltinMemberOwner, BuiltinMemberSignature, InterfaceRequirementSignature, MethodId,
+        ReceiverSignature, SignatureCollection, StructMemberSignatureKind, StructSignature,
     },
     source::{SourceModule, Span},
     symbol_table::{SymbolId, SymbolKind},
@@ -369,6 +369,33 @@ enum ResolvedMember {
     Copy { source_type: TypeId },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceKind {
+    String,
+    Bytes,
+}
+
+/// Identifies a compiler-provided sequence operation after type checking has
+/// selected its concrete string/byte meaning. Typed IR and lowering consume
+/// this fact instead of repeating member or operand-shape resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedSequenceOperation {
+    Index { sequence: SequenceKind },
+    Slice { sequence: SequenceKind },
+    Length { sequence: SequenceKind },
+    BytesConcat,
+}
+
+/// A dynamic precondition lowering must enforce for a resolved sequence
+/// operation. Byte writes are intentionally checked at runtime because their
+/// source-level type is `int`; constant evaluation is a later phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceRuntimeCheck {
+    IndexBounds,
+    SliceBounds,
+    ByteValueRange,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LambdaCaptureSource {
     Symbol(SymbolId),
@@ -445,6 +472,9 @@ enum ExpressionCheckingErrorKind {
         operator: AssignmentOperator,
         found: TypeId,
     },
+    InvalidSequenceOwner {
+        found: TypeId,
+    },
     InvalidConstructionOwner,
     UnknownConstructionField,
     DuplicateConstructionField,
@@ -508,6 +538,8 @@ struct ExpressionChecking {
     /// Final declaration identities selected by member lookup. Later typed IR
     /// can consume these without repeating lookup from source names.
     resolved_members: HashMap<NodeId, ResolvedMember>,
+    resolved_sequence_operations: HashMap<NodeId, ResolvedSequenceOperation>,
+    sequence_runtime_checks: HashMap<NodeId, Vec<SequenceRuntimeCheck>>,
     /// Bindings written by assignment. For object-like locals, lowering uses
     /// this to decide when the source-level reference needs indirection in
     /// addition to any frame-owned backing storage.
@@ -2749,8 +2781,17 @@ impl<'semantic> Analyzer<'semantic> {
                 self.synthesize_member_access(expression, object, *member)?
             }
             ExpressionKind::AssociatedAccess { owner, member } => {
-                self.synthesize_named_associated_access(expression, owner, *member)?
+                self.synthesize_associated_access(expression, owner, *member)?
             }
+            ExpressionKind::Index { object, index } => {
+                self.synthesize_sequence_index(expression, object, index)?
+            }
+            ExpressionKind::Slice { object, start, end } => self.synthesize_sequence_slice(
+                expression,
+                object,
+                start.as_deref(),
+                end.as_deref(),
+            )?,
             ExpressionKind::TypeAscription { value, type_syntax } => {
                 self.synthesize_type_ascription(expression, value, type_syntax)?
             }
@@ -2774,7 +2815,9 @@ impl<'semantic> Analyzer<'semantic> {
                 value,
             } if matches!(
                 &target.kind,
-                ExpressionKind::Identifier | ExpressionKind::MemberAccess { .. }
+                ExpressionKind::Identifier
+                    | ExpressionKind::MemberAccess { .. }
+                    | ExpressionKind::Index { .. }
             ) =>
             {
                 self.synthesize_place_assignment(target, *operator, value)?
@@ -4529,6 +4572,37 @@ impl<'semantic> Analyzer<'semantic> {
         if self.is_recovery(typed_object.type_id) {
             return Some(self.recovery_temporary());
         }
+        if let Some((sequence, _, _)) = self.sequence_parts(typed_object.type_id) {
+            let name = self
+                .module
+                .text(member)
+                .expect("sequence member name belongs to the source module");
+            let primitive = match sequence {
+                SequenceKind::String => PrimitiveType::String,
+                SequenceKind::Bytes => PrimitiveType::Bytes,
+            };
+            let selected = self
+                .signatures
+                .builtins()
+                .member(BuiltinMemberOwner::Primitive(primitive), name);
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: match selected {
+                    Some(BuiltinMemberSignature::Callable(template))
+                        if template.receiver.is_some() =>
+                    {
+                        ExpressionCheckingErrorKind::MethodRequiresCall
+                    }
+                    Some(BuiltinMemberSignature::Callable(_)) => {
+                        ExpressionCheckingErrorKind::AssociatedFunctionRequiresType
+                    }
+                    Some(BuiltinMemberSignature::Field(_)) | None => {
+                        ExpressionCheckingErrorKind::UnknownMember
+                    }
+                },
+                span: member,
+            });
+            return Some(self.recovery_temporary());
+        }
         let Some((declaration, object_capability, is_gc)) =
             self.aggregate_parts(typed_object.type_id)
         else {
@@ -4675,13 +4749,57 @@ impl<'semantic> Analyzer<'semantic> {
     ///
     /// Unlike instance methods, associated functions are ordinary first-class
     /// callable values because they carry no hidden receiver.
-    fn synthesize_named_associated_access(
+    fn synthesize_associated_access(
         &mut self,
         expression: &Expression,
         owner: &TypeSyntax,
         member: Span,
     ) -> Option<TypedExpression> {
         let owner_type = self.types.type_for_syntax(owner.id)?;
+        if self.primitive_kind(owner_type) == Some(PrimitiveType::Bytes) {
+            let name = self
+                .module
+                .text(member)
+                .expect("byte associated member belongs to the source module");
+            let selected = self
+                .signatures
+                .builtins()
+                .member(
+                    BuiltinMemberOwner::Primitive(PrimitiveType::Bytes),
+                    name,
+                )
+                .cloned();
+            let Some(BuiltinMemberSignature::Callable(template)) = selected else {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::UnknownMember,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            };
+            if template.receiver.is_some() {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::MethodRequiresValue,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            }
+            let signature = template
+                .instantiate(&[], self.types.types_mut())
+                .expect("byte associated member has no substitutions");
+            let type_id = self.types.types_mut().callable(
+                signature.parameters,
+                signature.return_type,
+                AccessCapability::Const,
+            );
+            self.checking.resolved_sequence_operations.insert(
+                expression.id,
+                ResolvedSequenceOperation::BytesConcat,
+            );
+            return Some(TypedExpression {
+                type_id,
+                category: ValueCategory::FreshTemporary,
+            });
+        }
         let Some(SemanticType::NamedStruct { declaration, .. }) =
             self.types.types().get(owner_type).cloned()
         else {
@@ -4773,6 +4891,200 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
+    /// Peels a plain or GC-qualified string/byte sequence. The capability is
+    /// the effective access to the sequence payload, while the final flag
+    /// records whether that payload lives behind a GC reference.
+    fn sequence_parts(
+        &self,
+        type_id: TypeId,
+    ) -> Option<(SequenceKind, AccessCapability, bool)> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Primitive {
+                primitive: PrimitiveType::String,
+                capability,
+            } => Some((SequenceKind::String, *capability, false)),
+            SemanticType::Primitive {
+                primitive: PrimitiveType::Bytes,
+                capability,
+            } => Some((SequenceKind::Bytes, *capability, false)),
+            SemanticType::Gc { target, capability } => {
+                let sequence = match self.types.types().get(*target)? {
+                    SemanticType::Primitive {
+                        primitive: PrimitiveType::String,
+                        ..
+                    } => SequenceKind::String,
+                    SemanticType::Primitive {
+                        primitive: PrimitiveType::Bytes,
+                        ..
+                    } => SequenceKind::Bytes,
+                    _ => return None,
+                };
+                Some((sequence, *capability, true))
+            }
+            _ => None,
+        }
+    }
+
+    /// Reads one sequence element and records the bounds check required at
+    /// runtime. Reads are trivial values, but the same expression also records
+    /// index-place access so assignment can reuse the evaluated receiver/index.
+    fn synthesize_sequence_index(
+        &mut self,
+        expression: &Expression,
+        object: &Expression,
+        index: &Expression,
+    ) -> Option<TypedExpression> {
+        let typed_object = self.synthesize(object)?;
+        let deferred_owner = matches!(
+            self.types.types().get(typed_object.type_id),
+            Some(SemanticType::Builtin { .. })
+        );
+        let sequence = if self.is_recovery(typed_object.type_id) {
+            None
+        } else if deferred_owner {
+            None
+        } else {
+            match self.sequence_parts(typed_object.type_id) {
+                Some(parts) => Some(parts),
+                None => {
+                    self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::InvalidSequenceOwner {
+                            found: typed_object.type_id,
+                        },
+                        span: object.span,
+                    });
+                    None
+                }
+            }
+        };
+        let int_type = self
+            .types
+            .types_mut()
+            .primitive(PrimitiveType::Int, AccessCapability::Const);
+        let typed_index = self.check(index, int_type)?;
+        if deferred_owner {
+            return None;
+        }
+        if sequence.is_none() || self.is_recovery(typed_index.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        let (sequence, capability, _) = sequence.expect("valid sequence was classified above");
+        let element = match sequence {
+            SequenceKind::String => PrimitiveType::Char,
+            SequenceKind::Bytes => PrimitiveType::Int,
+        };
+        let type_id = self
+            .types
+            .types_mut()
+            .primitive(element, AccessCapability::Const);
+        self.checking.places.insert(
+            expression.id,
+            Place {
+                symbol: None,
+                declared_type_id: type_id,
+                type_id,
+                category: ValueCategory::OwnedInlinePlace,
+                binding_mutability: None,
+                value_capability: match capability {
+                    AccessCapability::Const => ValueCapability::Const,
+                    AccessCapability::Mut => ValueCapability::Mut,
+                },
+            },
+        );
+        self.checking.resolved_sequence_operations.insert(
+            expression.id,
+            ResolvedSequenceOperation::Index { sequence },
+        );
+        self.checking
+            .sequence_runtime_checks
+            .entry(expression.id)
+            .or_default()
+            .push(SequenceRuntimeCheck::IndexBounds);
+        Some(TypedExpression {
+            type_id,
+            category: ValueCategory::FreshTemporary,
+        })
+    }
+
+    /// Copies an end-exclusive range into a new independently owned mutable
+    /// sequence. Optional bounds are still checked left-to-right when present;
+    /// lowering performs negative-bound normalization and range validation.
+    fn synthesize_sequence_slice(
+        &mut self,
+        expression: &Expression,
+        object: &Expression,
+        start: Option<&Expression>,
+        end: Option<&Expression>,
+    ) -> Option<TypedExpression> {
+        let typed_object = self.synthesize(object)?;
+        let deferred_owner = matches!(
+            self.types.types().get(typed_object.type_id),
+            Some(SemanticType::Builtin { .. })
+        );
+        let sequence = if self.is_recovery(typed_object.type_id) {
+            None
+        } else if deferred_owner {
+            None
+        } else {
+            match self.sequence_parts(typed_object.type_id) {
+                Some(parts) => Some(parts),
+                None => {
+                    self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::InvalidSequenceOwner {
+                            found: typed_object.type_id,
+                        },
+                        span: object.span,
+                    });
+                    None
+                }
+            }
+        };
+        let int_type = self
+            .types
+            .types_mut()
+            .primitive(PrimitiveType::Int, AccessCapability::Const);
+        let typed_start = match start {
+            Some(bound) => Some(self.check(bound, int_type)?),
+            None => None,
+        };
+        let typed_end = match end {
+            Some(bound) => Some(self.check(bound, int_type)?),
+            None => None,
+        };
+        let invalid_bound = typed_start
+            .into_iter()
+            .chain(typed_end)
+            .any(|typed| self.is_recovery(typed.type_id));
+        if deferred_owner {
+            return None;
+        }
+        if sequence.is_none() || invalid_bound {
+            return Some(self.recovery_temporary());
+        }
+        let (sequence, _, _) = sequence.expect("valid sequence was classified above");
+        let primitive = match sequence {
+            SequenceKind::String => PrimitiveType::String,
+            SequenceKind::Bytes => PrimitiveType::Bytes,
+        };
+        let type_id = self
+            .types
+            .types_mut()
+            .primitive(primitive, AccessCapability::Mut);
+        self.checking.resolved_sequence_operations.insert(
+            expression.id,
+            ResolvedSequenceOperation::Slice { sequence },
+        );
+        self.checking
+            .sequence_runtime_checks
+            .entry(expression.id)
+            .or_default()
+            .push(SequenceRuntimeCheck::SliceBounds);
+        Some(TypedExpression {
+            type_id,
+            category: ValueCategory::FreshTemporary,
+        })
+    }
+
     /// Finds the collected member table for either a source-named struct or a
     /// compiler-named anonymous struct.
     fn aggregate_signature(&self, owner: NodeId) -> Option<&StructSignature> {
@@ -4795,8 +5107,8 @@ impl<'semantic> Analyzer<'semantic> {
     }
 
     /// Identifies owners that cannot gain a member family in a later increment.
-    /// Strings, bytes, built-ins, and interfaces are omitted
-    /// because their member checking is intentionally still deferred.
+    /// Strings, bytes, built-ins, and interfaces are omitted because they use
+    /// compiler-provided member families rather than source aggregate lookup.
     fn member_owner_is_definitively_invalid(&self, type_id: TypeId) -> bool {
         matches!(
             self.types.types().get(type_id),
@@ -4927,6 +5239,9 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::MemberAccess { .. } => {
                 self.synthesize_field_assignment(target, operator, value)
             }
+            ExpressionKind::Index { .. } => {
+                self.synthesize_sequence_index_assignment(target, operator, value)
+            }
             _ => unreachable!("place assignment dispatch accepts only implemented places"),
         }
     }
@@ -5043,6 +5358,101 @@ impl<'semantic> Analyzer<'semantic> {
                 .union_mutations
                 .insert(target.id, UnionMutationKind::PayloadMutation);
         }
+        Some(self.fresh_primitive(PrimitiveType::Unit))
+    }
+
+    /// Checks writes through string/byte index places. Index-place mutation is
+    /// governed by access to the sequence payload, never by mutability of the
+    /// binding which holds the sequence reference.
+    fn synthesize_sequence_index_assignment(
+        &mut self,
+        target: &Expression,
+        operator: AssignmentOperator,
+        value: &Expression,
+    ) -> Option<TypedExpression> {
+        let typed_target = match self.synthesize(target) {
+            Some(typed) => typed,
+            None => {
+                let _ = self.synthesize(value);
+                return None;
+            }
+        };
+        let Some(place) = self.checking.places.get(&target.id).copied() else {
+            let _ = self.synthesize(value);
+            return Some(self.recovery_temporary());
+        };
+        let Some(ResolvedSequenceOperation::Index { sequence }) = self
+            .checking
+            .resolved_sequence_operations
+            .get(&target.id)
+            .copied()
+        else {
+            let _ = self.synthesize(value);
+            return Some(self.recovery_temporary());
+        };
+        let mutable = place.value_capability == ValueCapability::Mut;
+        if !mutable {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ImmutableValue,
+                span: target.span,
+            });
+        }
+
+        if operator == AssignmentOperator::Assign {
+            let checked = self.check(value, place.declared_type_id)?;
+            if !mutable || self.is_recovery(checked.type_id) {
+                return Some(self.recovery_temporary());
+            }
+            self.checking
+                .transfers
+                .insert(value.id, ValueTransfer::TrivialCopy);
+            if sequence == SequenceKind::Bytes {
+                self.checking
+                    .sequence_runtime_checks
+                    .entry(target.id)
+                    .or_default()
+                    .push(SequenceRuntimeCheck::ByteValueRange);
+            }
+            return Some(self.fresh_primitive(PrimitiveType::Unit));
+        }
+
+        let valid = sequence == SequenceKind::Bytes
+            && matches!(
+                operator,
+                AssignmentOperator::Add
+                    | AssignmentOperator::Subtract
+                    | AssignmentOperator::Multiply
+                    | AssignmentOperator::Divide
+                    | AssignmentOperator::Remainder
+                    | AssignmentOperator::BitwiseAnd
+                    | AssignmentOperator::BitwiseXor
+                    | AssignmentOperator::BitwiseOr
+                    | AssignmentOperator::ShiftLeft
+                    | AssignmentOperator::ShiftRight
+            );
+        if !valid {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidAssignmentOperand {
+                    operator,
+                    found: typed_target.type_id,
+                },
+                span: target.span,
+            });
+            let _ = self.synthesize(value);
+            return Some(self.recovery_temporary());
+        }
+        let checked = self.check(value, place.declared_type_id)?;
+        if !mutable || self.is_recovery(checked.type_id) {
+            return Some(self.recovery_temporary());
+        }
+        self.checking
+            .transfers
+            .insert(value.id, ValueTransfer::TrivialCopy);
+        self.checking
+            .sequence_runtime_checks
+            .entry(target.id)
+            .or_default()
+            .push(SequenceRuntimeCheck::ByteValueRange);
         Some(self.fresh_primitive(PrimitiveType::Unit))
     }
 
@@ -5270,12 +5680,24 @@ impl<'semantic> Analyzer<'semantic> {
             }
             return Some(Some(self.recovery_temporary()));
         }
-        let aggregate = self.aggregate_parts(typed_object.type_id);
         let name = self
             .module
             .text(*member)
             .expect("member name belongs to the source module")
             .to_string();
+        if let Some((sequence, _, _)) = self.sequence_parts(typed_object.type_id) {
+            return Some(self.synthesize_sequence_member_call(
+                call,
+                callee,
+                object,
+                typed_object,
+                *member,
+                &name,
+                sequence,
+                arguments,
+            ));
+        }
+        let aggregate = self.aggregate_parts(typed_object.type_id);
         if aggregate.is_none() {
             if self.interface_destination(typed_object.type_id).is_some() {
                 return Some(self.synthesize_interface_method_call(
@@ -5474,6 +5896,72 @@ impl<'semantic> Analyzer<'semantic> {
         let arguments_valid =
             self.analyze_call_arguments(call, arguments, &signature.parameters)?;
         if !receiver_valid || !arguments_valid || self.is_recovery(signature.return_type) {
+            return Some(self.recovery_temporary());
+        }
+        Some(self.call_result(signature.return_type))
+    }
+
+    /// Checks the compiler-provided `length()` method on strings and bytes.
+    /// Sequence methods are resolved before aggregate lookup because primitive
+    /// receivers have no source declaration or `MethodId`.
+    fn synthesize_sequence_member_call(
+        &mut self,
+        call: &Expression,
+        callee: &Expression,
+        object: &Expression,
+        typed_object: TypedExpression,
+        member: Span,
+        name: &str,
+        sequence: SequenceKind,
+        arguments: &[Expression],
+    ) -> Option<TypedExpression> {
+        let primitive = match sequence {
+            SequenceKind::String => PrimitiveType::String,
+            SequenceKind::Bytes => PrimitiveType::Bytes,
+        };
+        let owner = BuiltinMemberOwner::Primitive(primitive);
+        let selected = self.signatures.builtins().member(owner, name).cloned();
+        let Some(BuiltinMemberSignature::Callable(template)) = selected else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: if name == "concat" {
+                    ExpressionCheckingErrorKind::AssociatedFunctionRequiresType
+                } else {
+                    ExpressionCheckingErrorKind::UnknownMember
+                },
+                span: member,
+            });
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(self.recovery_temporary());
+        };
+        if template.receiver.is_none() {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::AssociatedFunctionRequiresType,
+                span: member,
+            });
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(self.recovery_temporary());
+        }
+        let signature = template
+            .instantiate(&[], self.types.types_mut())
+            .expect("primitive sequence member has no type substitutions");
+        let arguments_valid = self.analyze_call_arguments(call, arguments, &signature.parameters)?;
+        self.checking.transfers.insert(
+            object.id,
+            if typed_object.category == ValueCategory::GcReference {
+                ValueTransfer::CopyGcReference
+            } else {
+                ValueTransfer::Borrow
+            },
+        );
+        self.checking.resolved_sequence_operations.insert(
+            callee.id,
+            ResolvedSequenceOperation::Length { sequence },
+        );
+        if !arguments_valid {
             return Some(self.recovery_temporary());
         }
         Some(self.call_result(signature.return_type))
@@ -9686,5 +10174,239 @@ mod tests {
             .collect();
         assert_eq!(acquired_roots.len(), 2);
         assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn checks_sequence_index_slice_length_and_concat_operations() {
+        let source = concat!(
+            "fn inspect(text: string, data: bytes, shared: &bytes) {\n",
+            "    const character = text[0];\n",
+            "    const byte = shared[1];\n",
+            "    const text_part = text[-1..];\n",
+            "    const byte_part = data[..2];\n",
+            "    const text_size = text.length();\n",
+            "    const byte_size = shared.length();\n",
+            "    const combine = bytes::concat;\n",
+            "    const joined = combine(data, data);\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let inspect = function(&program.declarations[0]);
+        let character = binding_initializer(&inspect.body.statements[0]);
+        let byte = binding_initializer(&inspect.body.statements[1]);
+        assert_primitive_expression(
+            &types,
+            &checking,
+            character,
+            PrimitiveType::Char,
+            AccessCapability::Const,
+        );
+        assert_primitive_expression(
+            &types,
+            &checking,
+            byte,
+            PrimitiveType::Int,
+            AccessCapability::Const,
+        );
+        for indexed in [character, byte] {
+            assert!(matches!(
+                checking.resolved_sequence_operations[&indexed.id],
+                ResolvedSequenceOperation::Index { .. }
+            ));
+            assert_eq!(
+                checking.sequence_runtime_checks[&indexed.id],
+                vec![SequenceRuntimeCheck::IndexBounds]
+            );
+        }
+
+        for (statement, sequence) in [
+            (2, SequenceKind::String),
+            (3, SequenceKind::Bytes),
+        ] {
+            let slice = binding_initializer(&inspect.body.statements[statement]);
+            assert_eq!(
+                checking.resolved_sequence_operations[&slice.id],
+                ResolvedSequenceOperation::Slice { sequence }
+            );
+            assert_eq!(
+                checking.expressions[&slice.id].category,
+                ValueCategory::FreshTemporary
+            );
+            assert_eq!(checking.transfers[&slice.id], ValueTransfer::MoveTemporary);
+            assert!(matches!(
+                types.types().get(checking.expressions[&slice.id].type_id),
+                Some(SemanticType::Primitive {
+                    capability: AccessCapability::Mut,
+                    ..
+                })
+            ));
+            assert_eq!(
+                checking.sequence_runtime_checks[&slice.id],
+                vec![SequenceRuntimeCheck::SliceBounds]
+            );
+        }
+
+        for (statement, sequence) in [
+            (4, SequenceKind::String),
+            (5, SequenceKind::Bytes),
+        ] {
+            let call_expression = binding_initializer(&inspect.body.statements[statement]);
+            let (callee, _) = call(call_expression);
+            assert_eq!(
+                checking.resolved_sequence_operations[&callee.id],
+                ResolvedSequenceOperation::Length { sequence }
+            );
+        }
+        let combine = binding_initializer(&inspect.body.statements[6]);
+        assert_eq!(
+            checking.resolved_sequence_operations[&combine.id],
+            ResolvedSequenceOperation::BytesConcat
+        );
+        let concat = binding_initializer(&inspect.body.statements[7]);
+        let (_, arguments) = call(concat);
+        assert_eq!(checking.transfers[&concat.id], ValueTransfer::MoveTemporary);
+        assert_eq!(arguments.len(), 2);
+        assert!(arguments
+            .iter()
+            .all(|argument| checking.transfers[&argument.id] == ValueTransfer::Borrow));
+    }
+
+    #[test]
+    fn checks_mutable_sequence_index_places_and_byte_ranges() {
+        let source = concat!(
+            "fn inspect(const vmut data: bytes, const vmut text: string) {\n",
+            "    data[0] = 300;\n",
+            "    data[1] += 10;\n",
+            "    data[2] -= 10;\n",
+            "    data[3] *= 10;\n",
+            "    data[4] /= 10;\n",
+            "    data[5] %= 10;\n",
+            "    data[6] &= 10;\n",
+            "    data[7] ^= 10;\n",
+            "    data[8] |= 10;\n",
+            "    data[9] <<= 1;\n",
+            "    data[10] >>= 1;\n",
+            "    text[0] = 'x';\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let inspect = function(&program.declarations[0]);
+        for statement in 0..=11 {
+            let assignment = expression(&inspect.body.statements[statement]);
+            let ExpressionKind::Assignment { target, value, .. } = &assignment.kind else {
+                panic!("expected indexed assignment")
+            };
+            assert_eq!(
+                checking.places[&target.id].value_capability,
+                ValueCapability::Mut
+            );
+            assert_eq!(checking.transfers[&value.id], ValueTransfer::TrivialCopy);
+            let checks = &checking.sequence_runtime_checks[&target.id];
+            assert_eq!(checks[0], SequenceRuntimeCheck::IndexBounds);
+            assert_eq!(
+                checks.contains(&SequenceRuntimeCheck::ByteValueRange),
+                statement < 11
+            );
+        }
+    }
+
+    #[test]
+    fn reports_sequence_errors_without_stopping_later_operands() {
+        let source = concat!(
+            "fn bad(const vmut data: bytes, const vmut text: string, readonly: bytes) {\n",
+            "    data[true];\n",
+            "    1[0.0];\n",
+            "    data[0] = 'x';\n",
+            "    data[0] += true;\n",
+            "    text[0] += 1;\n",
+            "    readonly[0] = 1;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 7, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::InvalidSequenceOwner { .. }
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[5].kind,
+            ExpressionCheckingErrorKind::InvalidAssignmentOperand { .. }
+        ));
+        assert_eq!(
+            checking.errors[6].kind,
+            ExpressionCheckingErrorKind::ImmutableValue
+        );
+    }
+
+    #[test]
+    fn checks_sequence_bounds_and_member_arity_deterministically() {
+        let source = concat!(
+            "fn bad(data: bytes) {\n",
+            "    data[true..false];\n",
+            "    data.length(1);\n",
+            "    bytes::concat(data);\n",
+            "    data.length;\n",
+            "    bytes::length;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 6, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert_eq!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 0,
+                found: 1,
+            }
+        );
+        assert_eq!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 2,
+                found: 1,
+            }
+        );
+        assert_eq!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::MethodRequiresCall
+        );
+        assert_eq!(
+            checking.errors[5].kind,
+            ExpressionCheckingErrorKind::MethodRequiresValue
+        );
     }
 }

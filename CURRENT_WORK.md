@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-27
+Last reviewed: 2026-08-28
 
 ## Current phase
 
@@ -182,24 +182,25 @@ reviewable phases:
        proving counters never become negative and each edge reaches its stated
        destination lock depths. The complex-program test exercises direct,
        compound, and post-guard narrowing.
-7. Built-ins and completion (next)
-   - Phase 7.1, string and byte sequences (next):
-     - Check `string` and `bytes` indexing. Indices must have type `int`.
-     - Record mutable index places and check indexed assignment. `string`
-       elements accept `char`; `bytes` elements accept `int`.
-     - Support the existing integer compound-assignment operators on mutable
-       `bytes` elements.
-     - Check end-exclusive slicing with optional `int` bounds. Every slice
-       creates a fresh mutable sequence with an independent copied buffer.
-     - Check `string.length()`, `bytes.length()`, and the first-class
-       `bytes::concat` associated function.
-     - Record private resolved sequence-operation metadata and the runtime
-       checks needed by lowering. Indexing and indexed assignment panic when
-       the index is out of bounds; slicing normalizes negative bounds and
-       panics for invalid normalized ranges; byte assignment and compound
-       assignment panic when the stored result is outside `0..=255`.
+7. Built-ins and completion (in progress)
+   - Phase 7.1, string and byte sequences (complete):
+     - Checks `string` and `bytes` indexing with `int` indices and records
+       bounds-checked mutable index places. String elements accept `char`; byte
+       elements accept `int`.
+     - Checks all existing integer compound-assignment operators on mutable
+       byte elements and records runtime `0..=255` validation for simple and
+       compound writes.
+     - Checks optional-`int`, end-exclusive slicing. Slice results are fresh
+       mutable sequences with independent copied buffers; lowering metadata
+       records negative-bound normalization and invalid-range checks.
+     - Resolves `string.length()`, `bytes.length()`, and the first-class
+       `bytes::concat` associated function without repeating lookup in typed IR.
+     - Focused tests cover result types, categories, places, transfers, runtime
+       checks, mutable access, invalid operands, recovery, and source order. The
+       complex-program test exercises reads, writes, slicing, length, and byte
+       concatenation.
      - Constant evaluation and compile-time range diagnostics remain deferred.
-   - Then check primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`,
+   - Next check the remaining primitive conversions, `Queue`, `Vector`, `Map`, `Error`, `?`,
      `ascii`, output, `panic`, `yield`, `co`, and `defer`.
    - Aggregate deterministic diagnostics and expose successful semantic
      metadata for expressions, bindings, declarations, and callable signatures.

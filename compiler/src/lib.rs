@@ -81,6 +81,14 @@ fn apply(value: int, operation: fn(int) -> int) -> int {
     operation(value)
 }
 
+fn exercise_sequences(const vmut left: bytes, right: bytes) {
+    left[0] = 255;
+    left[1] += 1;
+    const joined = bytes::concat(left, right);
+    const copied = joined[0..joined.length()];
+    copied[0];
+}
+
 fn main() {
     const initial = 3;
     mut summary: Summary = Summary::new("language tour");
@@ -164,6 +172,10 @@ fn main() {
     const character = char(65);
     const text = string(character);
     const middle = text[0..1];
+    const text_length = text.length();
+    const literal_middle = "sequence"[1..4];
+    const literal_length = "sequence".length();
+    const first_character = "sequence"[0];
     const indexed = vector[0];
     const calculated = apply(fibonacci(initial), scale);
     const flags = (calculated << 1) | (initial & 1) ^ 2;
@@ -180,6 +192,10 @@ fn main() {
     announce(indexed);
     announce_if_integer(wider_numeric);
     formatter.format(middle);
+    formatter.format(literal_middle);
+    announce(text_length);
+    announce(literal_length);
+    first_character;
     heap_formatter.format(text);
     heap_scale(initial);
     notify();
