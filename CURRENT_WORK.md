@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-28
+Last reviewed: 2026-08-29
 
 ## Current phase
 
@@ -259,7 +259,93 @@ reviewable phases:
        value types, escapes and braces, evaluation order, every supported
        format option, malformed specifications, result semantics, and lowering
        metadata. The complex-program test exercises formatted strings.
-   - Phase 7.4, remaining built-ins and completion (next):
+   - Phase 7.4, compile-time type factories and bounded templates (next):
+     - Implement this phase as three independently reviewable changes. Stop
+       after each change so it can be reviewed and committed before beginning
+       the next one.
+     - Change 1, syntax and a unified declaration namespace:
+       - Unify type and value declarations into one lexical namespace. Reject
+         same-scope collisions regardless of declaration kind, preserve lexical
+         shadowing, and make the nearest declaration authoritative in both type
+         and value contexts.
+       - Add `type`, `comptime`, and `where` syntax and the corresponding AST
+         representation. Require a receiver first when present, followed by all
+         compile-time parameters and then all runtime parameters.
+       - Add transparent file-level aliases such as
+         `type IntBox = Box(int);`. An alias introduces no nominal identity,
+         runtime storage, binding mutability, or independent value capability.
+       - Parse named and anonymous interface constraints in `where` clauses and
+         update every frontend traversal, pretty-printer, diagnostic inventory,
+         and focused parser and name-resolution test.
+       - Stop for review and commit before implementing type-factory semantics.
+     - Change 2, type factories, generated structs, and built-in migration:
+       - Support type-producing functions at file level and as receiverless
+         struct members. A function returning `type` has no receiver or runtime
+         parameters and contains one final type expression or explicit
+         type-valued return.
+       - Restrict type-producing bodies to type parameters, existing type
+         composition, generated struct type literals, aliases, and calls to
+         known type factories. Defer locals, runtime expressions, conditionals,
+         loops, mutation, and arbitrary compile-time execution.
+       - Generated structs declare explicitly typed fields without initializers,
+         may declare ordinary methods and receiverless associated type
+         factories, may reference enclosing compile-time type parameters, and
+         cannot capture runtime values.
+       - Give generated structs nominal identity derived from their declaration
+         and concrete type arguments. Cache factory applications by factory
+         identity and canonical argument types, install in-progress placeholders
+         for exact recursion, and diagnose expanding instantiation and invalid
+         inline recursive layouts deterministically.
+       - Permit construction and associated selection through applications such
+         as `Box(int) { inner: 10 }` and `Box(int)::function()`. Permit
+         associated type-factory calls through statically known concrete types,
+         but reject them through a type parameter.
+       - Resolve aliases forward, preserve their exact underlying identity, and
+         diagnose direct and indirect alias cycles.
+       - Replace the compiler-known angle-bracket forms with `Queue(T)`,
+         `Vector(T)`, `Map(K, V)`, and `Error(T)` without compatibility aliases.
+         Use `Queue(T)::new()`, `Vector(T)::new()`, `Map(K, V)::new()`, and
+         `Error(T)::new(value)`, while retaining compiler-known
+         `Error::new(value)` expected-type or payload inference.
+       - Keep built-in runtime representations compiler-known while routing
+         their arity and type application through the shared factory machinery.
+       - Stop for review and commit before implementing runtime templates.
+     - Change 3, bounded runtime templates and specialization:
+       - Support top-level templated runtime functions and templated struct
+         methods. Type arguments are explicit, appear in declared order, and
+         are never inferred; unspecialized templates are not first-class
+         callable values.
+       - Support concise named constraints such as `comptime T: Reader` and
+         private named, intersection, or anonymous interface constraints in a
+         `where` clause.
+       - Keep interfaces runtime-oriented: every requirement has `self`, uses
+         only runtime parameters and return types, and cannot declare
+         `comptime` parameters or return `type`.
+       - Allow only named or generated concrete structs and their GC-qualified
+         forms to satisfy bounded parameters. Reuse exact canonical method
+         identities and existing receiver storage and capability rules.
+       - Check template member use against declared constraints. Do not expose
+         concrete-only fields, methods, constructors, `.copy()`, associated
+         functions, or primitive operators after specialization.
+       - At each requested specialization, substitute concrete type identities
+         and reuse ordinary expression analysis for exact capabilities, places,
+         transfers, returns, layouts, and diagnostics. Cache callable
+         specializations and record their identities for typed IR and lowering.
+       - Permit exact recursive specialization and diagnose unbounded
+         type-expanding specialization deterministically. Defer local template
+         declarations and local type aliases.
+       - Add focused coverage for namespace collisions, aliases, factory
+         composition and identity, generated structs, recursion, constraints,
+         explicit specializations, specialization-dependent value semantics,
+         diagnostics, recovery, and the migrated built-in syntax. Update the
+         complex-program test to exercise the complete feature.
+       - Update the language design and implementation-status documents and
+         mark Phase 7.4 complete only after this third change has been reviewed.
+       Stop for review and commit before beginning Phase 7.5.
+     - Compile-time values other than types, arbitrary compile-time execution,
+       generic inference, first-class template values, local templates, and
+       compile-time duck typing remain deferred.
+   - Phase 7.5, remaining built-ins and completion (pending):
      - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
        `yield`, `co`, and `defer`.
    - Aggregate deterministic diagnostics and expose successful semantic
