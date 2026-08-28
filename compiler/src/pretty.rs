@@ -446,14 +446,6 @@ fn format_expression_into(
             optional_return_type(output, source, return_type.as_ref(), depth);
             child_block(output, source, "body", body, depth);
         }
-        ExpressionKind::PrimitiveConversion { target, value } => {
-            line(
-                output,
-                depth,
-                format_args!("PrimitiveConversion {target:?} {}", location(span)),
-            );
-            child_expression(output, source, "value", value, depth);
-        }
         ExpressionKind::GcAllocate(inner) => {
             line(
                 output,
@@ -991,17 +983,6 @@ mod tests {
         assert_eq!(
             format_expression(&module(source), &expression),
             "Slice @ 0..9\n  object:\n    Identifier \"items\" @ 0..5\n  start:\n    (none)\n  end:\n    (none)"
-        );
-    }
-
-    #[test]
-    fn formats_primitive_conversions() {
-        let source = "string(value + 1)";
-        let expression = parse_expression_source(source);
-
-        assert_eq!(
-            format_expression(&module(source), &expression),
-            "PrimitiveConversion String @ 0..17\n  value:\n    Binary Add @ 7..16\n      left:\n        Identifier \"value\" @ 7..12\n      right:\n        Literal Integer \"1\" @ 15..16"
         );
     }
 

@@ -200,24 +200,31 @@ reviewable phases:
        complex-program test exercises reads, writes, slicing, length, and byte
        concatenation.
      - Constant evaluation and compile-time range diagnostics remain deferred.
-   - Phase 7.2, primitive conversion ascriptions (next):
-     - Remove conversion-call syntax such as `int(value)`, `float(value)`,
+   - Phase 7.2, primitive conversion ascriptions, is complete:
+     - Removed conversion-call syntax such as `int(value)`, `float(value)`,
        `char(value)`, and `string(value)` from the AST, parser, analyzer, tests,
-       and language design.
-     - Extend explicit type ascription to perform only the designed primitive
-       conversions: `float -> int`, `int -> float`, and `int -> char`.
+       complex-program coverage, and language design.
+     - Explicit type ascription now performs only the designed primitive
+       conversions: `float -> int`, `int -> float`, `int -> char`, and
+       `char -> int`.
        Ordinary annotations, arguments, returns, and other expected-type
        boundaries remain non-converting.
-     - Preserve existing exact checking, capability selection, union
+     - Existing exact checking, capability selection, union
        injection/widening, and structural interface-view formation through
-       ascription. Do not turn ascription into a general cast or downcast.
-     - Record lowering metadata for each actual primitive conversion.
-       `float -> int` panics for NaN, infinity, or values outside signed 64-bit
-       range; `int -> char` panics outside ASCII `0..=127`; `int -> float` uses
-       binary64 round-to-nearest, ties-to-even.
-     - Keep constant evaluation and compile-time conversion diagnostics
+       ascription remain unchanged; ascription is not a general cast or
+       downcast.
+     - Private lowering metadata identifies every actual primitive conversion.
+       Runtime-check facts cover finite signed-64-bit validation for
+       `float -> int` and ASCII `0..=127` validation for `int -> char`;
+       `int -> float` uses its defined binary64 rounding without a check, and
+       `char -> int` is total for ASCII characters.
+     - Focused tests cover conversion result types, fresh categories, lowering
+       and runtime-check metadata, exact ascriptions, invalid conversions,
+       recovery without parent cascades, removed call syntax, and non-converting
+       ordinary expected-type boundaries.
+     - Constant evaluation and compile-time conversion diagnostics remain
        deferred.
-   - Phase 7.3, formatted strings:
+   - Phase 7.3, formatted strings (next):
      - Add Python-style `f"...{expression}..."` interpolation as the language's
        primitive-to-text formatting mechanism, replacing `string(value)`.
      - Preserve ordinary string escapes, support literal braces with `{{` and

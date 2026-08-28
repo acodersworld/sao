@@ -286,11 +286,13 @@ const reader = file: Reader;
 const selected: Reader | Writer = file: Reader;
 ```
 
-This is a type ascription, not a runtime cast. It does not downcast, perform a
-primitive conversion, copy an object, or move an existing object. In the first
-example, a satisfying concrete `file` is exposed as a borrowed `Reader` view.
-In the second, that exact view selects the `Reader` member of the destination
-union while retaining the concrete object and its dispatch metadata.
+For non-primitive types this is a type ascription, not a runtime cast. It does
+not downcast, copy an object, or move an existing object. In the first example,
+a satisfying concrete `file` is exposed as a borrowed `Reader` view. In the
+second, that exact view selects the `Reader` member of the destination union
+while retaining the concrete object and its dispatch metadata. The same syntax
+also expresses the small set of explicit primitive conversions described
+below.
 
 Ascription accepts the same safe contextual conversions as an expected type.
 It may preserve or reduce access capability but cannot escalate it. The
@@ -335,8 +337,8 @@ const count: int = 10;
 const ratio: float = 0.5;
 
 const invalid = count + ratio;          // Type error.
-const valid = float(count) + ratio;     // Explicit conversion.
-const integer: int = int(ratio);        // Explicit conversion.
+const valid = (count: float) + ratio;   // Explicit conversion.
+const integer: int = ratio: int;        // Explicit conversion.
 ```
 
 Literals also retain their natural types rather than being coerced by an
@@ -347,25 +349,28 @@ const invalid: float = 1;   // Type error: 1 has type int.
 const valid: float = 1.0;
 ```
 
-The initial conversion syntax treats a target primitive type as a conversion
-function, such as `float(value)`, `int(value)`, `char(value)`, or
-`string(value)`. Text parsing is not a numeric conversion; parsing functions
-return an explicit error union for invalid input.
+Primitive conversions use the same `expression: Type` syntax as type
+ascription. Conversion is supported only from `float` to `int`, from `int` to
+`float`, from `int` to `char`, and from `char` to `int`. An ordinary annotation,
+argument, return, or other expected-type boundary never performs these
+conversions. Text formatting uses formatted strings, while text parsing
+functions return an explicit error union for invalid input.
 
-`int(value)` converts a finite, in-range `float` by truncating toward zero:
+`value: int` converts a finite, in-range `float` by truncating toward zero:
 
 ```text
-int(3.9)   // 3
-int(-3.9)  // -3
+3.9: int      // 3
+(-3.9): int   // -3
 ```
 
 Negative floating-point zero converts to integer zero. Conversion from NaN,
 positive or negative infinity, or a value outside the `int` range panics. An
 invalid constant conversion is a compile-time diagnostic when detectable.
 
-`float(value)` converts an `int` to the closest representable binary64 value,
-using round-to-nearest with ties to even when precision is lost. `char(value)`
-accepts only an integer from 0 through 127 and panics otherwise.
+`value: float` converts an `int` to the closest representable binary64 value,
+using round-to-nearest with ties to even when precision is lost. `value: char`
+accepts only an integer from 0 through 127 and panics otherwise. `value: int`
+converts every `char` to its ASCII integer value without a runtime check.
 
 ## 3.5 Floating-point behavior
 

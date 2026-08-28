@@ -38,7 +38,7 @@ struct User {
     age: int,
 
     fn describe(self) -> string {
-        self.name + " is " + string(self.age)
+        f"{self.name} is {self.age}"
     }
 }
 

@@ -116,10 +116,10 @@ or resolved field place within the true control-flow path:
 fn display(value: int | float | none) -> () {
     if value is int {
         // value has type int here.
-        print(string(value));
+        print(f"{value}");
     } else if value is float {
         // value has type float here.
-        print(string(value));
+        print(f"{value}");
     } else {
         // value has type none here.
         print("none");
@@ -237,7 +237,7 @@ const result = myfunc();
 if result is Error<string> {
     print(result.value);
 } else {
-    print(string(result));
+    print(f"{result}");
 }
 ```
 

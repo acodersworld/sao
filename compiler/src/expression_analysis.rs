@@ -396,6 +396,26 @@ enum SequenceRuntimeCheck {
     ByteValueRange,
 }
 
+/// Identifies the deliberately small set of primitive conversions expressed
+/// by type ascription. The inner expression keeps its source type; this fact
+/// tells typed IR that the surrounding ascription constructs a fresh value of
+/// the destination primitive type rather than merely checking compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimitiveConversion {
+    FloatToInt,
+    IntToFloat,
+    IntToChar,
+    CharToInt,
+}
+
+/// A dynamic precondition required by a primitive conversion. Integer-to-float
+/// needs no check because every integer has a defined rounded binary64 result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimitiveConversionRuntimeCheck {
+    FiniteSignedIntRange,
+    AsciiRange,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LambdaCaptureSource {
     Symbol(SymbolId),
@@ -540,6 +560,9 @@ struct ExpressionChecking {
     resolved_members: HashMap<NodeId, ResolvedMember>,
     resolved_sequence_operations: HashMap<NodeId, ResolvedSequenceOperation>,
     sequence_runtime_checks: HashMap<NodeId, Vec<SequenceRuntimeCheck>>,
+    primitive_conversions: HashMap<NodeId, PrimitiveConversion>,
+    primitive_conversion_runtime_checks:
+        HashMap<NodeId, PrimitiveConversionRuntimeCheck>,
     /// Bindings written by assignment. For object-like locals, lowering uses
     /// this to decide when the source-level reference needs indirection in
     /// addition to any frame-owned backing storage.
@@ -651,7 +674,6 @@ impl LexicalIndex {
             | ExpressionKind::Literal(_)
             | ExpressionKind::AssociatedAccess { .. } => {}
             ExpressionKind::Group(inner)
-            | ExpressionKind::PrimitiveConversion { value: inner, .. }
             | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::MemberAccess { object: inner, .. }
             | ExpressionKind::Try { expression: inner }
@@ -2767,9 +2789,6 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::Lambda {
                 parameters, body, ..
             } => self.synthesize_lambda(expression, parameters, body)?,
-            ExpressionKind::PrimitiveConversion { target, value } => {
-                self.synthesize_primitive_conversion(*target, value)?
-            }
             ExpressionKind::GcAllocate(value) => self.synthesize_gc_allocation(value)?,
             ExpressionKind::StructConstruction { fields, .. } => {
                 self.synthesize_named_struct_construction(expression, fields)?
@@ -2832,14 +2851,16 @@ impl<'semantic> Analyzer<'semantic> {
         Some(typed)
     }
 
-    /// Checks an expression under a source-written expected type and exposes
-    /// exactly that type to its surrounding expression.
+    /// Checks or explicitly converts an expression under a source-written type
+    /// and exposes exactly that type to its surrounding expression.
     ///
     /// For example, `file: Reader` creates a borrowed `Reader` view when the
     /// concrete file satisfies that interface. In
     /// `const selected: Reader | Writer = file: Reader`, the surrounding union
-    /// therefore sees the unambiguous `Reader` member. This never performs a
-    /// runtime cast, primitive conversion, or implicit object copy.
+    /// therefore sees the unambiguous `Reader` member. Primitive ascriptions
+    /// additionally support `float -> int`, `int -> float`, `int -> char`, and
+    /// `char -> int`. No ascription performs a runtime downcast or implicit
+    /// object copy.
     fn synthesize_type_ascription(
         &mut self,
         expression: &Expression,
@@ -2850,6 +2871,47 @@ impl<'semantic> Analyzer<'semantic> {
             .types
             .type_for_syntax(type_syntax.id)
             .expect("ascribed source type must have been resolved");
+        if self.primitive_kind(expected).is_some() {
+            let found = self.synthesize(value)?;
+            if self.is_recovery(found.type_id) || self.is_divergence(found.type_id) {
+                let explicitly_produces_value = self.explicitly_produces_value(value);
+                self.checking
+                    .explicit_values
+                    .insert(expression.id, explicitly_produces_value);
+                return Some(found);
+            }
+            if let Some(conversion) =
+                self.primitive_conversion(found.type_id, expected)
+            {
+                self.checking
+                    .primitive_conversions
+                    .insert(expression.id, conversion);
+                match conversion {
+                    PrimitiveConversion::FloatToInt => {
+                        self.checking.primitive_conversion_runtime_checks.insert(
+                            expression.id,
+                            PrimitiveConversionRuntimeCheck::FiniteSignedIntRange,
+                        );
+                    }
+                    PrimitiveConversion::IntToChar => {
+                        self.checking.primitive_conversion_runtime_checks.insert(
+                            expression.id,
+                            PrimitiveConversionRuntimeCheck::AsciiRange,
+                        );
+                    }
+                    PrimitiveConversion::IntToFloat | PrimitiveConversion::CharToInt => {}
+                }
+                let explicitly_produces_value = self.explicitly_produces_value(value);
+                self.checking
+                    .explicit_values
+                    .insert(expression.id, explicitly_produces_value);
+                return Some(TypedExpression {
+                    type_id: expected,
+                    category: ValueCategory::FreshTemporary,
+                });
+            }
+        }
+
         let checked = self.check(value, expected)?;
         let explicitly_produces_value = self.explicitly_produces_value(value);
         self.checking
@@ -3075,7 +3137,6 @@ impl<'semantic> Analyzer<'semantic> {
             }
             ExpressionKind::Literal(_) | ExpressionKind::AssociatedAccess { .. } => {}
             ExpressionKind::Group(inner)
-            | ExpressionKind::PrimitiveConversion { value: inner, .. }
             | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::MemberAccess { object: inner, .. }
             | ExpressionKind::Try { expression: inner }
@@ -4114,30 +4175,29 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
-    fn synthesize_primitive_conversion(
-        &mut self,
-        target: PrimitiveType,
-        value: &Expression,
-    ) -> Option<TypedExpression> {
-        let source = match target {
-            PrimitiveType::Int => PrimitiveType::Float,
-            PrimitiveType::Float => PrimitiveType::Int,
-            PrimitiveType::Char => PrimitiveType::Int,
-            PrimitiveType::Unit
-            | PrimitiveType::None
-            | PrimitiveType::Bool
-            | PrimitiveType::String
-            | PrimitiveType::Bytes => return None,
-        };
-        let expected = self
-            .types
-            .types_mut()
-            .primitive(source, AccessCapability::Const);
-        let checked = self.check(value, expected)?;
-        if self.is_recovery(checked.type_id) {
-            return Some(self.recovery_temporary());
+    fn primitive_conversion(
+        &self,
+        source: TypeId,
+        destination: TypeId,
+    ) -> Option<PrimitiveConversion> {
+        match (
+            self.primitive_kind(source)?,
+            self.primitive_kind(destination)?,
+        ) {
+            (PrimitiveType::Float, PrimitiveType::Int) => {
+                Some(PrimitiveConversion::FloatToInt)
+            }
+            (PrimitiveType::Int, PrimitiveType::Float) => {
+                Some(PrimitiveConversion::IntToFloat)
+            }
+            (PrimitiveType::Int, PrimitiveType::Char) => {
+                Some(PrimitiveConversion::IntToChar)
+            }
+            (PrimitiveType::Char, PrimitiveType::Int) => {
+                Some(PrimitiveConversion::CharToInt)
+            }
+            _ => None,
         }
-        Some(self.fresh_primitive(target))
     }
 
     /// Types prefix GC allocation and records how its operand enters GC storage.
@@ -7607,29 +7667,60 @@ mod tests {
     }
 
     #[test]
-    fn checks_supported_primitive_conversions() {
+    fn checks_and_records_primitive_conversion_ascriptions() {
         let source = concat!(
             "fn main() { ",
-            "int(1.0); float(1); char(65); int(1); ",
-            "const bad: float = int(1.0); string(1); ",
+            "1.0: int; 1: float; 65: char; 'A': int; 1: int; ",
+            "const bad: float = 1; (1.0: char) + 1; ",
             "}",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
         let checking = check(&module, &program, &names, &context, &mut types, &signatures);
         let main = function(&program.declarations[0]);
-        for (statement, primitive) in main.body.statements[..3].iter().zip([
-            PrimitiveType::Int,
-            PrimitiveType::Float,
-            PrimitiveType::Char,
-        ]) {
+        let expected_conversions = [
+            (PrimitiveType::Int, PrimitiveConversion::FloatToInt),
+            (PrimitiveType::Float, PrimitiveConversion::IntToFloat),
+            (PrimitiveType::Char, PrimitiveConversion::IntToChar),
+            (PrimitiveType::Int, PrimitiveConversion::CharToInt),
+        ];
+        for index in 0..expected_conversions.len() {
+            let (primitive, conversion) = expected_conversions[index];
+            let converted = expression(&main.body.statements[index]);
             assert_primitive_expression(
                 &types,
                 &checking,
-                expression(statement),
+                converted,
                 primitive,
                 AccessCapability::Const,
             );
+            assert_eq!(
+                checking.primitive_conversions.get(&converted.id),
+                Some(&conversion)
+            );
+            assert_eq!(
+                checking.expressions[&converted.id].category,
+                ValueCategory::FreshTemporary
+            );
         }
+        assert_eq!(
+            checking.primitive_conversion_runtime_checks
+                [&expression(&main.body.statements[0]).id],
+            PrimitiveConversionRuntimeCheck::FiniteSignedIntRange
+        );
+        assert!(!checking
+            .primitive_conversion_runtime_checks
+            .contains_key(&expression(&main.body.statements[1]).id));
+        assert_eq!(
+            checking.primitive_conversion_runtime_checks
+                [&expression(&main.body.statements[2]).id],
+            PrimitiveConversionRuntimeCheck::AsciiRange
+        );
+        assert!(!checking
+            .primitive_conversion_runtime_checks
+            .contains_key(&expression(&main.body.statements[3]).id));
+        assert!(!checking
+            .primitive_conversions
+            .contains_key(&expression(&main.body.statements[4]).id));
         assert_eq!(checking.errors.len(), 2);
         assert!(
             checking.errors.iter().all(|error| matches!(
@@ -7638,11 +7729,27 @@ mod tests {
             ))
         );
         assert_eq!(
-            checking.expressions[&expression(&main.body.statements[3]).id].type_id,
+            checking.expressions[&expression(&main.body.statements[6]).id].type_id,
             types.types().recovery()
         );
-        let unsupported = expression(&main.body.statements[5]);
-        assert!(!checking.expressions.contains_key(&unsupported.id));
+    }
+
+    #[test]
+    fn keeps_ordinary_expected_type_boundaries_non_converting() {
+        let source = concat!(
+            "fn take(value: float) {}\n",
+            "fn wrong_return() -> float { 1 }\n",
+            "fn main() { const bad: float = 1; take(1); }",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+
+        assert_eq!(checking.errors.len(), 3);
+        assert!(checking.errors.iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        )));
+        assert!(checking.primitive_conversions.is_empty());
     }
 
     #[test]
@@ -9262,7 +9369,7 @@ mod tests {
     }
 
     #[test]
-    fn ascriptions_reject_casts_escalation_and_ambiguous_union_selection() {
+    fn ascriptions_reject_downcasts_escalation_and_ambiguous_union_selection() {
         let source = concat!(
             "interface Reader { fn read(self) -> int; }\n",
             "interface Writer { fn write(self) -> int; }\n",
@@ -9284,7 +9391,7 @@ mod tests {
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
         let checking = check(&module, &program, &names, &context, &mut types, &signatures);
-        assert_eq!(checking.errors.len(), 4, "{:#?}", checking.errors);
+        assert_eq!(checking.errors.len(), 3, "{:#?}", checking.errors);
         assert!(matches!(
             checking.errors[0].kind,
             ExpressionCheckingErrorKind::AmbiguousUnionConversion { .. }
@@ -9297,6 +9404,11 @@ mod tests {
         }
 
         let inspect = function(&program.declarations[3]);
+        let numeric = binding_initializer(&inspect.body.statements[4]);
+        assert_eq!(
+            checking.primitive_conversions.get(&numeric.id),
+            Some(&PrimitiveConversion::IntToFloat)
+        );
         let anonymous = binding_initializer(&inspect.body.statements[5]);
         let (anonymous_value, _) = ascription(anonymous);
         let anonymous_view = &checking.interface_views[&anonymous_value.id];

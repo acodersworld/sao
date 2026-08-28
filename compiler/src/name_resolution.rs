@@ -409,9 +409,6 @@ impl<'source> Resolver<'source> {
                 self.declare_parameters(body_scope, parameters);
                 self.resolve_block_contents(body_scope, body);
             }
-            ExpressionKind::PrimitiveConversion { value, .. } => {
-                self.resolve_expression(scope, value);
-            }
             ExpressionKind::GcAllocate(value) => self.resolve_expression(scope, value),
             ExpressionKind::StructConstruction { name, fields } => {
                 self.resolve_type_name(scope, expression.id, *name);

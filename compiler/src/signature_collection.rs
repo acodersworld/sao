@@ -1043,7 +1043,6 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             }
             ExpressionKind::Group(inner)
             | ExpressionKind::GcAllocate(inner)
-            | ExpressionKind::PrimitiveConversion { value: inner, .. }
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::Unary { operand: inner, .. } => self.visit_expression(inner),
             ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {

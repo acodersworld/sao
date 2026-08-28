@@ -48,7 +48,7 @@ struct Summary {
     }
 
     fn format(&self, prefix: string) -> string {
-        prefix + self.name + string(self.total)
+        prefix + self.name
     }
 }
 
@@ -69,7 +69,7 @@ fn cleanup(summary: Summary) {
 }
 
 fn worker(value: int) {
-    println(string(value));
+    println("working");
     yield();
 }
 
@@ -104,7 +104,7 @@ fn main() {
     }
 
     fn announce(value: int) {
-        println(string(value));
+        println("value");
     }
 
     fn announce_if_integer(value: int | float | none) {
@@ -159,8 +159,8 @@ fn main() {
     const failure: Error<int> = checked(initial);
     const recovered = failure?;
 
-    const integer = int(1.5);
-    const decimal = float(integer);
+    const integer = 1.5: int;
+    const decimal = integer: float;
     const truth: bool = decimal != 0.0;
     const numeric: int | float = if truth {
         integer
@@ -169,8 +169,9 @@ fn main() {
     };
     const wider_numeric: int | float | none = numeric;
     const grouped_initial = { initial };
-    const character = char(65);
-    const text = string(character);
+    const character = 65: char;
+    const character_code = character: int;
+    const text = "A";
     const middle = text[0..1];
     const text_length = text.length();
     const literal_middle = "sequence"[1..4];
@@ -196,6 +197,8 @@ fn main() {
     announce(text_length);
     announce(literal_length);
     first_character;
+    character;
+    announce(character_code);
     heap_formatter.format(text);
     heap_scale(initial);
     notify();

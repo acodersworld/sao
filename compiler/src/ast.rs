@@ -523,10 +523,6 @@ pub enum ExpressionKind {
         return_type: Option<TypeSyntax>,
         body: Block,
     },
-    PrimitiveConversion {
-        target: PrimitiveType,
-        value: Box<Expression>,
-    },
     /// Moves a fresh value into independently managed GC storage. Reapplying
     /// `&` to an already GC-qualified value is semantically idempotent.
     GcAllocate(Box<Expression>),
@@ -569,8 +565,10 @@ pub enum ExpressionKind {
         type_syntax: TypeSyntax,
     },
     /// Checks `value` under an explicitly stated type, as in `value: Reader`.
-    /// This is a static checking boundary rather than a runtime cast or an
-    /// owning conversion; any accepted interface view still borrows its source.
+    /// Most ascriptions are static checking boundaries; the deliberately small
+    /// primitive conversion matrix is also expressed here, as in `value: int`.
+    /// Interface views still borrow their source and aggregates are never
+    /// implicitly copied, moved, or promoted into GC storage.
     TypeAscription {
         value: Box<Expression>,
         type_syntax: TypeSyntax,

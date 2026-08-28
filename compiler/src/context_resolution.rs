@@ -501,7 +501,6 @@ impl ContextResolver {
                     .insert(expression.id, CallableKind::Lambda);
                 self.enter_callable(expression.id, false, body);
             }
-            ExpressionKind::PrimitiveConversion { value, .. } => self.visit_expression(value),
             ExpressionKind::GcAllocate(value) => self.visit_expression(value),
             ExpressionKind::StructConstruction { fields, .. } => {
                 for field in fields {
