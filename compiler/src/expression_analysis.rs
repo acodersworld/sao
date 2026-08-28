@@ -16,9 +16,9 @@ use crate::{
     ast::{
         AnonymousStructMember, AssignmentOperator, BinaryOperator, BindingMutability,
         BindingQualifiers, Block, BuiltinType, ConditionalElse, Declaration, Expression,
-        ExpressionKind, Function, FunctionParameter, FunctionParameterKind, LiteralKind, NodeId,
-        PrimitiveType, Program, ReceiverStorage, Statement, StatementKind, StructFieldInitializer,
-        StructMember, TypeSyntax, UnaryOperator, ValueCapability,
+        ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
+        LiteralKind, NodeId, PrimitiveType, Program, ReceiverStorage, Statement, StatementKind,
+        StructFieldInitializer, StructMember, TypeSyntax, UnaryOperator, ValueCapability,
     },
     context_resolution::ContextResolution,
     name_resolution::NameResolution,
@@ -416,6 +416,40 @@ enum PrimitiveConversionRuntimeCheck {
     AsciiRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatAlignment {
+    Left,
+    Right,
+    Center,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatSign {
+    Plus,
+    Minus,
+    Space,
+}
+
+/// The normalized, deliberately small Python-compatible format specification
+/// consumed by lowering. Width and precision are literals, so formatting does
+/// not introduce hidden expression evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FormatSpecification {
+    fill: Option<u8>,
+    alignment: Option<FormatAlignment>,
+    sign: Option<FormatSign>,
+    zero_padding: bool,
+    width: Option<u32>,
+    fixed_precision: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedInterpolation {
+    value: NodeId,
+    value_type: TypeId,
+    format: FormatSpecification,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LambdaCaptureSource {
     Symbol(SymbolId),
@@ -532,6 +566,11 @@ enum ExpressionCheckingErrorKind {
     InfiniteInlineLayout {
         owner: TypeId,
     },
+    UnsupportedFormattedValue {
+        found: TypeId,
+    },
+    DivergentFormattedValue,
+    InvalidFormatSpecification,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -563,6 +602,10 @@ struct ExpressionChecking {
     primitive_conversions: HashMap<NodeId, PrimitiveConversion>,
     primitive_conversion_runtime_checks:
         HashMap<NodeId, PrimitiveConversionRuntimeCheck>,
+    /// Source-ordered interpolation operations. Literal text remains in the
+    /// AST; these facts identify each single-evaluation value and its parsed
+    /// formatting behavior for typed IR and lowering.
+    formatted_strings: HashMap<NodeId, Vec<ResolvedInterpolation>>,
     /// Bindings written by assignment. For object-like locals, lowering uses
     /// this to decide when the source-level reference needs indirection in
     /// addition to any frame-owned backing storage.
@@ -673,6 +716,13 @@ impl LexicalIndex {
             | ExpressionKind::SelfValue
             | ExpressionKind::Literal(_)
             | ExpressionKind::AssociatedAccess { .. } => {}
+            ExpressionKind::FormattedString { parts } => {
+                for part in parts {
+                    if let FormattedStringPart::Interpolation { value, .. } = part {
+                        self.visit_expression(value, callable, names);
+                    }
+                }
+            }
             ExpressionKind::Group(inner)
             | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::MemberAccess { object: inner, .. }
@@ -2760,6 +2810,9 @@ impl<'semantic> Analyzer<'semantic> {
 
         let typed = match &expression.kind {
             ExpressionKind::Literal(literal) => self.synthesize_literal(expression, *literal),
+            ExpressionKind::FormattedString { parts } => {
+                self.synthesize_formatted_string(expression, parts)?
+            }
             ExpressionKind::Identifier => self.synthesize_identifier(expression)?,
             ExpressionKind::SelfValue => self.synthesize_self(expression),
             ExpressionKind::Group(inner) => {
@@ -3136,6 +3189,13 @@ impl<'semantic> Analyzer<'semantic> {
                 }
             }
             ExpressionKind::Literal(_) | ExpressionKind::AssociatedAccess { .. } => {}
+            ExpressionKind::FormattedString { parts } => {
+                for part in parts {
+                    if let FormattedStringPart::Interpolation { value, .. } = part {
+                        self.collect_captures_from_expression(lambda, value, captures, seen);
+                    }
+                }
+            }
             ExpressionKind::Group(inner)
             | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::MemberAccess { object: inner, .. }
@@ -6134,6 +6194,127 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
+    /// Checks each interpolation exactly once in source order and normalizes
+    /// its optional Python-compatible format specification for lowering.
+    fn synthesize_formatted_string(
+        &mut self,
+        expression: &Expression,
+        parts: &[FormattedStringPart],
+    ) -> Option<TypedExpression> {
+        let mut resolved = Vec::new();
+        let mut valid = true;
+
+        for part in parts {
+            let FormattedStringPart::Interpolation {
+                value,
+                format_spec,
+                ..
+            } = part
+            else {
+                continue;
+            };
+            let typed = self.synthesize(value)?;
+            if self.is_divergence(typed.type_id) {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::DivergentFormattedValue,
+                    span: value.span,
+                });
+                valid = false;
+            }
+
+            let format = match format_spec {
+                Some(span) => {
+                    let source = self
+                        .module
+                        .text(*span)
+                        .expect("format specification belongs to the source module");
+                    match parse_format_specification(source) {
+                        Some(format) => format,
+                        None => {
+                            self.checking.errors.push(ExpressionCheckingError {
+                                kind: ExpressionCheckingErrorKind::InvalidFormatSpecification,
+                                span: *span,
+                            });
+                            valid = false;
+                            FormatSpecification::default()
+                        }
+                    }
+                }
+                None => FormatSpecification::default(),
+            };
+
+            if !self.is_recovery(typed.type_id) && !self.is_divergence(typed.type_id) {
+                if !self.formatted_value_is_supported(typed.type_id) {
+                    self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::UnsupportedFormattedValue {
+                            found: typed.type_id,
+                        },
+                        span: value.span,
+                    });
+                    valid = false;
+                } else if !self.formatted_value_supports_specification(typed.type_id, format) {
+                    self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::InvalidFormatSpecification,
+                        span: format_spec.unwrap_or(value.span),
+                    });
+                    valid = false;
+                }
+            } else if self.is_recovery(typed.type_id) {
+                valid = false;
+            }
+
+            resolved.push(ResolvedInterpolation {
+                value: value.id,
+                value_type: typed.type_id,
+                format,
+            });
+        }
+
+        if !valid {
+            return Some(self.recovery_temporary());
+        }
+        self.checking
+            .formatted_strings
+            .insert(expression.id, resolved);
+        Some(TypedExpression {
+            type_id: self
+                .types
+                .types_mut()
+                .primitive(PrimitiveType::String, AccessCapability::Mut),
+            category: ValueCategory::FreshTemporary,
+        })
+    }
+
+    fn formatted_value_is_supported(&self, type_id: TypeId) -> bool {
+        self.primitive_kind(type_id).is_some_and(|primitive| {
+            matches!(
+                primitive,
+                PrimitiveType::String
+                    | PrimitiveType::Int
+                    | PrimitiveType::Float
+                    | PrimitiveType::Bool
+                    | PrimitiveType::Char
+                    | PrimitiveType::Unit
+                    | PrimitiveType::None
+            )
+        })
+    }
+
+    fn formatted_value_supports_specification(
+        &self,
+        type_id: TypeId,
+        format: FormatSpecification,
+    ) -> bool {
+        let Some(primitive) = self.primitive_kind(type_id) else {
+            return false;
+        };
+        let numeric = matches!(primitive, PrimitiveType::Int | PrimitiveType::Float);
+        let precision_valid = format.fixed_precision.is_none() || primitive == PrimitiveType::Float;
+        let numeric_options_valid = numeric
+            || (format.sign.is_none() && !format.zero_padding);
+        precision_valid && numeric_options_valid
+    }
+
     fn fresh_primitive(&mut self, primitive: PrimitiveType) -> TypedExpression {
         TypedExpression {
             type_id: self
@@ -6534,6 +6715,130 @@ impl<'semantic> Analyzer<'semantic> {
 
     fn is_divergence(&self, type_id: TypeId) -> bool {
         type_id == self.types.types().divergence()
+    }
+}
+
+fn parse_format_specification(source: &str) -> Option<FormatSpecification> {
+    let bytes = decode_format_specification(source)?;
+    let mut offset = 0;
+    let mut format = FormatSpecification::default();
+
+    if bytes.get(1).copied().and_then(format_alignment).is_some() {
+        format.fill = Some(bytes[0]);
+        format.alignment = format_alignment(bytes[1]);
+        offset = 2;
+    } else if let Some(alignment) = bytes.first().copied().and_then(format_alignment) {
+        format.alignment = Some(alignment);
+        offset = 1;
+    }
+
+    if let Some(sign) = bytes.get(offset).copied().and_then(format_sign) {
+        format.sign = Some(sign);
+        offset += 1;
+    }
+    if bytes.get(offset) == Some(&b'0') {
+        format.zero_padding = true;
+        offset += 1;
+    }
+
+    let width_start = offset;
+    while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+        offset += 1;
+    }
+    if width_start != offset {
+        format.width = Some(parse_ascii_u32(&bytes[width_start..offset])?);
+    }
+
+    if bytes.get(offset) == Some(&b'.') {
+        offset += 1;
+        let precision_start = offset;
+        while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+            offset += 1;
+        }
+        if precision_start == offset || bytes.get(offset) != Some(&b'f') {
+            return None;
+        }
+        format.fixed_precision = Some(parse_ascii_u32(&bytes[precision_start..offset])?);
+        offset += 1;
+    }
+
+    (offset == bytes.len()).then_some(format)
+}
+
+fn decode_format_specification(source: &str) -> Option<Vec<u8>> {
+    let source = source.as_bytes();
+    let mut decoded = Vec::with_capacity(source.len());
+    let mut offset = 0;
+    while offset < source.len() {
+        if source[offset] != b'\\' {
+            decoded.push(source[offset]);
+            offset += 1;
+            continue;
+        }
+        let escaped = *source.get(offset + 1)?;
+        match escaped {
+            b'\\' | b'"' | b'\'' => {
+                decoded.push(escaped);
+                offset += 2;
+            }
+            b'n' => {
+                decoded.push(b'\n');
+                offset += 2;
+            }
+            b'r' => {
+                decoded.push(b'\r');
+                offset += 2;
+            }
+            b't' => {
+                decoded.push(b'\t');
+                offset += 2;
+            }
+            b'0' => {
+                decoded.push(0);
+                offset += 2;
+            }
+            b'x' => {
+                let high = ascii_hex_value(*source.get(offset + 2)?)?;
+                let low = ascii_hex_value(*source.get(offset + 3)?)?;
+                decoded.push(high * 16 + low);
+                offset += 4;
+            }
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+fn parse_ascii_u32(digits: &[u8]) -> Option<u32> {
+    digits.iter().try_fold(0_u32, |value, digit| {
+        value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
+    })
+}
+
+const fn ascii_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+const fn format_alignment(byte: u8) -> Option<FormatAlignment> {
+    match byte {
+        b'<' => Some(FormatAlignment::Left),
+        b'>' => Some(FormatAlignment::Right),
+        b'^' => Some(FormatAlignment::Center),
+        _ => None,
+    }
+}
+
+const fn format_sign(byte: u8) -> Option<FormatSign> {
+    match byte {
+        b'+' => Some(FormatSign::Plus),
+        b'-' => Some(FormatSign::Minus),
+        b' ' => Some(FormatSign::Space),
+        _ => None,
     }
 }
 
@@ -10520,5 +10825,154 @@ mod tests {
             checking.errors[5].kind,
             ExpressionCheckingErrorKind::MethodRequiresValue
         );
+    }
+
+
+    #[test]
+    fn checks_formatted_strings_and_records_normalized_specs() {
+        let source = r#"
+fn main() {
+    const text = "name";
+    const integer = 42;
+    const decimal = 3.5;
+    const truth = true;
+    const character = 'A';
+    const rendered = f"{text:\x2a<10}|{integer:+010}|{decimal:^12.2f}|{integer:>-8}|{integer:> 8}|{truth}|{character}|{()}|{none}";
+    rendered;
+}
+"#;
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let main = function(&program.declarations[0]);
+        let formatted = binding_initializer(&main.body.statements[5]);
+        let typed = checking.expressions[&formatted.id];
+        assert!(matches!(
+            types.types().get(typed.type_id),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::String,
+                capability: AccessCapability::Mut,
+            })
+        ));
+        assert_eq!(typed.category, ValueCategory::FreshTemporary);
+        assert_eq!(checking.transfers[&formatted.id], ValueTransfer::MoveTemporary);
+
+        let interpolations = &checking.formatted_strings[&formatted.id];
+        assert_eq!(interpolations.len(), 9);
+        assert_eq!(
+            interpolations[0].format,
+            FormatSpecification {
+                fill: Some(b'*'),
+                alignment: Some(FormatAlignment::Left),
+                width: Some(10),
+                ..FormatSpecification::default()
+            }
+        );
+        assert_eq!(
+            interpolations[1].format,
+            FormatSpecification {
+                sign: Some(FormatSign::Plus),
+                zero_padding: true,
+                width: Some(10),
+                ..FormatSpecification::default()
+            }
+        );
+        assert_eq!(
+            interpolations[2].format,
+            FormatSpecification {
+                alignment: Some(FormatAlignment::Center),
+                width: Some(12),
+                fixed_precision: Some(2),
+                ..FormatSpecification::default()
+            }
+        );
+        assert_eq!(
+            interpolations[3].format,
+            FormatSpecification {
+                alignment: Some(FormatAlignment::Right),
+                sign: Some(FormatSign::Minus),
+                width: Some(8),
+                ..FormatSpecification::default()
+            }
+        );
+        assert_eq!(
+            interpolations[4].format,
+            FormatSpecification {
+                alignment: Some(FormatAlignment::Right),
+                sign: Some(FormatSign::Space),
+                width: Some(8),
+                ..FormatSpecification::default()
+            }
+        );
+    }
+
+    #[test]
+    fn reports_unsupported_formatted_values_and_invalid_specs_in_source_order() {
+        let source = r#"
+interface Reader {}
+struct Item {}
+fn bad(data: bytes, choice: int | float, action: fn() -> int, reader: Reader, queue: Queue<int>) {
+    const result: string = f"{Item {}}|{data}|{choice}|{action}|{reader}|{queue}|{panic("stop")}|{"text":+}|{1:.2f}|{1:q}";
+}
+fn main() {}
+"#;
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 10, "{:#?}", checking.errors);
+        assert!(checking.errors[..6].iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::UnsupportedFormattedValue { .. }
+        )));
+        assert_eq!(
+            checking.errors[6].kind,
+            ExpressionCheckingErrorKind::DivergentFormattedValue
+        );
+        assert!(checking.errors[7..].iter().all(|error| {
+            error.kind == ExpressionCheckingErrorKind::InvalidFormatSpecification
+        }));
+
+        let bad = function(&program.declarations[2]);
+        let formatted = binding_initializer(&bad.body.statements[0]);
+        assert!(matches!(
+            types.types().get(checking.expressions[&formatted.id].type_id),
+            Some(SemanticType::Recovery)
+        ));
+        assert!(!checking.formatted_strings.contains_key(&formatted.id));
+    }
+
+    #[test]
+    fn records_formatted_interpolations_once_in_evaluation_order() {
+        let source = r#"
+fn first() -> int { 1 }
+fn second() -> int { 2 }
+fn main() {
+    const rendered = f"{first()} then {second()}";
+}
+"#;
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let main = function(&program.declarations[2]);
+        let formatted = binding_initializer(&main.body.statements[0]);
+        let ExpressionKind::FormattedString { parts } = &formatted.kind else {
+            panic!("expected formatted initializer")
+        };
+        let values = parts
+            .iter()
+            .filter_map(|part| match part {
+                FormattedStringPart::Interpolation { value, .. } => Some(value.id),
+                FormattedStringPart::Text(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checking.formatted_strings[&formatted.id]
+                .iter()
+                .map(|interpolation| interpolation.value)
+                .collect::<Vec<_>>(),
+            values
+        );
+        assert_eq!(values.len(), 2);
     }
 }

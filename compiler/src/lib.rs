@@ -181,6 +181,7 @@ fn main() {
     const calculated = apply(fibonacci(initial), scale);
     const flags = (calculated << 1) | (initial & 1) ^ 2;
     const comparison = calculated >= initial && truth || false;
+    const formatted = f"{{total}} {summary.name:<20}: {calculated:+08} ({decimal:.2f})";
 
     summary.total = calculated;
     summary.total += recovered;
@@ -199,6 +200,7 @@ fn main() {
     first_character;
     character;
     announce(character_code);
+    println(formatted);
     heap_formatter.format(text);
     heap_scale(initial);
     notify();

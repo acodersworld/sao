@@ -13,7 +13,7 @@ use std::{collections::HashMap, fmt};
 use crate::{
     ast::{
         AnonymousStructMember, Block, BuiltinType, ConditionalElse, Declaration, Expression,
-        ExpressionKind, Function, FunctionParameter, FunctionParameterKind,
+        ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
         InterfaceMethodRequirement, NodeId, PrimitiveType, Program, Statement, StatementKind,
         StructMember, TypeKind, TypeSyntax,
     },
@@ -291,6 +291,13 @@ impl<'source, 'names> Resolver<'source, 'names> {
     fn visit_expression(&mut self, expression: &Expression) {
         match &expression.kind {
             ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {
+            }
+            ExpressionKind::FormattedString { parts } => {
+                for part in parts {
+                    if let FormattedStringPart::Interpolation { value, .. } = part {
+                        self.visit_expression(value);
+                    }
+                }
             }
             ExpressionKind::Group(inner)
             | ExpressionKind::GcAllocate(inner)

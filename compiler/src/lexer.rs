@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::iter::FusedIterator;
+use std::ops::Range;
 
 use logos::{Lexer as LogosLexer, Logos, SpannedIter};
 
@@ -13,6 +15,8 @@ pub enum LexErrorKind {
     UnterminatedBlockComment,
     UnterminatedStringLiteral,
     UnterminatedCharacterLiteral,
+    UnterminatedFormattedString,
+    UnmatchedFormattedStringBrace,
     InvalidEscape,
     NonAsciiLiteral,
     InvalidLiteralCharacter,
@@ -27,6 +31,8 @@ impl fmt::Display for LexErrorKind {
             Self::UnterminatedBlockComment => "unterminated block comment",
             Self::UnterminatedStringLiteral => "unterminated string literal",
             Self::UnterminatedCharacterLiteral => "unterminated character literal",
+            Self::UnterminatedFormattedString => "unterminated formatted string",
+            Self::UnmatchedFormattedStringBrace => "unmatched formatted-string brace",
             Self::InvalidEscape => "invalid escape sequence",
             Self::NonAsciiLiteral => "literal contains a non-ASCII character",
             Self::InvalidLiteralCharacter => "literal contains an invalid control character",
@@ -73,7 +79,11 @@ impl Default for RawLexError {
 }
 
 macro_rules! define_token_kinds {
-    ($( $(#[$attribute:meta])* $variant:ident ),+ $(,)?) => {
+    (
+        $( $(#[$attribute:meta])* $variant:ident ),+ $(,)?;
+        raw $( $(#[$raw_attribute:meta])* $raw:ident ),+ $(,)?;
+        virtual $( $(#[$virtual_attribute:meta])* $virtual:ident ),+ $(,)?
+    ) => {
         #[derive(Debug, Logos, Clone, Copy, PartialEq, Eq, Hash)]
         #[logos(error = RawLexError)]
         // Ignore insignificant horizontal and vertical ASCII whitespace.
@@ -87,11 +97,16 @@ macro_rules! define_token_kinds {
                 $(#[$attribute])*
                 $variant,
             )+
+            $(
+                $(#[$raw_attribute])*
+                $raw,
+            )+
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum TokenKind {
             $($variant,)+
+            $($(#[$virtual_attribute])* $virtual,)+
             Eof,
         }
 
@@ -99,6 +114,7 @@ macro_rules! define_token_kinds {
             fn from(token: RawTokenKind) -> Self {
                 match token {
                     $(RawTokenKind::$variant => Self::$variant,)+
+                    $(RawTokenKind::$raw => unreachable!("raw-only token must be expanded"),)+
                 }
             }
         }
@@ -281,6 +297,23 @@ define_token_kinds! {
     #[token("\"", lex_string_literal)] StringLiteral,
     // Consumes and validates a single ASCII character literal using the callback below.
     #[token("'", lex_character_literal)] CharacterLiteral,
+    ; raw
+    // Consumes a complete formatted string. The public lexer expands it into
+    // structural tokens so embedded expressions retain ordinary token spans.
+    #[token("f\"", lex_formatted_string_literal)] FormattedStringLiteral,
+    ; virtual
+    /// Opens one lexer-expanded formatted string (`f"`).
+    FormattedStringStart,
+    /// Raw literal text within a formatted string.
+    FormattedStringText,
+    /// Opens an interpolation field (`{`).
+    FormattedStringInterpolationStart,
+    /// The raw specification following a top-level interpolation `:`.
+    FormattedStringFormatSpec,
+    /// Closes an interpolation field (`}`).
+    FormattedStringInterpolationEnd,
+    /// Closes one formatted string (`"`).
+    FormattedStringEnd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -319,8 +352,10 @@ pub type LexResult = Result<Vec<Token>, Vec<LexError>>;
 #[must_use = "a lexer does nothing unless it is iterated"]
 pub struct Lexer<'source> {
     inner: SpannedIter<'source, RawTokenKind>,
+    source: &'source str,
     module_id: ModuleId,
     source_len: usize,
+    pending: VecDeque<Result<Token, LexError>>,
     emitted_eof: bool,
 }
 
@@ -328,8 +363,10 @@ impl<'source> Lexer<'source> {
     pub fn new(module: &'source SourceModule) -> Self {
         Self {
             inner: RawTokenKind::lexer(module.source()).spanned(),
+            source: module.source(),
             module_id: module.module_id(),
             source_len: module.source().len(),
+            pending: VecDeque::new(),
             emitted_eof: false,
         }
     }
@@ -339,8 +376,21 @@ impl Iterator for Lexer<'_> {
     type Item = Result<Token, LexError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.pending.pop_front() {
+            return Some(item);
+        }
         if let Some((result, logos_span)) = self.inner.next() {
             let token_span = Span::new(self.module_id, logos_span.start, logos_span.end);
+
+            if matches!(result, Ok(RawTokenKind::FormattedStringLiteral)) {
+                self.pending.extend(expand_formatted_string(
+                    self.source,
+                    self.module_id,
+                    logos_span.start,
+                    logos_span.end,
+                ));
+                return self.pending.pop_front();
+            }
 
             return Some(match result {
                 Ok(kind) => Ok(Token::new(kind.into(), token_span)),
@@ -430,6 +480,38 @@ fn lex_block_comment(lexer: &mut LogosLexer<'_, RawTokenKind>) -> Result<(), Raw
 
 fn lex_string_literal(lexer: &mut LogosLexer<'_, RawTokenKind>) -> Result<(), RawLexError> {
     lex_quoted_literal(lexer, b'"', QuotedLiteralKind::String)
+}
+
+fn lex_formatted_string_literal(
+    lexer: &mut LogosLexer<'_, RawTokenKind>,
+) -> Result<(), RawLexError> {
+    match scan_formatted_content(lexer.remainder().as_bytes(), false) {
+        Ok(scan) => {
+            lexer.bump(scan.consumed);
+            Ok(())
+        }
+        Err(error) => {
+            lexer.bump(formatted_recovery_end(lexer.remainder().as_bytes()));
+            Err(error)
+        }
+    }
+}
+
+/// Finds a useful token boundary after a malformed formatted string so lazy
+/// lexing can continue. This deliberately prefers the next unescaped quote or
+/// line ending; full structural interpretation already failed and is not used
+/// for recovery.
+fn formatted_recovery_end(content: &[u8]) -> usize {
+    let mut offset = 0;
+    while offset < content.len() {
+        match content[offset] {
+            b'"' => return offset + 1,
+            b'\n' | b'\r' => return offset,
+            b'\\' => offset = (offset + 2).min(content.len()),
+            _ => offset += 1,
+        }
+    }
+    content.len()
 }
 
 fn lex_character_literal(lexer: &mut LogosLexer<'_, RawTokenKind>) -> Result<(), RawLexError> {
@@ -572,6 +654,424 @@ fn lex_quoted_literal(
 
     lexer.bump(bytes.len());
     Err(RawLexError::whole_token(literal_kind.unterminated_error()))
+}
+
+#[derive(Debug)]
+struct FormattedScan {
+    /// Bytes consumed after the opening `f"`, including the closing quote.
+    consumed: usize,
+    parts: Vec<ScannedFormattedPart>,
+}
+
+#[derive(Debug)]
+enum ScannedFormattedPart {
+    Text(Range<usize>),
+    Interpolation {
+        open: usize,
+        expression: Range<usize>,
+        format_spec: Option<Range<usize>>,
+        close: usize,
+    },
+}
+
+/// Scans the contents following an opening `f"`. All offsets in successful
+/// output are relative to that content; errors are relative to the complete
+/// token and therefore include the two-byte prefix.
+fn scan_formatted_content(
+    content: &[u8],
+    collect_parts: bool,
+) -> Result<FormattedScan, RawLexError> {
+    let mut parts = Vec::new();
+    let mut text_start = 0;
+    let mut offset = 0;
+
+    while offset < content.len() {
+        match content[offset] {
+            b'"' => {
+                if collect_parts && text_start < offset {
+                    parts.push(ScannedFormattedPart::Text(text_start..offset));
+                }
+                return Ok(FormattedScan {
+                    consumed: offset + 1,
+                    parts,
+                });
+            }
+            b'\n' | b'\r' => {
+                return Err(RawLexError::whole_token(
+                    LexErrorKind::UnterminatedFormattedString,
+                ));
+            }
+            b'\\' => {
+                offset = formatted_escape_end(content, offset)?;
+            }
+            b'{' if content.get(offset + 1) == Some(&b'{') => offset += 2,
+            b'}' if content.get(offset + 1) == Some(&b'}') => offset += 2,
+            b'}' => {
+                return Err(formatted_error_at(
+                    LexErrorKind::UnmatchedFormattedStringBrace,
+                    offset,
+                    offset + 1,
+                ));
+            }
+            b'{' => {
+                if collect_parts && text_start < offset {
+                    parts.push(ScannedFormattedPart::Text(text_start..offset));
+                }
+                let open = offset;
+                let expression_start = offset + 1;
+                let (delimiter, format_colon) =
+                    scan_formatted_interpolation(content, expression_start)?;
+                let expression_end = format_colon.unwrap_or(delimiter);
+                let format_spec = format_colon.map(|colon| colon + 1..delimiter);
+                if collect_parts {
+                    parts.push(ScannedFormattedPart::Interpolation {
+                        open,
+                        expression: expression_start..expression_end,
+                        format_spec,
+                        close: delimiter,
+                    });
+                }
+                offset = delimiter + 1;
+                text_start = offset;
+            }
+            byte if !byte.is_ascii() => {
+                let length = utf8_character_length(byte);
+                return Err(formatted_error_at(
+                    LexErrorKind::NonAsciiLiteral,
+                    offset,
+                    offset + length,
+                ));
+            }
+            byte if byte < 0x20 || byte == 0x7f => {
+                return Err(formatted_error_at(
+                    LexErrorKind::InvalidLiteralCharacter,
+                    offset,
+                    offset + 1,
+                ));
+            }
+            _ => offset += 1,
+        }
+    }
+
+    Err(RawLexError::whole_token(
+        LexErrorKind::UnterminatedFormattedString,
+    ))
+}
+
+fn scan_formatted_interpolation(
+    content: &[u8],
+    mut offset: usize,
+) -> Result<(usize, Option<usize>), RawLexError> {
+    let mut delimiters = Vec::new();
+
+    while offset < content.len() {
+        if matches!(content[offset], b'\n' | b'\r') && delimiters.is_empty() {
+            return Err(RawLexError::whole_token(
+                LexErrorKind::UnterminatedFormattedString,
+            ));
+        }
+
+        if content[offset] == b'f' && content.get(offset + 1) == Some(&b'"') {
+            let nested = scan_formatted_content(&content[offset + 2..], false)
+                .map_err(|error| shift_formatted_error(error, offset + 2))?;
+            offset += 2 + nested.consumed;
+            continue;
+        }
+
+        match content[offset] {
+            b'"' | b'\'' => {
+                offset = skip_quoted_expression(content, offset)?;
+            }
+            b'/' if content.get(offset + 1) == Some(&b'/') => {
+                offset += 2;
+                while offset < content.len() && !matches!(content[offset], b'\n' | b'\r') {
+                    offset += 1;
+                }
+            }
+            b'/' if content.get(offset + 1) == Some(&b'*') => {
+                offset = skip_block_comment_in_formatted(content, offset)?;
+            }
+            b'(' => {
+                delimiters.push(b')');
+                offset += 1;
+            }
+            b'[' => {
+                delimiters.push(b']');
+                offset += 1;
+            }
+            b'{' => {
+                delimiters.push(b'}');
+                offset += 1;
+            }
+            b')' | b']' | b'}'
+                if delimiters.last().copied() == Some(content[offset]) =>
+            {
+                delimiters.pop();
+                offset += 1;
+            }
+            b'}' if delimiters.is_empty() => return Ok((offset, None)),
+            b':' if delimiters.is_empty() => {
+                let colon = offset;
+                offset += 1;
+                while offset < content.len() {
+                    match content[offset] {
+                        b'}' => return Ok((offset, Some(colon))),
+                        b'\\' => offset = formatted_escape_end(content, offset)?,
+                        b'{' => {
+                            return Err(formatted_error_at(
+                                LexErrorKind::UnmatchedFormattedStringBrace,
+                                offset,
+                                offset + 1,
+                            ));
+                        }
+                        b'\n' | b'\r' | b'"' => {
+                            return Err(RawLexError::whole_token(
+                                LexErrorKind::UnterminatedFormattedString,
+                            ));
+                        }
+                        byte if !byte.is_ascii() => {
+                            let length = utf8_character_length(byte);
+                            return Err(formatted_error_at(
+                                LexErrorKind::NonAsciiLiteral,
+                                offset,
+                                offset + length,
+                            ));
+                        }
+                        byte if byte < 0x20 || byte == 0x7f => {
+                            return Err(formatted_error_at(
+                                LexErrorKind::InvalidLiteralCharacter,
+                                offset,
+                                offset + 1,
+                            ));
+                        }
+                        _ => offset += 1,
+                    }
+                }
+                return Err(RawLexError::whole_token(
+                    LexErrorKind::UnterminatedFormattedString,
+                ));
+            }
+            b'\n' | b'\r' => {
+                return Err(RawLexError::whole_token(
+                    LexErrorKind::UnterminatedFormattedString,
+                ));
+            }
+            _ => offset += 1,
+        }
+    }
+
+    Err(RawLexError::whole_token(
+        LexErrorKind::UnterminatedFormattedString,
+    ))
+}
+
+fn formatted_escape_end(content: &[u8], offset: usize) -> Result<usize, RawLexError> {
+    let Some(&escaped) = content.get(offset + 1) else {
+        return Err(RawLexError::whole_token(
+            LexErrorKind::UnterminatedFormattedString,
+        ));
+    };
+    if escaped == b'x' {
+        if content.get(offset + 2).is_none_or(|byte| !byte.is_ascii_hexdigit())
+            || content.get(offset + 3).is_none_or(|byte| !byte.is_ascii_hexdigit())
+        {
+            return Err(formatted_error_at(
+                LexErrorKind::InvalidEscape,
+                offset,
+                (offset + 4).min(content.len()),
+            ));
+        }
+        let value = hex_value(content[offset + 2]) * 16 + hex_value(content[offset + 3]);
+        if value > 0x7f {
+            return Err(formatted_error_at(
+                LexErrorKind::NonAsciiLiteral,
+                offset,
+                offset + 4,
+            ));
+        }
+        return Ok(offset + 4);
+    }
+    if !matches!(escaped, b'\\' | b'"' | b'\'' | b'n' | b'r' | b't' | b'0') {
+        return Err(formatted_error_at(
+            LexErrorKind::InvalidEscape,
+            offset,
+            offset + 2,
+        ));
+    }
+    Ok(offset + 2)
+}
+
+fn skip_quoted_expression(content: &[u8], start: usize) -> Result<usize, RawLexError> {
+    let quote = content[start];
+    let mut offset = start + 1;
+    while offset < content.len() {
+        match content[offset] {
+            byte if byte == quote => return Ok(offset + 1),
+            b'\\' => offset = (offset + 2).min(content.len()),
+            b'\n' | b'\r' => break,
+            _ => offset += 1,
+        }
+    }
+    Err(RawLexError::whole_token(
+        LexErrorKind::UnterminatedFormattedString,
+    ))
+}
+
+fn skip_block_comment_in_formatted(
+    content: &[u8],
+    mut offset: usize,
+) -> Result<usize, RawLexError> {
+    let mut depth = 1;
+    offset += 2;
+    while offset + 1 < content.len() {
+        match (content[offset], content[offset + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                offset += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                offset += 2;
+                if depth == 0 {
+                    return Ok(offset);
+                }
+            }
+            _ => offset += 1,
+        }
+    }
+    Err(RawLexError::whole_token(
+        LexErrorKind::UnterminatedBlockComment,
+    ))
+}
+
+const fn formatted_error_at(kind: LexErrorKind, start: usize, end: usize) -> RawLexError {
+    RawLexError::at(kind, start + 2, end + 2)
+}
+
+const fn shift_formatted_error(error: RawLexError, amount: usize) -> RawLexError {
+    match error.relative_span {
+        Some(span) => RawLexError::at(error.kind, span.start + amount, span.end + amount),
+        None => error,
+    }
+}
+
+const fn utf8_character_length(first_byte: u8) -> usize {
+    match first_byte {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
+}
+
+fn expand_formatted_string(
+    source: &str,
+    module_id: ModuleId,
+    start: usize,
+    end: usize,
+) -> Vec<Result<Token, LexError>> {
+    let literal = &source[start..end];
+    let scan = scan_formatted_content(&literal.as_bytes()[2..], true)
+        .expect("logos only exposes lexically valid formatted strings");
+    let content_start = start + 2;
+    let mut items = vec![Ok(Token::new(
+        TokenKind::FormattedStringStart,
+        Span::new(module_id, start, content_start),
+    ))];
+
+    for part in scan.parts {
+        match part {
+            ScannedFormattedPart::Text(range) => items.push(Ok(Token::new(
+                TokenKind::FormattedStringText,
+                Span::new(
+                    module_id,
+                    content_start + range.start,
+                    content_start + range.end,
+                ),
+            ))),
+            ScannedFormattedPart::Interpolation {
+                open,
+                expression,
+                format_spec,
+                close,
+            } => {
+                items.push(Ok(Token::new(
+                    TokenKind::FormattedStringInterpolationStart,
+                    Span::new(module_id, content_start + open, content_start + open + 1),
+                )));
+                items.extend(lex_fragment(
+                    source,
+                    module_id,
+                    content_start + expression.start,
+                    content_start + expression.end,
+                ));
+                if let Some(format_spec) = format_spec {
+                    items.push(Ok(Token::new(
+                        TokenKind::FormattedStringFormatSpec,
+                        Span::new(
+                            module_id,
+                            content_start + format_spec.start,
+                            content_start + format_spec.end,
+                        ),
+                    )));
+                }
+                items.push(Ok(Token::new(
+                    TokenKind::FormattedStringInterpolationEnd,
+                    Span::new(module_id, content_start + close, content_start + close + 1),
+                )));
+            }
+        }
+    }
+
+    items.push(Ok(Token::new(
+        TokenKind::FormattedStringEnd,
+        Span::new(module_id, end - 1, end),
+    )));
+    items
+}
+
+fn lex_fragment(
+    source: &str,
+    module_id: ModuleId,
+    start: usize,
+    end: usize,
+) -> Vec<Result<Token, LexError>> {
+    let mut items = Vec::new();
+    for (result, range) in RawTokenKind::lexer(&source[start..end]).spanned() {
+        let token_start = start + range.start;
+        let token_end = start + range.end;
+        match result {
+            Ok(RawTokenKind::FormattedStringLiteral) => {
+                items.extend(expand_formatted_string(
+                    source,
+                    module_id,
+                    token_start,
+                    token_end,
+                ));
+            }
+            Ok(kind) => items.push(Ok(Token::new(
+                kind.into(),
+                Span::new(module_id, token_start, token_end),
+            ))),
+            Err(error) => {
+                let span = error.relative_span.map_or(
+                    Span::new(module_id, token_start, token_end),
+                    |relative| {
+                        Span::new(
+                            module_id,
+                            token_start + relative.start,
+                            token_start + relative.end,
+                        )
+                    },
+                );
+                items.push(Err(LexError {
+                    kind: error.kind,
+                    span,
+                }));
+            }
+        }
+    }
+    items
 }
 
 const fn hex_value(byte: u8) -> u8 {
@@ -837,6 +1337,53 @@ mod tests {
         assert_eq!(tokens[0].text(&module), "\"hello\\n\\x00\"");
         assert_eq!(tokens[1].text(&module), "'\\x7f'");
         assert_eq!(tokens[2].text(&module), "'\\''");
+    }
+
+    #[test]
+    fn expands_formatted_strings_without_losing_expression_spans() {
+        let source = r#"f"{{{name:*>10}}}""#;
+        let module = module(source);
+        let tokens = lex(&module).expect("formatted string should lex successfully");
+
+        assert_eq!(
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![
+                TokenKind::FormattedStringStart,
+                TokenKind::FormattedStringText,
+                TokenKind::FormattedStringInterpolationStart,
+                TokenKind::Identifier,
+                TokenKind::FormattedStringFormatSpec,
+                TokenKind::FormattedStringInterpolationEnd,
+                TokenKind::FormattedStringText,
+                TokenKind::FormattedStringEnd,
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            tokens[..tokens.len() - 1]
+                .iter()
+                .map(|token| token.text(&module))
+                .collect::<Vec<_>>(),
+            vec!["f\"", "{{", "{", "name", "*>10", "}", "}}", "\""]
+        );
+    }
+
+    #[test]
+    fn rejects_unmatched_formatted_string_braces() {
+        let (tokens, closing_errors) = streamed(r#"f"value }" + 1"#);
+        let (_, opening_errors) = streamed(r#"f"value {name""#);
+        assert_eq!(
+            closing_errors[0].kind,
+            LexErrorKind::UnmatchedFormattedStringBrace
+        );
+        assert_eq!(
+            opening_errors[0].kind,
+            LexErrorKind::UnterminatedFormattedString
+        );
+        assert_eq!(
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Plus, TokenKind::IntegerLiteral, TokenKind::Eof]
+        );
     }
 
     #[test]

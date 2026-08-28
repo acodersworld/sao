@@ -11,6 +11,7 @@ use std::{collections::HashMap, fmt};
 use crate::{
     ast::{
         AnonymousStructMember, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
+        FormattedStringPart,
         Function, FunctionParameter, FunctionParameterKind, InterfaceMethodRequirement, NodeId,
         Program, Statement, StatementKind, StructMember, TypeKind, TypeSyntax,
     },
@@ -341,6 +342,13 @@ impl<'source> Resolver<'source> {
                 self.resolve_value_name(scope, expression.id, expression.span);
             }
             ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {}
+            ExpressionKind::FormattedString { parts } => {
+                for part in parts {
+                    if let FormattedStringPart::Interpolation { value, .. } = part {
+                        self.resolve_expression(scope, value);
+                    }
+                }
+            }
             ExpressionKind::Group(inner) => self.resolve_expression(scope, inner),
             ExpressionKind::Block(block) => self.resolve_block(scope, block),
             ExpressionKind::If {

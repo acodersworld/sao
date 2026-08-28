@@ -3,10 +3,11 @@ use std::iter::Peekable;
 use crate::ast::{
     AnonymousStructField, AnonymousStructMember, AssignmentOperator, BinaryOperator,
     BindingMutability, BindingQualifiers, Block, BuiltinType, ConditionalElse, Declaration,
-    Expression, ExpressionKind, Function, FunctionParameter, FunctionParameterKind,
-    InterfaceDeclaration, InterfaceMethodRequirement, LiteralKind, NodeId, PrimitiveType, Program,
-    RangeInclusivity, ReceiverStorage, Statement, StatementKind, StructDeclaration, StructField,
-    StructFieldInitializer, StructMember, TypeKind, TypeSyntax, UnaryOperator, ValueCapability,
+    Expression, ExpressionKind, FormattedStringPart, Function, FunctionParameter,
+    FunctionParameterKind, InterfaceDeclaration, InterfaceMethodRequirement, LiteralKind, NodeId,
+    PrimitiveType, Program, RangeInclusivity, ReceiverStorage, Statement, StatementKind,
+    StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
+    UnaryOperator, ValueCapability,
 };
 use crate::lexer::{LexError, Token, TokenKind};
 use crate::source::{ModuleId, Span};
@@ -66,6 +67,7 @@ pub enum ParseErrorKind {
     BindingValueCapabilityMustPrecedeName,
     AggregateMemberCapabilityNotSupported,
     ChainedTypeAscription,
+    InvalidFormattedStringExpression,
     ExpectedToken {
         expected: TokenKind,
         found: TokenKind,
@@ -1436,12 +1438,62 @@ where
             TokenKind::False => self.literal(LiteralKind::Boolean(false)),
             TokenKind::CharacterLiteral => self.literal(LiteralKind::Character),
             TokenKind::StringLiteral => self.literal(LiteralKind::String),
+            TokenKind::FormattedStringStart => self.formatted_string(),
             TokenKind::None => self.literal(LiteralKind::None),
             _ => Err(ParseError {
                 kind: ParseErrorKind::ExpectedExpression { found: token.kind },
                 span: token.span,
             }
             .into()),
+        }
+    }
+
+    fn formatted_string(&mut self) -> ParseResult {
+        let start = self.expect(TokenKind::FormattedStringStart)?;
+        let mut parts = Vec::new();
+
+        loop {
+            match self.current()?.kind {
+                TokenKind::FormattedStringText => {
+                    parts.push(FormattedStringPart::Text(self.advance()?.span));
+                }
+                TokenKind::FormattedStringInterpolationStart => {
+                    let open = self.advance()?;
+                    let value = self.expression(LOWEST_BINDING_POWER, true)?;
+                    validate_formatted_string_expression(&value)?;
+                    let format_spec = if self.current()?.kind
+                        == TokenKind::FormattedStringFormatSpec
+                    {
+                        Some(self.advance()?.span)
+                    } else {
+                        None
+                    };
+                    let close = self.expect(TokenKind::FormattedStringInterpolationEnd)?;
+                    parts.push(FormattedStringPart::Interpolation {
+                        value,
+                        format_spec,
+                        span: Span::new(self.module_id, open.span.start, close.span.end),
+                    });
+                }
+                TokenKind::FormattedStringEnd => {
+                    let end = self.advance()?;
+                    return Ok(Expression::new(
+                        ExpressionKind::FormattedString { parts },
+                        Span::new(self.module_id, start.span.start, end.span.end),
+                    ));
+                }
+                found => {
+                    let span = self.current()?.span;
+                    return Err(ParseError {
+                        kind: ParseErrorKind::ExpectedToken {
+                            expected: TokenKind::FormattedStringEnd,
+                            found,
+                        },
+                        span,
+                    }
+                    .into());
+                }
+            }
         }
     }
 
@@ -2075,6 +2127,13 @@ fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext
     expression.id = context.next_node_id();
     match &mut expression.kind {
         ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {}
+        ExpressionKind::FormattedString { parts } => {
+            for part in parts {
+                if let FormattedStringPart::Interpolation { value, .. } = part {
+                    assign_expression_ids(value, context);
+                }
+            }
+        }
         ExpressionKind::GcAllocate(inner) => assign_expression_ids(inner, context),
         ExpressionKind::Group(inner) => assign_expression_ids(inner, context),
         ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
@@ -2258,6 +2317,118 @@ fn directly_ascribes_type(expression: &Expression) -> bool {
         ExpressionKind::Group(inner) => directly_ascribes_type(inner),
         _ => false,
     }
+}
+
+/// Enforces Python-like interpolation boundaries. SAO has several control-flow
+/// expressions which Python does not, so accepting every expression here would
+/// also admit loops, statement blocks, `return`, `break`, and `continue`.
+/// Interpolations instead accept ordinary value expressions and statement-free
+/// conditional expressions whose every branch explicitly produces a value.
+fn validate_formatted_string_expression(expression: &Expression) -> ParseResult<()> {
+    match &expression.kind {
+        ExpressionKind::Identifier
+        | ExpressionKind::SelfValue
+        | ExpressionKind::Literal(_)
+        | ExpressionKind::AssociatedAccess { .. }
+        | ExpressionKind::Lambda { .. } => Ok(()),
+        ExpressionKind::FormattedString { parts } => {
+            for part in parts {
+                if let FormattedStringPart::Interpolation { value, .. } = part {
+                    validate_formatted_string_expression(value)?;
+                }
+            }
+            Ok(())
+        }
+        ExpressionKind::Group(inner)
+        | ExpressionKind::GcAllocate(inner)
+        | ExpressionKind::MemberAccess { object: inner, .. }
+        | ExpressionKind::Unary { operand: inner, .. }
+        | ExpressionKind::TypeTest { value: inner, .. }
+        | ExpressionKind::TypeAscription { value: inner, .. } => {
+            validate_formatted_string_expression(inner)
+        }
+        ExpressionKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            validate_formatted_string_expression(condition)?;
+            validate_formatted_string_branch(then_branch)?;
+            match else_branch {
+                Some(ConditionalElse::Block(block)) => validate_formatted_string_branch(block),
+                Some(ConditionalElse::If(conditional)) => {
+                    validate_formatted_string_expression(conditional)
+                }
+                None => invalid_formatted_string_expression(expression.span),
+            }
+        }
+        ExpressionKind::StructConstruction { fields, .. } => {
+            for field in fields {
+                validate_formatted_string_expression(&field.value)?;
+            }
+            Ok(())
+        }
+        ExpressionKind::AnonymousStruct { members } => {
+            for member in members {
+                if let AnonymousStructMember::Field(field) = member {
+                    validate_formatted_string_expression(&field.initializer)?;
+                }
+            }
+            Ok(())
+        }
+        ExpressionKind::Call { callee, arguments } => {
+            validate_formatted_string_expression(callee)?;
+            for argument in arguments {
+                validate_formatted_string_expression(argument)?;
+            }
+            Ok(())
+        }
+        ExpressionKind::Index { object, index }
+        | ExpressionKind::Binary {
+            left: object,
+            right: index,
+            ..
+        } => {
+            validate_formatted_string_expression(object)?;
+            validate_formatted_string_expression(index)
+        }
+        ExpressionKind::Slice { object, start, end } => {
+            validate_formatted_string_expression(object)?;
+            if let Some(start) = start {
+                validate_formatted_string_expression(start)?;
+            }
+            if let Some(end) = end {
+                validate_formatted_string_expression(end)?;
+            }
+            Ok(())
+        }
+        ExpressionKind::Block(_)
+        | ExpressionKind::Loop { .. }
+        | ExpressionKind::While { .. }
+        | ExpressionKind::RangeFor { .. }
+        | ExpressionKind::Try { .. }
+        | ExpressionKind::Assignment { .. } => {
+            invalid_formatted_string_expression(expression.span)
+        }
+    }
+}
+
+fn validate_formatted_string_branch(block: &Block) -> ParseResult<()> {
+    if !block.statements.is_empty() {
+        return invalid_formatted_string_expression(block.span);
+    }
+    let Some(value) = &block.value else {
+        return invalid_formatted_string_expression(block.span);
+    };
+    validate_formatted_string_expression(value)
+}
+
+fn invalid_formatted_string_expression<T>(span: Span) -> ParseResult<T> {
+    Err(ParseError {
+        kind: ParseErrorKind::InvalidFormattedStringExpression,
+        span,
+    }
+    .into())
 }
 
 const fn builtin_type_argument_count(builtin: BuiltinType) -> usize {
@@ -2558,6 +2729,136 @@ mod tests {
 
     fn integer(span: Span) -> Expression {
         Expression::new(ExpressionKind::Literal(LiteralKind::Integer), span)
+    }
+
+    #[test]
+    fn parses_formatted_string_expressions_and_specs() {
+        let source = r#"f"{(value: int):*>10}""#;
+        let expression = parse(source).expect("formatted string should parse");
+        let ExpressionKind::FormattedString { parts } = expression.kind else {
+            panic!("expected formatted string")
+        };
+        let [FormattedStringPart::Interpolation {
+            value,
+            format_spec: Some(format_spec),
+            ..
+        }] = parts.as_slice()
+        else {
+            panic!("expected one formatted interpolation")
+        };
+        let ExpressionKind::Group(grouped) = &value.kind else {
+            panic!("grouped ascription should remain the interpolation value")
+        };
+        assert!(matches!(
+            &grouped.kind,
+            ExpressionKind::TypeAscription { .. }
+        ));
+        assert_eq!(&source[value.span.start..value.span.end], "(value: int)");
+        assert_eq!(&source[format_spec.start..format_spec.end], "*>10");
+    }
+
+    #[test]
+    fn preserves_mixed_literal_text_and_multiple_interpolations() {
+        let source = r#"f"Hello, {first} and {second}!""#;
+        let expression = parse(source).expect("formatted string should parse");
+        let ExpressionKind::FormattedString { parts } = expression.kind else {
+            panic!("expected formatted string")
+        };
+        assert_eq!(parts.len(), 5);
+
+        let expected = [
+            (0, "Hello, "),
+            (2, " and "),
+            (4, "!"),
+        ];
+        for (index, text) in expected {
+            let FormattedStringPart::Text(span) = &parts[index] else {
+                panic!("expected literal text at part {index}")
+            };
+            assert_eq!(&source[span.start..span.end], text);
+        }
+
+        for (index, name) in [(1, "first"), (3, "second")] {
+            let FormattedStringPart::Interpolation {
+                value,
+                format_spec: None,
+                ..
+            } = &parts[index]
+            else {
+                panic!("expected interpolation at part {index}")
+            };
+            assert!(matches!(&value.kind, ExpressionKind::Identifier));
+            assert_eq!(&source[value.span.start..value.span.end], name);
+        }
+    }
+
+    #[test]
+    fn parses_rich_multiple_substitutions_between_literal_sections() {
+        let source = r#"f"{{report}} {user.name:<12}: {scores[index]:04} points""#;
+        let expression = parse(source).expect("formatted string should parse");
+        let ExpressionKind::FormattedString { parts } = expression.kind else {
+            panic!("expected formatted string")
+        };
+        assert_eq!(parts.len(), 5);
+
+        let FormattedStringPart::Text(prefix) = &parts[0] else {
+            panic!("expected literal prefix")
+        };
+        let FormattedStringPart::Interpolation {
+            value: name,
+            format_spec: Some(name_spec),
+            ..
+        } = &parts[1]
+        else {
+            panic!("expected formatted member interpolation")
+        };
+        let FormattedStringPart::Text(separator) = &parts[2] else {
+            panic!("expected literal separator")
+        };
+        let FormattedStringPart::Interpolation {
+            value: score,
+            format_spec: Some(score_spec),
+            ..
+        } = &parts[3]
+        else {
+            panic!("expected formatted index interpolation")
+        };
+        let FormattedStringPart::Text(suffix) = &parts[4] else {
+            panic!("expected literal suffix")
+        };
+
+        assert_eq!(&source[prefix.start..prefix.end], "{{report}} ");
+        assert_eq!(&source[separator.start..separator.end], ": ");
+        assert_eq!(&source[suffix.start..suffix.end], " points");
+        assert!(matches!(&name.kind, ExpressionKind::MemberAccess { .. }));
+        assert!(matches!(&score.kind, ExpressionKind::Index { .. }));
+        assert_eq!(&source[name_spec.start..name_spec.end], "<12");
+        assert_eq!(&source[score_spec.start..score_spec.end], "04");
+    }
+
+    #[test]
+    fn permits_only_value_conditionals_as_formatted_string_control_flow() {
+        parse(r#"f"{if ready { "yes" } else if waiting { "wait" } else { "no" }}""#)
+            .expect("statement-free exhaustive conditional should be valid");
+
+        for source in [
+            r#"f"{loop {}}""#,
+            r#"f"{while ready {}}""#,
+            r#"f"{ { return 1; } }""#,
+            r#"f"{value = 1}""#,
+            r#"f"{value?}""#,
+            r#"f"{if ready { "yes" }}""#,
+            r#"f"{if ready { notify(); "yes" } else { "no" }}""#,
+        ] {
+            let error = parse(source).expect_err("control flow should be rejected");
+            assert!(matches!(
+                error,
+                FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::InvalidFormattedStringExpression,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

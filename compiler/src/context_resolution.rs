@@ -11,6 +11,7 @@ use std::{collections::HashMap, fmt, mem};
 use crate::{
     ast::{
         AnonymousStructMember, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
+        FormattedStringPart,
         Function, FunctionParameter, FunctionParameterKind, InterfaceMethodRequirement, NodeId,
         Program, Statement, StatementKind, StructMember,
     },
@@ -442,6 +443,13 @@ impl ContextResolver {
     fn visit_expression(&mut self, expression: &Expression) {
         match &expression.kind {
             ExpressionKind::Identifier | ExpressionKind::Literal(_) => {}
+            ExpressionKind::FormattedString { parts } => {
+                for part in parts {
+                    if let FormattedStringPart::Interpolation { value, .. } = part {
+                        self.visit_expression(value);
+                    }
+                }
+            }
             ExpressionKind::SelfValue => {
                 if let Some(method) = self.method_stack.last() {
                     self.self_targets.insert(expression.id, *method);

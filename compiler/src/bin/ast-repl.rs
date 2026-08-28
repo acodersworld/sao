@@ -212,6 +212,10 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ChainedTypeAscription => {
             "type ascriptions cannot be chained".to_owned()
         }
+        ParseErrorKind::InvalidFormattedStringExpression => {
+            "formatted-string interpolations allow value expressions and value-only if/else"
+                .to_owned()
+        }
         ParseErrorKind::ExpectedToken { expected, found } => {
             format!("expected {expected:?}, found {found:?}")
         }
@@ -437,6 +441,17 @@ mod tests {
                 span: Span::new(ModuleId::PRELUDE, 9, 12),
             }),
             "qualify the complete union or intersection instead of one member"
+        );
+    }
+
+    #[test]
+    fn describes_invalid_formatted_string_expressions() {
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::InvalidFormattedStringExpression,
+                span: Span::new(ModuleId::PRELUDE, 3, 10),
+            }),
+            "formatted-string interpolations allow value expressions and value-only if/else"
         );
     }
 }

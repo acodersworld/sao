@@ -224,17 +224,25 @@ reviewable phases:
        ordinary expected-type boundaries.
      - Constant evaluation and compile-time conversion diagnostics remain
        deferred.
-   - Phase 7.3, formatted strings (next):
-     - Add Python-style `f"...{expression}..."` interpolation as the language's
-       primitive-to-text formatting mechanism, replacing `string(value)`.
-       Preserve ordinary string escapes, support literal braces with `{{` and
-       `}}`, and parse embedded SAO expressions with their original source
-       spans. Evaluate interpolations exactly once from left to right.
-     - Initially format `string`, `int`, `float`, `bool`, `char`, unit, and
-       `none`; reject aggregates, interfaces, unions, callables, bytes, and
-       compiler-known parameterized built-ins unless narrowed or otherwise
-       converted by an explicit operation.
-     - Support the strict Python-compatible format-specification subset
+   - Phase 7.3, formatted strings, is complete:
+     - Python-style `f"...{expression}..."` interpolation is implemented as
+       the language's primitive-to-text formatting mechanism, replacing
+       `string(value)`. Ordinary string escapes are preserved, `{{` and `}}`
+       produce literal braces, and embedded SAO expressions retain their
+       original source spans and evaluate exactly once from left to right.
+     - Interpolations accept ordinary value expressions but prohibit SAO's
+       statement-bearing and direct control-transfer expressions: standalone
+       blocks, loops, assignments, and `?`. An `if`/`else if`/`else` expression
+       is the sole direct control-flow form; it requires a final `else`, and
+       every branch must contain no statements and must explicitly produce a
+       value. Any interpolation which nevertheless has the divergence type,
+       including a compiler-known diverging call, is rejected rather than
+       making the formatted string divergent.
+     - Formatting accepts `string`, `int`, `float`, `bool`, `char`, unit, and
+       `none`. Aggregates, interfaces, unions, callables, bytes, and
+       compiler-known parameterized built-ins are rejected unless the source
+       has first been narrowed or converted by an explicit operation.
+     - The strict Python-compatible format-specification subset is
        `[[fill]align][sign][0][width][.precision f]`: ASCII fill characters;
        `<`, `>`, and `^` alignment; numeric `+`, `-`, and space signs; numeric
        zero-padding; literal minimum widths; and fixed-point float precision
@@ -242,16 +250,16 @@ reviewable phases:
      - A top-level `:` inside an interpolation begins its format
        specification. An ascription in that position must therefore be
        grouped, as in `f"{(value: int):>10}"`.
-     - Produce a fresh mutable string and record resolved interpolation and
-       formatting metadata for typed IR and lowering.
-     - Defer `=` alignment, `z`, alternate forms, digit grouping, additional
+     - Formatted expressions produce a fresh mutable string and record resolved
+       interpolation and formatting metadata for typed IR and lowering.
+     - `=` alignment, `z`, alternate forms, digit grouping, additional
        presentation types, string precision, dynamic nested specifications,
-       conversion flags, and debug syntax.
-     - Add focused coverage for interpolation parsing, supported and rejected
+       conversion flags, and debug syntax remain deferred.
+     - Focused coverage exercises interpolation parsing, supported and rejected
        value types, escapes and braces, evaluation order, every supported
        format option, malformed specifications, result semantics, and lowering
-       metadata. Exercise formatted strings in the complex-program test.
-   - Phase 7.4, remaining built-ins and completion:
+       metadata. The complex-program test exercises formatted strings.
+   - Phase 7.4, remaining built-ins and completion (next):
      - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
        `yield`, `co`, and `defer`.
    - Aggregate deterministic diagnostics and expose successful semantic

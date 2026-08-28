@@ -493,6 +493,11 @@ pub enum ExpressionKind {
     Identifier,
     SelfValue,
     Literal(LiteralKind),
+    /// A string whose literal and evaluated portions are interleaved in
+    /// source order, as in `f"name: {name:>10}"`.
+    FormattedString {
+        parts: Vec<FormattedStringPart>,
+    },
     Group(Box<Expression>),
     Block(Block),
     If {
@@ -586,6 +591,21 @@ pub enum ExpressionKind {
         target: Box<Expression>,
         operator: AssignmentOperator,
         value: Box<Expression>,
+    },
+}
+
+/// One source-ordered portion of a formatted string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormattedStringPart {
+    /// Raw source text between interpolations. Escapes and doubled braces are
+    /// retained for lowering to decode exactly once.
+    Text(Span),
+    Interpolation {
+        value: Expression,
+        /// The source after the interpolation's top-level `:`. Parsing its
+        /// deliberately small format grammar is semantic analysis work.
+        format_spec: Option<Span>,
+        span: Span,
     },
 }
 

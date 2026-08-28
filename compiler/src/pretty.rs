@@ -2,9 +2,9 @@ use std::fmt::{Arguments, Write};
 
 use crate::ast::{
     AnonymousStructField, AnonymousStructMember, Block, ConditionalElse, Declaration, Expression,
-    ExpressionKind, Function, FunctionParameter, FunctionParameterKind, InterfaceDeclaration,
-    InterfaceMethodRequirement, Program, Statement, StatementKind, StructDeclaration, StructField,
-    StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
+    ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
+    InterfaceDeclaration, InterfaceMethodRequirement, Program, Statement, StatementKind,
+    StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
 };
 use crate::source::{SourceModule, Span};
 
@@ -366,6 +366,38 @@ fn format_expression_into(
                 location(span)
             ),
         ),
+        ExpressionKind::FormattedString { parts } => {
+            line(output, depth, format_args!("FormattedString {}", location(span)));
+            for part in parts {
+                match part {
+                    FormattedStringPart::Text(text_span) => line(
+                        output,
+                        depth + 1,
+                        format_args!(
+                            "Text {:?} {}",
+                            text(source, *text_span),
+                            location(*text_span)
+                        ),
+                    ),
+                    FormattedStringPart::Interpolation {
+                        value,
+                        format_spec,
+                        span,
+                    } => {
+                        line(output, depth + 1, format_args!("Interpolation {}", location(*span)));
+                        child_expression(output, source, "value", value, depth + 1);
+                        line(
+                            output,
+                            depth + 2,
+                            format_args!(
+                                "format: {:?}",
+                                format_spec.map(|span| text(source, span))
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         ExpressionKind::Group(inner) => {
             line(output, depth, format_args!("Group {}", location(span)));
             child_expression(output, source, "expression", inner, depth);

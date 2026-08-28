@@ -78,6 +78,44 @@ control characters are rejected; newlines terminate an unclosed literal.
 Literal tokens retain their original source spelling. Decoding and allocating
 their runtime value occurs in a later compiler phase.
 
+Formatted strings use an `f` immediately before the opening quote:
+
+```text
+f"{name} has {count:04} items"
+```
+
+They use the ordinary string escape set and ASCII restriction. `{{` and `}}`
+emit literal braces. A single `{` begins an interpolation, and its matching
+single `}` ends it. Interpolations are evaluated exactly once from left to
+right and retain their original source spans.
+
+An interpolation accepts ordinary value expressions, but not standalone block
+expressions, loops, assignments, `?`, or direct `return`, `break`, and
+`continue` control transfer. The one permitted direct control-flow expression
+is `if`/`else if`/`else`: it must have a final `else`, and every branch must be
+statement-free and explicitly produce a value. This preserves Python's useful
+conditional-formatting model without admitting the additional statement-like
+constructs which SAO ordinarily treats as expressions. An otherwise permitted
+expression which is statically known to diverge is also invalid as an
+interpolation; formatted strings accept only expressions that can produce a
+formattable value.
+
+A top-level `:` within an interpolation begins its format specification. A
+type ascription in that position must consequently be grouped, for example
+`f"{(value: int):>10}"`. The initial format grammar is the strict
+Python-compatible subset `[[fill]align][sign][0][width][.precision f]`:
+
+- `fill` is one ASCII character and requires `<`, `>`, or `^` alignment;
+- `+`, `-`, and space signs and `0` padding apply only to numeric values;
+- width is a literal minimum width; and
+- `.precision f`, such as `.2f`, is fixed-point float precision.
+
+The initially formattable values are `string`, `int`, `float`, `bool`, `char`,
+unit, and `none`. Other values require a separately defined explicit operation.
+Dynamic specifications, conversion flags, debug syntax, string precision,
+additional presentation types, `=` alignment, `z`, alternate forms, and digit
+grouping are deferred.
+
 ## 16.5 Errors and recovery
 
 The lazy lexer yields `Result<Token, LexError>` items and continues after an
