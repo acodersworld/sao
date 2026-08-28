@@ -227,17 +227,30 @@ reviewable phases:
    - Phase 7.3, formatted strings (next):
      - Add Python-style `f"...{expression}..."` interpolation as the language's
        primitive-to-text formatting mechanism, replacing `string(value)`.
-     - Preserve ordinary string escapes, support literal braces with `{{` and
-       `}}`, parse embedded SAO expressions with original source spans, and
-       evaluate interpolations once from left to right.
+       Preserve ordinary string escapes, support literal braces with `{{` and
+       `}}`, and parse embedded SAO expressions with their original source
+       spans. Evaluate interpolations exactly once from left to right.
      - Initially format `string`, `int`, `float`, `bool`, `char`, unit, and
        `none`; reject aggregates, interfaces, unions, callables, bytes, and
        compiler-known parameterized built-ins unless narrowed or otherwise
        converted by an explicit operation.
+     - Support the strict Python-compatible format-specification subset
+       `[[fill]align][sign][0][width][.precision f]`: ASCII fill characters;
+       `<`, `>`, and `^` alignment; numeric `+`, `-`, and space signs; numeric
+       zero-padding; literal minimum widths; and fixed-point float precision
+       such as `.2f`.
+     - A top-level `:` inside an interpolation begins its format
+       specification. An ascription in that position must therefore be
+       grouped, as in `f"{(value: int):>10}"`.
      - Produce a fresh mutable string and record resolved interpolation and
        formatting metadata for typed IR and lowering.
-     - Reserve Python's colon format specifications, conversion flags, debug
-       syntax, and nested format specifications for a later design increment.
+     - Defer `=` alignment, `z`, alternate forms, digit grouping, additional
+       presentation types, string precision, dynamic nested specifications,
+       conversion flags, and debug syntax.
+     - Add focused coverage for interpolation parsing, supported and rejected
+       value types, escapes and braces, evaluation order, every supported
+       format option, malformed specifications, result semantics, and lowering
+       metadata. Exercise formatted strings in the complex-program test.
    - Phase 7.4, remaining built-ins and completion:
      - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
        `yield`, `co`, and `defer`.
