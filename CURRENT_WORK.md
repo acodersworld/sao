@@ -321,28 +321,31 @@ reviewable phases:
        - Complete: keep built-in runtime representations compiler-known while routing
          their arity and type application through the shared factory machinery.
        - Stop for review and commit before implementing runtime templates.
-     - Change 3, bounded template declarations (next):
-       - Support bounded compile-time type parameters on top-level runtime
+     - Change 3, bounded template declarations (complete):
+       - Complete: support bounded compile-time type parameters on top-level runtime
          functions and struct methods. Unspecialized templates are not
          first-class callable values.
-       - Support concise named constraints such as `comptime T: Reader` and
+       - Complete: support concise named constraints such as `comptime T: Reader` and
          private named, intersection, or anonymous interface constraints in a
          `where` clause.
-       - Keep interfaces runtime-oriented: every requirement has `self`, uses
+       - Complete: keep interfaces runtime-oriented: every requirement has `self`, uses
          only runtime parameters and return types, and cannot declare
          `comptime` parameters or return `type`.
-       - Allow only named or generated concrete structs and their GC-qualified
-         forms to satisfy bounded parameters. Reuse exact canonical method
-         identities and existing receiver storage and capability rules.
-       - Check template member use against declared constraints. Do not expose
+       - Complete: retain canonical symbolic parameter identities and their
+         interface bounds so later specialization can allow only named or
+         generated concrete structs and their GC-qualified forms to satisfy
+         bounded parameters.
+       - Complete: reuse exact canonical method identities and existing
+         receiver storage and capability rules while checking bounds.
+       - Complete: check template member use against declared constraints. Do not expose
          concrete-only fields, methods, constructors, `.copy()`, associated
          functions, or primitive operators, regardless of the concrete types
          later used to specialize the template.
-       - Validate template signatures and bodies symbolically through their
+       - Complete: validate template signatures and bodies symbolically through their
          declared constraints so an invalid template is diagnosed independently
          of whether it is ever specialized.
        - Stop for review and commit before implementing specialization.
-     - Change 4, top-level runtime specialization (pending):
+     - Change 4, top-level runtime specialization (next):
        - Support explicit specialization of top-level templated runtime
          functions. Type arguments appear in declared order and are never
          inferred.

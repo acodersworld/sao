@@ -76,6 +76,7 @@ pub enum NameResolutionErrorKind {
     DuplicateDeclaration { name: String, other: Span },
     DuplicateTemplateConstraint { name: String, other: Span },
     InvalidTemplateConstraint { found: SymbolKind },
+    InvalidTemplateConstraintTarget { found: SymbolKind },
     MissingMain,
 }
 
@@ -100,6 +101,11 @@ impl fmt::Display for NameResolutionError {
             NameResolutionErrorKind::InvalidTemplateConstraint { found } => write!(
                 formatter,
                 "template constraint at {}..{} must name an interface, found {found:?}",
+                self.span.start, self.span.end
+            ),
+            NameResolutionErrorKind::InvalidTemplateConstraintTarget { found } => write!(
+                formatter,
+                "template constraint target at {}..{} must be a compile-time type parameter, found {found:?}",
                 self.span.start, self.span.end
             ),
             NameResolutionErrorKind::MissingMain => {
@@ -338,6 +344,21 @@ impl<'source> Resolver<'source> {
                     });
                 }
                 self.resolve_type_name(body_scope, constraint.id, constraint.parameter);
+                if let Some(symbol) = self.references.get(&constraint.id).copied() {
+                    let found = self
+                        .symbols
+                        .symbol(symbol)
+                        .expect("resolved constraint target must exist")
+                        .kind;
+                    if found != SymbolKind::ComptimeParameter {
+                        self.errors.push(NameResolutionError {
+                            kind: NameResolutionErrorKind::InvalidTemplateConstraintTarget {
+                                found,
+                            },
+                            span: constraint.parameter,
+                        });
+                    }
+                }
                 match &constraint.interface {
                     InterfaceConstraint::Named(interface) => {
                         self.resolve_type(body_scope, interface);
@@ -1212,6 +1233,27 @@ mod tests {
                         found: SymbolKind::Struct,
                     },
                     span: nth_span(&module, "Item", 1),
+                }
+        }));
+    }
+
+    #[test]
+    fn rejects_a_where_constraint_target_that_is_not_a_template_parameter() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "fn invalid(comptime T: type) where Reader: Reader {}\n",
+            "fn main() {}",
+        );
+        let (module, program) = parse(source);
+        let errors = resolve_program(&module, &program)
+            .expect_err("where constraints must target compile-time parameters");
+        assert!(errors.iter().any(|error| {
+            error
+                == &NameResolutionError {
+                    kind: NameResolutionErrorKind::InvalidTemplateConstraintTarget {
+                        found: SymbolKind::Interface,
+                    },
+                    span: nth_span(&module, "Reader", 1),
                 }
         }));
     }

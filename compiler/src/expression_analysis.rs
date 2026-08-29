@@ -548,6 +548,7 @@ enum ExpressionCheckingErrorKind {
     AssociatedFunctionRequiresType,
     MethodRequiresValue,
     MethodRequiresCall,
+    TemplateRequiresSpecialization,
     CopyRequiresCall,
     CopyRequiresValue,
     ReceiverStorageMismatch,
@@ -3900,6 +3901,18 @@ impl<'semantic> Analyzer<'semantic> {
                     self.types.types().get(*target),
                     Some(SemanticType::Interface { .. } | SemanticType::Intersection { .. })
                 ) => Some((*target, *capability, true)),
+            SemanticType::TemplateParameter { capability, .. } => self
+                .template_parameter_bound(type_id)
+                .flatten()
+                .map(|bound| (bound, *capability, false)),
+            SemanticType::Gc { target, capability }
+                if matches!(
+                    self.types.types().get(*target),
+                    Some(SemanticType::TemplateParameter { .. })
+                ) => self
+                    .template_parameter_bound(*target)
+                    .flatten()
+                    .map(|bound| (bound, *capability, true)),
             _ => None,
         }
     }
@@ -4272,6 +4285,18 @@ impl<'semantic> Analyzer<'semantic> {
             {
                 Some((*target, *capability, true))
             }
+            SemanticType::TemplateParameter { capability, .. } => self
+                .template_parameter_bound(type_id)
+                .flatten()
+                .map(|bound| (bound, *capability, false)),
+            SemanticType::Gc { target, capability }
+                if matches!(
+                    self.types.types().get(*target),
+                    Some(SemanticType::TemplateParameter { .. })
+                ) => self
+                    .template_parameter_bound(*target)
+                    .flatten()
+                    .map(|bound| (bound, *capability, true)),
             _ => None,
         }
     }
@@ -5084,6 +5109,16 @@ impl<'semantic> Analyzer<'semantic> {
             });
         }
         let Some((aggregate_owner, _, false)) = self.aggregate_parts(owner_type) else {
+            if matches!(
+                self.types.types().get(owner_type),
+                Some(SemanticType::TemplateParameter { .. })
+            ) {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::InvalidMemberOwner { found: owner_type },
+                    span: owner.span,
+                });
+                return Some(self.recovery_temporary());
+            }
             return None;
         };
         let name = self
@@ -5132,6 +5167,13 @@ impl<'semantic> Analyzer<'semantic> {
                 return Some(self.recovery_temporary());
             }
         };
+        if self.signatures.is_runtime_template(declaration) {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::TemplateRequiresSpecialization,
+                span: member,
+            });
+            return Some(self.recovery_temporary());
+        }
         let signature = match aggregate_owner {
             AggregateOwner::Source(_) => self.signatures.callable(declaration),
             AggregateOwner::Generated(owner) => {
@@ -5430,9 +5472,10 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("checked anonymous field must have an inferred type")
     }
 
-    /// Identifies owners that cannot gain a member family in a later increment.
-    /// Strings, bytes, built-ins, and interfaces are omitted because they use
-    /// compiler-provided member families rather than source aggregate lookup.
+    /// Identifies owners that cannot expose concrete aggregate members.
+    /// Strings, bytes, built-ins, and interfaces use separate member families;
+    /// a symbolic template parameter reaches this check only when it has no
+    /// interface bound, so it deliberately exposes no members at all.
     fn member_owner_is_definitively_invalid(&self, type_id: TypeId) -> bool {
         matches!(
             self.types.types().get(type_id),
@@ -5444,7 +5487,7 @@ impl<'semantic> Analyzer<'semantic> {
                     | PrimitiveType::Bool
                     | PrimitiveType::Char,
                 ..
-            })
+            } | SemanticType::TemplateParameter { .. })
         )
     }
 
@@ -6117,6 +6160,16 @@ impl<'semantic> Analyzer<'semantic> {
             }
             return None;
         };
+        if self.signatures.is_runtime_template(declaration) {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::TemplateRequiresSpecialization,
+                span: *member,
+            });
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(Some(self.recovery_temporary()));
+        }
         let signature = match owner {
             AggregateOwner::Source(_) => self.signatures.callable(declaration),
             AggregateOwner::Generated(owner) => {
@@ -6611,7 +6664,21 @@ impl<'semantic> Analyzer<'semantic> {
             );
             return Some(typed);
         }
-        let type_id = self.signatures.callable_value_type(symbol)?;
+        let Some(type_id) = self.signatures.callable_value_type(symbol) else {
+            if self
+                .names
+                .symbols()
+                .symbol(symbol)
+                .is_some_and(|symbol| symbol.kind == SymbolKind::Function)
+            {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::TemplateRequiresSpecialization,
+                    span: expression.span,
+                });
+                return Some(self.recovery_temporary());
+            }
+            return None;
+        };
         Some(TypedExpression {
             type_id,
             category: ValueCategory::FreshTemporary,
@@ -6855,6 +6922,7 @@ impl<'semantic> Analyzer<'semantic> {
                 | SemanticType::Primitive { .. }
                 | SemanticType::Callable { .. }
                 | SemanticType::Interface { .. }
+                | SemanticType::TemplateParameter { .. }
                 | SemanticType::Intersection { .. }
                 | SemanticType::Builtin { .. }
                 | SemanticType::Recovery
@@ -6893,6 +6961,11 @@ impl<'semantic> Analyzer<'semantic> {
         self.current_specialized_owner
             .and_then(|owner| self.types.specialized_type_for_syntax(owner, syntax))
             .or_else(|| self.types.type_for_syntax(syntax))
+    }
+
+    fn template_parameter_bound(&self, type_id: TypeId) -> Option<Option<TypeId>> {
+        self.types
+            .template_parameter_bound_for(self.current_specialized_owner, type_id)
     }
 
     /// Returns whether an already analyzed expression explicitly produces a
@@ -6935,6 +7008,7 @@ impl<'semantic> Analyzer<'semantic> {
             | SemanticType::NamedStruct { .. }
             | SemanticType::GeneratedStruct { .. }
             | SemanticType::AnonymousStruct { .. }
+            | SemanticType::TemplateParameter { .. }
             | SemanticType::Builtin { .. }
             | SemanticType::Recovery
             | SemanticType::Divergence)
@@ -11346,5 +11420,70 @@ fn main() {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn checks_runtime_templates_symbolically_through_their_bounds() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "interface Writer { fn write(self, value: int); }\n",
+            "fn inspect(comptime T: type, value: T) -> T\n",
+            "where T: Reader & Writer, { value.read(); value.write(1); value }\n",
+            "fn inspect_private(comptime T: type, value: T) -> int\n",
+            "where T: interface { fn read(self) -> int; }, { value.read() }\n",
+            "struct Wrapper {\n",
+            "    fn inspect(self, comptime T: Reader, value: T) -> int { value.read() }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let inspect = function(&program.declarations[2]);
+        let parameter = named_parameter(inspect, 0);
+        let FunctionParameterKind::Named { type_annotation, .. } = &parameter.kind else {
+            panic!("expected runtime parameter")
+        };
+        let symbolic = types
+            .type_for_syntax(type_annotation.id)
+            .expect("template parameter use must resolve symbolically");
+        assert!(matches!(
+            types.types().get(symbolic),
+            Some(SemanticType::TemplateParameter { .. })
+        ));
+        assert!(types.template_parameter_bound(symbolic).flatten().is_some());
+        assert!(signatures.is_runtime_template(inspect.id));
+    }
+
+    #[test]
+    fn rejects_unbounded_members_and_unspecialized_template_values() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "fn invalid(comptime T: Reader, value: T) {\n",
+            "    value.missing();\n",
+            "    value.copy();\n",
+            "    value + value;\n",
+            "    T::make;\n",
+            "}\n",
+            "fn main() { invalid; }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 5, "{:#?}", checking.errors);
+        assert_eq!(checking.errors[0].kind, ExpressionCheckingErrorKind::UnknownMember);
+        assert_eq!(checking.errors[1].kind, ExpressionCheckingErrorKind::UnknownMember);
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::InvalidBinaryOperand { .. }
+        ));
+        assert!(matches!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::InvalidMemberOwner { .. }
+        ));
+        assert_eq!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::TemplateRequiresSpecialization
+        );
     }
 }

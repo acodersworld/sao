@@ -138,6 +138,14 @@ pub enum SemanticType {
         declaration: NodeId,
         capability: AccessCapability,
     },
+    /// One compile-time type parameter while its runtime template is checked
+    /// before specialization. The declaration identity keeps distinct `T`s
+    /// distinct; its interface bound is recorded by type resolution rather
+    /// than folded into this type, so `T` remains the exact signature type.
+    TemplateParameter {
+        declaration: NodeId,
+        capability: AccessCapability,
+    },
     Builtin {
         builtin: BuiltinType,
         arguments: Vec<TypeId>,
@@ -172,6 +180,7 @@ impl SemanticType {
             | Self::GeneratedStruct { capability, .. }
             | Self::AnonymousStruct { capability, .. }
             | Self::Interface { capability, .. }
+            | Self::TemplateParameter { capability, .. }
             | Self::Builtin { capability, .. }
             | Self::Union { capability, .. }
             | Self::Intersection { capability, .. } => Some(*capability),
@@ -193,6 +202,7 @@ impl SemanticType {
             | Self::NamedStruct { .. }
             | Self::GeneratedStruct { .. }
             | Self::AnonymousStruct { .. }
+            | Self::TemplateParameter { .. }
             | Self::Builtin { .. }
             | Self::Union { .. } => Some(StorageSemantics::Inline),
             Self::Recovery | Self::Divergence => None,
@@ -220,6 +230,7 @@ impl SemanticType {
             | Self::NamedStruct { .. }
             | Self::GeneratedStruct { .. }
             | Self::AnonymousStruct { .. }
+            | Self::TemplateParameter { .. }
             | Self::Builtin { .. }
             | Self::Union { .. } => Some(CopySemantics::Recursive),
             Self::Recovery | Self::Divergence => None,
@@ -278,6 +289,16 @@ impl SemanticType {
                 },
                 Self::Interface {
                     declaration: right, ..
+                },
+            ) => left == right,
+            (
+                Self::TemplateParameter {
+                    declaration: left,
+                    ..
+                },
+                Self::TemplateParameter {
+                    declaration: right,
+                    ..
                 },
             ) => left == right,
             (
@@ -441,6 +462,20 @@ impl TypeStore {
         })
     }
 
+    /// Returns the symbolic identity used to validate an unspecialized runtime
+    /// template. Concrete specialization replaces this type at every syntax
+    /// occurrence; it is never a runtime type emitted by lowering.
+    pub fn template_parameter(
+        &mut self,
+        declaration: NodeId,
+        capability: AccessCapability,
+    ) -> TypeId {
+        self.intern(SemanticType::TemplateParameter {
+            declaration,
+            capability,
+        })
+    }
+
     /// Returns the canonical identity for a compiler-known parameterized type.
     ///
     /// Type argument arity and legality are validated when source type syntax
@@ -581,6 +616,9 @@ impl TypeStore {
             }
             SemanticType::Interface { declaration, .. } => {
                 Some(self.interface(declaration, capability))
+            }
+            SemanticType::TemplateParameter { declaration, .. } => {
+                Some(self.template_parameter(declaration, capability))
             }
             SemanticType::Builtin {
                 builtin, arguments, ..

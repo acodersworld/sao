@@ -377,7 +377,8 @@ pub enum FunctionParameterKind {
         type_annotation: TypeSyntax,
     },
     /// A compile-time type argument. It is either unconstrained (`T: type`) or
-    /// required to satisfy the named interface type used as its bound.
+    /// required to satisfy the interface or interface intersection used as
+    /// its bound.
     Comptime {
         name: Span,
         constraint: ComptimeParameterConstraint,

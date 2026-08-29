@@ -14,8 +14,9 @@ use crate::{
     ast::{
         AnonymousStructMember, Block, BuiltinType, ConditionalElse, Declaration, Expression,
         ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
-        InterfaceMethodRequirement, NodeId, PrimitiveType, Program, Statement, StatementKind,
-        StructMember, TypeAliasDeclaration, TypeKind, TypeSyntax,
+        ComptimeParameterConstraint, InterfaceConstraint, InterfaceMethodRequirement, NodeId,
+        PrimitiveType, Program, Statement, StatementKind, StructMember, TypeAliasDeclaration,
+        TypeKind, TypeSyntax,
     },
     name_resolution::NameResolution,
     semantic_types::{AccessCapability, SemanticType, TypeId, TypeStore},
@@ -31,6 +32,8 @@ pub struct TypeResolution {
     declaration_types: HashMap<NodeId, TypeId>,
     generated_structs: HashMap<TypeId, GeneratedStructInstantiation>,
     specialized_syntax_types: HashMap<(TypeId, NodeId), TypeId>,
+    template_parameter_bounds: HashMap<NodeId, Option<TypeId>>,
+    specialized_template_parameter_bounds: HashMap<(TypeId, NodeId), Option<TypeId>>,
 }
 
 /// One canonical struct materialized from a type-factory body.
@@ -91,6 +94,36 @@ impl TypeResolution {
     pub fn specialized_type_for_syntax(&self, owner: TypeId, syntax: NodeId) -> Option<TypeId> {
         self.specialized_syntax_types.get(&(owner, syntax)).copied()
     }
+
+    /// Returns the interface or interface intersection which limits member
+    /// access on an unspecialized template parameter. `None` distinguishes an
+    /// unconstrained `T: type` parameter from a non-parameter type.
+    #[must_use]
+    pub fn template_parameter_bound(&self, type_id: TypeId) -> Option<Option<TypeId>> {
+        self.template_parameter_bound_for(None, type_id)
+    }
+
+    /// Looks up a bound after applying an optional generated-struct owner.
+    /// Bounds inside generated methods may mention the factory's enclosing
+    /// type arguments and therefore differ between owner instantiations.
+    #[must_use]
+    pub fn template_parameter_bound_for(
+        &self,
+        owner: Option<TypeId>,
+        type_id: TypeId,
+    ) -> Option<Option<TypeId>> {
+        let SemanticType::TemplateParameter { declaration, .. } = self.types.get(type_id)? else {
+            return None;
+        };
+        if let Some(owner) = owner
+            && let Some(bound) = self
+                .specialized_template_parameter_bounds
+                .get(&(owner, *declaration))
+        {
+            return Some(*bound);
+        }
+        self.template_parameter_bounds.get(declaration).copied()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +154,9 @@ pub enum TypeResolutionErrorKind {
     GeneratedStructOutsideFactory,
     InvalidAssociatedTypeFactoryOwner,
     UnknownAssociatedTypeFactory,
+    InvalidRuntimeTemplateDeclaration,
+    InvalidTemplateConstraint,
+    InvalidInterfaceRequirementType,
 }
 
 impl fmt::Display for TypeResolutionError {
@@ -200,6 +236,21 @@ impl fmt::Display for TypeResolutionError {
                 "unknown associated type factory at {}..{}",
                 self.span.start, self.span.end
             ),
+            TypeResolutionErrorKind::InvalidRuntimeTemplateDeclaration => write!(
+                formatter,
+                "a runtime template may be declared only as a top-level function or instance method at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::InvalidTemplateConstraint => write!(
+                formatter,
+                "a compile-time type constraint must be an interface or interface intersection at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::InvalidInterfaceRequirementType => write!(
+                formatter,
+                "an interface requirement cannot return `type` at {}..{}",
+                self.span.start, self.span.end
+            ),
         }
     }
 }
@@ -247,6 +298,8 @@ struct Resolver<'source, 'names> {
     current_specialized_owner: Option<TypeId>,
     generated_structs: HashMap<TypeId, GeneratedStructInstantiation>,
     specialized_syntax_types: HashMap<(TypeId, NodeId), TypeId>,
+    template_parameter_bounds: HashMap<NodeId, Option<TypeId>>,
+    specialized_template_parameter_bounds: HashMap<(TypeId, NodeId), Option<TypeId>>,
     errors: Vec<TypeResolutionError>,
 }
 
@@ -272,6 +325,8 @@ impl<'source, 'names> Resolver<'source, 'names> {
             current_specialized_owner: None,
             generated_structs: HashMap::new(),
             specialized_syntax_types: HashMap::new(),
+            template_parameter_bounds: HashMap::new(),
+            specialized_template_parameter_bounds: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -290,6 +345,8 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 declaration_types: self.declaration_types,
                 generated_structs: self.generated_structs,
                 specialized_syntax_types: self.specialized_syntax_types,
+                template_parameter_bounds: self.template_parameter_bounds,
+                specialized_template_parameter_bounds: self.specialized_template_parameter_bounds,
             })
         } else {
             Err(self.errors)
@@ -412,7 +469,19 @@ impl<'source, 'names> Resolver<'source, 'names> {
                         StructMember::Function(function) if self.is_type_factory(function) => {
                             self.validate_type_factory_signature(function);
                         }
-                        StructMember::Function(function) => self.visit_function(function),
+                        StructMember::Function(function) => {
+                            if self.is_runtime_template(function)
+                                && !function.parameters.iter().any(|parameter| {
+                                    matches!(&parameter.kind, FunctionParameterKind::Receiver { .. })
+                                })
+                            {
+                                self.error(
+                                    TypeResolutionErrorKind::InvalidRuntimeTemplateDeclaration,
+                                    function.name,
+                                );
+                            }
+                            self.visit_function(function);
+                        }
                     }
                 }
             }
@@ -438,6 +507,13 @@ impl<'source, 'names> Resolver<'source, 'names> {
             .is_some_and(|return_type| matches!(&return_type.kind, TypeKind::ComptimeType))
     }
 
+    fn is_runtime_template(&self, function: &Function) -> bool {
+        !self.is_type_factory(function)
+            && function.parameters.iter().any(|parameter| {
+                matches!(&parameter.kind, FunctionParameterKind::Comptime { .. })
+            })
+    }
+
     fn validate_type_factory_signature(&mut self, function: &Function) {
         let valid = function.where_clause.is_none()
             && function.parameters.iter().all(|parameter| {
@@ -460,16 +536,151 @@ impl<'source, 'names> Resolver<'source, 'names> {
     fn visit_interface_requirement(&mut self, requirement: &InterfaceMethodRequirement) {
         self.visit_parameters(&requirement.parameters);
         if let Some(return_type) = &requirement.return_type {
+            if matches!(&return_type.kind, TypeKind::ComptimeType) {
+                self.error(
+                    TypeResolutionErrorKind::InvalidInterfaceRequirementType,
+                    return_type.span,
+                );
+            }
             self.resolve_type(return_type);
         }
     }
 
     fn visit_function(&mut self, function: &Function) {
+        if self.is_runtime_template(function) {
+            self.visit_runtime_template(function);
+            return;
+        }
         self.visit_parameters(&function.parameters);
         if let Some(return_type) = &function.return_type {
             self.resolve_type(return_type);
         }
         self.visit_block(&function.body);
+    }
+
+    /// Resolves an unspecialized runtime template with a distinct symbolic
+    /// semantic type for each compile-time parameter. Bounds are retained as
+    /// separate metadata: annotations still mean exactly `T`, while expression
+    /// checking may expose only the methods promised by `T`'s interface.
+    fn visit_runtime_template(&mut self, function: &Function) {
+        let mut environment = HashMap::new();
+        for parameter in &function.parameters {
+            let FunctionParameterKind::Comptime { .. } = &parameter.kind else {
+                continue;
+            };
+            let symbol = self
+                .names
+                .symbol_for_declaration(parameter.id)
+                .expect("compile-time parameter must have a resolved symbol");
+            let symbolic = self
+                .types
+                .template_parameter(parameter.id, AccessCapability::Const);
+            environment.insert(symbol, symbolic);
+            if let Some(owner) = self.current_specialized_owner {
+                self.specialized_template_parameter_bounds
+                    .insert((owner, parameter.id), None);
+            } else {
+                self.template_parameter_bounds.insert(parameter.id, None);
+            }
+        }
+        self.environments.push(environment);
+
+        for parameter in &function.parameters {
+            let FunctionParameterKind::Comptime { constraint, .. } = &parameter.kind else {
+                continue;
+            };
+            let bound = match constraint {
+                ComptimeParameterConstraint::Type { .. } => None,
+                ComptimeParameterConstraint::Interface(interface) => {
+                    Some(self.resolve_type(interface))
+                }
+            };
+            self.record_template_bound(parameter.id, bound, parameter.span);
+        }
+
+        if let Some(where_clause) = &function.where_clause {
+            for constraint in &where_clause.constraints {
+                let bound = match &constraint.interface {
+                    InterfaceConstraint::Named(interface) => self.resolve_type(interface),
+                    InterfaceConstraint::Anonymous { requirements, .. } => {
+                        let interface = self
+                            .types
+                            .interface(constraint.id, AccessCapability::Const);
+                        self.declaration_types.insert(constraint.id, interface);
+                        for requirement in requirements {
+                            self.visit_interface_requirement(requirement);
+                        }
+                        interface
+                    }
+                };
+                let parameter = self
+                    .names
+                    .symbol_for_reference(constraint.id)
+                    .expect("where constraint must resolve its template parameter");
+                let symbolic = self
+                    .environments
+                    .last()
+                    .and_then(|environment| environment.get(&parameter))
+                    .copied()
+                    .expect("where constraint must target a compile-time parameter");
+                self.validate_template_bound(symbolic, Some(bound), constraint.span);
+            }
+        }
+
+        self.visit_parameters(&function.parameters);
+        if let Some(return_type) = &function.return_type {
+            self.resolve_type(return_type);
+        }
+        self.visit_block(&function.body);
+        self.environments.pop();
+    }
+
+    fn record_template_bound(
+        &mut self,
+        parameter: NodeId,
+        bound: Option<TypeId>,
+        span: Span,
+    ) {
+        let symbol = self
+            .names
+            .symbol_for_declaration(parameter)
+            .expect("compile-time parameter must have a resolved symbol");
+        let symbolic = self
+            .environments
+            .last()
+            .and_then(|environment| environment.get(&symbol))
+            .copied()
+            .expect("runtime template environment must contain its parameter");
+        self.validate_template_bound(symbolic, bound, span);
+    }
+
+    fn validate_template_bound(
+        &mut self,
+        symbolic: TypeId,
+        bound: Option<TypeId>,
+        span: Span,
+    ) {
+        let declaration = match self.types.get(symbolic) {
+            Some(SemanticType::TemplateParameter { declaration, .. }) => *declaration,
+            _ => unreachable!("runtime template environment contains only parameter types"),
+        };
+        if let Some(bound) = bound
+            && !self.is_plain_interface_type(bound)
+        {
+            self.error(TypeResolutionErrorKind::InvalidTemplateConstraint, span);
+            self.insert_template_bound(declaration, None);
+        } else {
+            self.insert_template_bound(declaration, bound);
+        }
+    }
+
+    fn insert_template_bound(&mut self, declaration: NodeId, bound: Option<TypeId>) {
+        if let Some(owner) = self.current_specialized_owner {
+            self.specialized_template_parameter_bounds
+                .insert((owner, declaration), bound);
+        } else {
+            self.template_parameter_bounds.insert(declaration, bound);
+        }
     }
 
     fn visit_parameters(&mut self, parameters: &[FunctionParameter]) {
@@ -517,6 +728,12 @@ impl<'source, 'names> Resolver<'source, 'names> {
                         function.name,
                     );
                 } else {
+                    if self.is_runtime_template(function) {
+                        self.error(
+                            TypeResolutionErrorKind::InvalidRuntimeTemplateDeclaration,
+                            function.name,
+                        );
+                    }
                     self.visit_function(function);
                 }
             }
@@ -976,7 +1193,19 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 StructMember::Function(function) if self.is_type_factory(function) => {
                     self.validate_type_factory_signature(function);
                 }
-                StructMember::Function(function) => self.resolve_specialized_function(type_id, function),
+                StructMember::Function(function) => {
+                    if self.is_runtime_template(function)
+                        && !function.parameters.iter().any(|parameter| {
+                            matches!(&parameter.kind, FunctionParameterKind::Receiver { .. })
+                        })
+                    {
+                        self.error(
+                            TypeResolutionErrorKind::InvalidRuntimeTemplateDeclaration,
+                            function.name,
+                        );
+                    }
+                    self.resolve_specialized_function(type_id, function);
+                }
             }
         }
         self.generated_structs
@@ -988,6 +1217,11 @@ impl<'source, 'names> Resolver<'source, 'names> {
 
     fn resolve_specialized_function(&mut self, owner: TypeId, function: &Function) {
         let previous = self.current_specialized_owner.replace(owner);
+        if self.is_runtime_template(function) {
+            self.visit_runtime_template(function);
+            self.current_specialized_owner = previous;
+            return;
+        }
         for parameter in &function.parameters {
             if let FunctionParameterKind::Named { type_annotation, .. } = &parameter.kind {
                 let resolved = self.resolve_type(type_annotation);
@@ -1675,5 +1909,84 @@ mod tests {
                 error.kind == TypeResolutionErrorKind::ExpandingTypeFactoryInstantiation
             })
         ));
+    }
+
+    #[test]
+    fn preserves_symbolic_template_parameters_and_interface_bounds() {
+        let (program, resolution) = resolve(concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "interface Writer { fn write(self, value: int); }\n",
+            "fn inspect(comptime T: type, value: T) -> T\n",
+            "where T: Reader & Writer, { value }\n",
+            "fn main() {}\n",
+        ));
+        let inspect = top_level_function(&program, 2);
+        let value = inspect
+            .parameters
+            .iter()
+            .find_map(|parameter| match &parameter.kind {
+                FunctionParameterKind::Named { type_annotation, .. } => Some(type_annotation),
+                _ => None,
+            })
+            .expect("template must have a runtime parameter");
+        let symbolic = resolution
+            .type_for_syntax(value.id)
+            .expect("runtime use of T must resolve");
+        assert!(matches!(
+            resolution.types().get(symbolic),
+            Some(SemanticType::TemplateParameter { .. })
+        ));
+        let bound = resolution
+            .template_parameter_bound(symbolic)
+            .flatten()
+            .expect("where clause must record a bound");
+        assert!(matches!(
+            resolution.types().get(bound),
+            Some(SemanticType::Intersection { members, .. }) if members.len() == 2
+        ));
+        assert_eq!(
+            resolution.type_for_syntax(inspect.return_type.as_ref().unwrap().id),
+            Some(symbolic)
+        );
+    }
+
+    #[test]
+    fn rejects_runtime_templates_outside_supported_declarations() {
+        let (module, program) = parse(concat!(
+            "struct Item { fn associated(comptime T: type, value: T) {} }\n",
+            "fn main() { fn local(comptime T: type, value: T) {} }\n",
+        ));
+        let names = resolve_program(&module, &program).expect("template names should resolve");
+        let errors = resolve_types(&module, &program, &names)
+            .expect_err("associated and local runtime templates are deferred");
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| {
+                    error.kind == TypeResolutionErrorKind::InvalidRuntimeTemplateDeclaration
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_non_interface_bounds_and_type_returning_requirements() {
+        let (module, program) = parse(concat!(
+            "struct Item {}\n",
+            "type ItemAlias = Item;\n",
+            "interface Invalid { fn make(self) -> type; }\n",
+            "fn inspect(comptime T: type, value: T) where T: ItemAlias {}\n",
+            "fn main() {}\n",
+        ));
+        let names = resolve_program(&module, &program).expect("constraint names should resolve");
+        let errors = resolve_types(&module, &program, &names)
+            .expect_err("bounds and requirements must remain interface-only and runtime-only");
+        assert!(errors.iter().any(|error| {
+            error.kind == TypeResolutionErrorKind::InvalidTemplateConstraint
+        }));
+        assert!(errors.iter().any(|error| {
+            error.kind == TypeResolutionErrorKind::InvalidInterfaceRequirementType
+        }));
     }
 }

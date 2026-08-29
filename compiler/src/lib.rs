@@ -47,12 +47,19 @@ fn Box(comptime T: type) -> type {
 
 type IntBox = Box(int);
 
-fn inspect_inline(comptime T: Formatter) {}
+fn inspect_inline(comptime T: Formatter, value: T) -> string {
+    value.format("inline: ")
+}
 
-fn inspect_named(comptime T: type) where T: Formatter {}
+fn inspect_named(comptime T: type, value: T) -> string
+where T: Formatter, {
+    value.format("named: ")
+}
 
-fn inspect_private(comptime T: type)
-where T: interface { fn format(self, prefix: string) -> string; }, {}
+fn inspect_private(comptime T: type, value: T) -> string
+where T: interface { fn format(self, prefix: string) -> string; }, {
+    value.format("private: ")
+}
 
 struct Summary {
     name: string,
@@ -70,6 +77,10 @@ struct Summary {
 
     fn format(&self, prefix: string) -> string {
         prefix + self.name
+    }
+
+    fn format_with(self, comptime T: Formatter, formatter: T) -> string {
+        formatter.format(self.name)
     }
 }
 

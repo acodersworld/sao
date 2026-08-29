@@ -5,14 +5,14 @@
 //! and interns owner-independent method identities. It deliberately does not
 //! type-check executable expressions.
 
-use std::{collections::HashMap, fmt};
+use std::{collections::{HashMap, HashSet}, fmt};
 
 use crate::{
     ast::{
         AnonymousStructMember, Block, BuiltinType, ConditionalElse, Declaration, Expression,
         ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
-        InterfaceMethodRequirement, NodeId, PrimitiveType, Program, ReceiverStorage, Statement,
-        StatementKind, StructMember, TypeKind, TypeSyntax,
+        InterfaceConstraint, InterfaceMethodRequirement, NodeId, PrimitiveType, Program,
+        ReceiverStorage, Statement, StatementKind, StructMember, TypeKind, TypeSyntax,
     },
     context_resolution::{CallableKind, ContextResolution},
     name_resolution::NameResolution,
@@ -631,6 +631,7 @@ fn find_nested_type(type_syntax: &TypeSyntax, target: NodeId) -> Option<&TypeSyn
 pub struct SignatureCollection {
     callables: HashMap<NodeId, CallableSignature>,
     callable_value_types: HashMap<SymbolId, TypeId>,
+    runtime_templates: HashSet<NodeId>,
     named_structs: HashMap<NodeId, StructSignature>,
     anonymous_structs: HashMap<NodeId, StructSignature>,
     generated_structs: HashMap<TypeId, StructSignature>,
@@ -649,6 +650,13 @@ impl SignatureCollection {
     #[must_use]
     pub fn callable_value_type(&self, symbol: SymbolId) -> Option<TypeId> {
         self.callable_value_types.get(&symbol).copied()
+    }
+
+    /// Returns whether a callable declaration still requires explicit type
+    /// arguments and therefore cannot be used as an ordinary callable value.
+    #[must_use]
+    pub fn is_runtime_template(&self, declaration: NodeId) -> bool {
+        self.runtime_templates.contains(&declaration)
     }
 
     #[must_use]
@@ -797,6 +805,7 @@ struct Collector<'source, 'semantic> {
     types: &'semantic mut TypeResolution,
     callables: HashMap<NodeId, CallableSignature>,
     callable_value_types: HashMap<SymbolId, TypeId>,
+    runtime_templates: HashSet<NodeId>,
     named_structs: HashMap<NodeId, StructSignature>,
     anonymous_structs: HashMap<NodeId, StructSignature>,
     generated_structs: HashMap<TypeId, StructSignature>,
@@ -822,6 +831,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             types,
             callables: HashMap::new(),
             callable_value_types: HashMap::new(),
+            runtime_templates: HashSet::new(),
             named_structs: HashMap::new(),
             anonymous_structs: HashMap::new(),
             generated_structs: HashMap::new(),
@@ -845,6 +855,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             Ok(SignatureCollection {
                 callables: self.callables,
                 callable_value_types: self.callable_value_types,
+                runtime_templates: self.runtime_templates,
                 named_structs: self.named_structs,
                 anonymous_structs: self.anonymous_structs,
                 generated_structs: self.generated_structs,
@@ -910,6 +921,12 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     }
                     StructMember::Function(function) => {
                         self.reject_reserved_copy(function.name);
+                        self.collect_template_constraints(function);
+                        if function.parameters.iter().any(|parameter| {
+                            matches!(&parameter.kind, FunctionParameterKind::Comptime { .. })
+                        }) {
+                            self.runtime_templates.insert(function.id);
+                        }
                         let name = self.text(function.name).to_string();
                         let kind = match self.context.callable_kind(function.id) {
                             Some(CallableKind::GeneratedStructMethod) => {
@@ -1030,6 +1047,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                 {
                     return;
                 }
+                self.collect_template_constraints(function);
                 self.collect_function_header(function);
                 if self.text(function.name) == "main" {
                     self.validate_main(function);
@@ -1112,6 +1130,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                         );
                         continue;
                     }
+                    self.collect_template_constraints(function);
                     let signature = self.collect_function_header(function);
                     let kind = match self.context.callable_kind(function.id) {
                         Some(CallableKind::NamedStructMethod) => {
@@ -1158,10 +1177,16 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
     }
 
     fn collect_function_header(&mut self, function: &Function) -> CallableSignature {
+        let is_template = function.parameters.iter().any(|parameter| {
+            matches!(&parameter.kind, FunctionParameterKind::Comptime { .. })
+        });
+        if is_template {
+            self.runtime_templates.insert(function.id);
+        }
         let signature = self.source_signature(&function.parameters, function.return_type.as_ref());
         self.callables.insert(function.id, signature.clone());
 
-        if matches!(
+        if !is_template && matches!(
             self.context.callable_kind(function.id),
             Some(CallableKind::TopLevelFunction | CallableKind::NestedFunction)
         ) {
@@ -1173,6 +1198,50 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             self.callable_value_types.insert(symbol, type_id);
         }
         signature
+    }
+
+    /// Materializes private anonymous `where` interfaces in the same method
+    /// dictionary used by declared interfaces. Named and intersection bounds
+    /// already refer to signatures collected from their declarations.
+    fn collect_template_constraints(&mut self, function: &Function) {
+        let Some(where_clause) = &function.where_clause else {
+            return;
+        };
+        for constraint in &where_clause.constraints {
+            let InterfaceConstraint::Anonymous { requirements, .. } = &constraint.interface else {
+                continue;
+            };
+            if self.interfaces.contains_key(&constraint.id) {
+                continue;
+            }
+            let type_id = self
+                .types
+                .type_for_declaration(constraint.id)
+                .expect("anonymous template constraint must have a semantic interface type");
+            let mut collected = HashMap::new();
+            let mut requirement_order = Vec::new();
+            for requirement in requirements {
+                self.reject_reserved_copy(requirement.name);
+                let signature = self.collect_interface_requirement(requirement);
+                let method_id = self.intern_method(requirement.name, &signature);
+                let name = self.text(requirement.name).to_string();
+                requirement_order.push(name.clone());
+                let entry = InterfaceRequirementSignature {
+                    declaration: requirement.id,
+                    method_id,
+                    span: requirement.name,
+                };
+                self.insert_interface_requirement(&mut collected, name, entry);
+            }
+            self.interfaces.insert(
+                constraint.id,
+                InterfaceSignature {
+                    type_id,
+                    requirements: collected,
+                    requirement_order,
+                },
+            );
+        }
     }
 
     fn collect_interface_requirement(
