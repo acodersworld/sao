@@ -35,6 +35,18 @@ interface Accumulator {
 
 type SummaryAlias = Summary;
 
+fn Box(comptime T: type) -> type {
+    struct {
+        inner: T,
+
+        fn get(self) -> T {
+            self.inner
+        }
+    }
+}
+
+type IntBox = Box(int);
+
 fn inspect_inline(comptime T: Formatter) {}
 
 fn inspect_named(comptime T: type) where T: Formatter {}
@@ -82,7 +94,7 @@ fn worker(value: int) {
     yield();
 }
 
-fn checked(value: int) -> Error<int> {
+fn checked(value: int) -> Error(int) {
     Error::new(value)
 }
 
@@ -162,10 +174,10 @@ fn main() {
     const formatter_view: Formatter = formatter_choice;
     const optional: int | none = none;
 
-    const queue: Queue<int> = Queue<int>::new();
-    const vector: Vector<int> = Vector<int>::new();
-    const table: Map<string, int> = Map<string, int>::new();
-    const failure: Error<int> = checked(initial);
+    const queue: Queue(int) = Queue(int)::new();
+    const vector: Vector(int) = Vector(int)::new();
+    const table: Map(string, int) = Map(string, int)::new();
+    const failure: Error(int) = checked(initial);
     const recovered = failure?;
 
     const integer = 1.5: int;
@@ -191,6 +203,7 @@ fn main() {
     const flags = (calculated << 1) | (initial & 1) ^ 2;
     const comparison = calculated >= initial && truth || false;
     const formatted = f"{{total}} {summary.name:<20}: {calculated:+08} ({decimal:.2f})";
+    const boxed: IntBox = Box(int) { inner: calculated };
 
     summary.total = calculated;
     summary.total += recovered;
@@ -210,6 +223,7 @@ fn main() {
     character;
     announce(character_code);
     println(formatted);
+    announce(boxed.get());
     heap_formatter.format(text);
     heap_scale(initial);
     notify();

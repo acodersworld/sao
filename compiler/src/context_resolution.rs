@@ -13,7 +13,7 @@ use crate::{
         AnonymousStructMember, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
         FormattedStringPart,
         Function, FunctionParameter, FunctionParameterKind, InterfaceMethodRequirement, NodeId,
-        Program, Statement, StatementKind, StructMember,
+        Program, Statement, StatementKind, StructMember, TypeKind, TypeSyntax,
     },
     source::Span,
 };
@@ -25,6 +25,8 @@ pub enum CallableKind {
     NamedStructAssociatedFunction,
     NamedStructMethod,
     AnonymousStructMethod,
+    GeneratedStructMethod,
+    GeneratedStructAssociatedFunction,
     Lambda,
     InterfaceRequirement,
 }
@@ -341,7 +343,9 @@ impl ContextResolver {
     fn visit_function(&mut self, function: &Function, kind: CallableKind) {
         let establishes_self_context = matches!(
             kind,
-            CallableKind::NamedStructMethod | CallableKind::AnonymousStructMethod
+            CallableKind::NamedStructMethod
+                | CallableKind::AnonymousStructMethod
+                | CallableKind::GeneratedStructMethod
         );
         self.callable_kinds.insert(function.id, kind);
         self.enter_callable(function.id, establishes_self_context, &function.body);
@@ -444,6 +448,7 @@ impl ContextResolver {
     fn visit_expression(&mut self, expression: &Expression) {
         match &expression.kind {
             ExpressionKind::Identifier | ExpressionKind::Literal(_) => {}
+            ExpressionKind::TypeValue(type_syntax) => self.visit_type(type_syntax),
             ExpressionKind::FormattedString { parts } => {
                 for part in parts {
                     if let FormattedStringPart::Interpolation { value, .. } = part {
@@ -511,7 +516,8 @@ impl ContextResolver {
                 self.enter_callable(expression.id, false, body);
             }
             ExpressionKind::GcAllocate(value) => self.visit_expression(value),
-            ExpressionKind::StructConstruction { fields, .. } => {
+            ExpressionKind::StructConstruction { owner, fields } => {
+                self.visit_type(owner);
                 for field in fields {
                     self.visit_expression(&field.value);
                 }
@@ -584,6 +590,59 @@ impl ContextResolver {
         self.loop_stack.push(id);
         self.visit_block(body);
         self.loop_stack.pop();
+    }
+
+    fn visit_type(&mut self, type_syntax: &TypeSyntax) {
+        match &type_syntax.kind {
+            TypeKind::GeneratedStruct { members } => {
+                for member in members {
+                    if let StructMember::Function(function) = member {
+                        let has_receiver = self.validate_receivers(
+                            function.name,
+                            &function.parameters,
+                            ReceiverPolicy::OptionalFirst,
+                        );
+                        let kind = if has_receiver {
+                            CallableKind::GeneratedStructMethod
+                        } else {
+                            CallableKind::GeneratedStructAssociatedFunction
+                        };
+                        self.visit_function(function, kind);
+                    }
+                }
+            }
+            TypeKind::Associated {
+                owner, arguments, ..
+            } => {
+                self.visit_type(owner);
+                for argument in arguments {
+                    self.visit_type(argument);
+                }
+            }
+            TypeKind::Builtin { arguments, .. } | TypeKind::Named { arguments, .. } => {
+                for argument in arguments {
+                    self.visit_type(argument);
+                }
+            }
+            TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+                self.visit_type(inner);
+            }
+            TypeKind::Callable {
+                parameters,
+                return_type,
+            } => {
+                for parameter in parameters {
+                    self.visit_type(parameter);
+                }
+                self.visit_type(return_type);
+            }
+            TypeKind::Intersection { members } | TypeKind::Union { members } => {
+                for member in members {
+                    self.visit_type(member);
+                }
+            }
+            TypeKind::ComptimeType | TypeKind::Primitive(_) => {}
+        }
     }
 
     fn error(&mut self, kind: ContextResolutionErrorKind, span: Span) {
@@ -922,7 +981,7 @@ mod tests {
         let valid = parse(concat!(
             "struct Named {\n",
             "    field: int,\n",
-            "    fn method(mut self, object: Named, items: Vector<int>, index: int) {\n",
+            "    fn method(mut self, object: Named, items: Vector(int), index: int) {\n",
             "        object = self;\n",
             "        self.field = 1;\n",
             "        (object).field = 2;\n",

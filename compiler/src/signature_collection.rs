@@ -12,7 +12,7 @@ use crate::{
         AnonymousStructMember, Block, BuiltinType, ConditionalElse, Declaration, Expression,
         ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
         InterfaceMethodRequirement, NodeId, PrimitiveType, Program, ReceiverStorage, Statement,
-        StatementKind, StructMember,
+        StatementKind, StructMember, TypeKind, TypeSyntax,
     },
     context_resolution::{CallableKind, ContextResolution},
     name_resolution::NameResolution,
@@ -74,6 +74,9 @@ pub enum StructMemberSignatureKind {
         method_id: MethodId,
     },
     AssociatedFunction {
+        declaration: NodeId,
+    },
+    AssociatedTypeFactory {
         declaration: NodeId,
     },
 }
@@ -546,6 +549,83 @@ fn callable(
     }
 }
 
+fn find_type_syntax(program: &Program, target: NodeId) -> Option<&TypeSyntax> {
+    for declaration in &program.declarations {
+        match declaration {
+            Declaration::Function(function) => {
+                if let Some(found) = find_type_in_factory(function, target) {
+                    return Some(found);
+                }
+            }
+            Declaration::Struct(structure) => {
+                for member in &structure.members {
+                    if let StructMember::Function(function) = member
+                        && let Some(found) = find_type_in_factory(function, target)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+            Declaration::Interface(_) | Declaration::TypeAlias(_) => {}
+        }
+    }
+    None
+}
+
+fn find_type_in_factory(function: &Function, target: NodeId) -> Option<&TypeSyntax> {
+    if let Some(value) = &function.body.value
+        && let ExpressionKind::TypeValue(type_syntax) = &value.kind
+    {
+        return find_nested_type(type_syntax, target);
+    }
+    for statement in &function.body.statements {
+        if let StatementKind::Return(Some(value)) = &statement.kind
+            && let ExpressionKind::TypeValue(type_syntax) = &value.kind
+        {
+            return find_nested_type(type_syntax, target);
+        }
+    }
+    None
+}
+
+fn find_nested_type(type_syntax: &TypeSyntax, target: NodeId) -> Option<&TypeSyntax> {
+    if type_syntax.id == target {
+        return Some(type_syntax);
+    }
+    match &type_syntax.kind {
+        TypeKind::Builtin { arguments, .. } | TypeKind::Named { arguments, .. } => {
+            arguments
+                .iter()
+                .find_map(|argument| find_nested_type(argument, target))
+        }
+        TypeKind::GeneratedStruct { members } => members.iter().find_map(|member| match member {
+            StructMember::Field(field) => find_nested_type(&field.type_annotation, target),
+            StructMember::Function(function) => find_type_in_factory(function, target),
+        }),
+        TypeKind::Associated {
+            owner, arguments, ..
+        } => find_nested_type(owner, target).or_else(|| {
+            arguments
+                .iter()
+                .find_map(|argument| find_nested_type(argument, target))
+        }),
+        TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+            find_nested_type(inner, target)
+        }
+        TypeKind::Callable {
+            parameters,
+            return_type,
+        } => parameters
+            .iter()
+            .find_map(|parameter| find_nested_type(parameter, target))
+            .or_else(|| find_nested_type(return_type, target)),
+        TypeKind::Intersection { members } | TypeKind::Union { members } => members
+            .iter()
+            .find_map(|member| find_nested_type(member, target)),
+        TypeKind::ComptimeType | TypeKind::Primitive(_) => None,
+    }
+}
+
 /// Semantic declaration metadata produced before expression type checking.
 #[derive(Debug)]
 pub struct SignatureCollection {
@@ -553,6 +633,8 @@ pub struct SignatureCollection {
     callable_value_types: HashMap<SymbolId, TypeId>,
     named_structs: HashMap<NodeId, StructSignature>,
     anonymous_structs: HashMap<NodeId, StructSignature>,
+    generated_structs: HashMap<TypeId, StructSignature>,
+    specialized_callables: HashMap<(TypeId, NodeId), CallableSignature>,
     interfaces: HashMap<NodeId, InterfaceSignature>,
     method_signatures: Vec<MethodSignature>,
     builtins: BuiltinSignatures,
@@ -577,6 +659,20 @@ impl SignatureCollection {
     #[must_use]
     pub fn anonymous_struct(&self, expression: NodeId) -> Option<&StructSignature> {
         self.anonymous_structs.get(&expression)
+    }
+
+    #[must_use]
+    pub fn generated_struct(&self, type_id: TypeId) -> Option<&StructSignature> {
+        self.generated_structs.get(&type_id)
+    }
+
+    #[must_use]
+    pub fn specialized_callable(
+        &self,
+        owner: TypeId,
+        declaration: NodeId,
+    ) -> Option<&CallableSignature> {
+        self.specialized_callables.get(&(owner, declaration))
     }
 
     #[must_use]
@@ -612,6 +708,11 @@ impl SignatureCollection {
     #[must_use]
     pub const fn anonymous_structs(&self) -> &HashMap<NodeId, StructSignature> {
         &self.anonymous_structs
+    }
+
+    #[must_use]
+    pub const fn generated_structs(&self) -> &HashMap<TypeId, StructSignature> {
+        &self.generated_structs
     }
 
     #[must_use]
@@ -698,6 +799,8 @@ struct Collector<'source, 'semantic> {
     callable_value_types: HashMap<SymbolId, TypeId>,
     named_structs: HashMap<NodeId, StructSignature>,
     anonymous_structs: HashMap<NodeId, StructSignature>,
+    generated_structs: HashMap<TypeId, StructSignature>,
+    specialized_callables: HashMap<(TypeId, NodeId), CallableSignature>,
     interfaces: HashMap<NodeId, InterfaceSignature>,
     method_ids: HashMap<MethodSignature, MethodId>,
     method_signatures: Vec<MethodSignature>,
@@ -721,6 +824,8 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             callable_value_types: HashMap::new(),
             named_structs: HashMap::new(),
             anonymous_structs: HashMap::new(),
+            generated_structs: HashMap::new(),
+            specialized_callables: HashMap::new(),
             interfaces: HashMap::new(),
             method_ids: HashMap::new(),
             method_signatures: Vec::new(),
@@ -734,6 +839,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
         for declaration in &program.declarations {
             self.visit_declaration(declaration);
         }
+        self.collect_generated_structs(program);
 
         if self.errors.is_empty() {
             Ok(SignatureCollection {
@@ -741,6 +847,8 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                 callable_value_types: self.callable_value_types,
                 named_structs: self.named_structs,
                 anonymous_structs: self.anonymous_structs,
+                generated_structs: self.generated_structs,
+                specialized_callables: self.specialized_callables,
                 interfaces: self.interfaces,
                 method_signatures: self.method_signatures,
                 builtins: self.builtins,
@@ -770,9 +878,158 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
         }
     }
 
+    fn collect_generated_structs(&mut self, program: &Program) {
+        let instances: Vec<_> = self
+            .types
+            .generated_structs()
+            .values()
+            .cloned()
+            .collect();
+        for instance in instances {
+            let Some(TypeKind::GeneratedStruct { members }) =
+                find_type_syntax(program, instance.template).map(|syntax| &syntax.kind)
+            else {
+                continue;
+            };
+            let mut collected = HashMap::new();
+            let mut field_order = Vec::new();
+            for member in members {
+                match member {
+                    StructMember::Field(field) => {
+                        self.reject_reserved_copy(field.name);
+                        let name = self.text(field.name).to_string();
+                        field_order.push(name.clone());
+                        let entry = StructMemberSignature {
+                            kind: StructMemberSignatureKind::Field(FieldSignature {
+                                declaration: field.id,
+                                type_id: instance.field_types.get(&field.id).copied(),
+                            }),
+                            span: field.name,
+                        };
+                        self.insert_struct_member(&mut collected, name, entry);
+                    }
+                    StructMember::Function(function) => {
+                        self.reject_reserved_copy(function.name);
+                        let name = self.text(function.name).to_string();
+                        let kind = match self.context.callable_kind(function.id) {
+                            Some(CallableKind::GeneratedStructMethod) => {
+                                let signature =
+                                    self.specialized_source_signature(instance.type_id, function);
+                                let method_id = self.intern_method(function.name, &signature);
+                                self.specialized_callables
+                                    .insert((instance.type_id, function.id), signature);
+                                StructMemberSignatureKind::Method {
+                                    declaration: function.id,
+                                    method_id,
+                                }
+                            }
+                            Some(CallableKind::GeneratedStructAssociatedFunction) => {
+                                if function
+                                    .return_type
+                                    .as_ref()
+                                    .is_some_and(|return_type| matches!(&return_type.kind, TypeKind::ComptimeType))
+                                {
+                                    StructMemberSignatureKind::AssociatedTypeFactory {
+                                        declaration: function.id,
+                                    }
+                                } else {
+                                    let signature = self
+                                        .specialized_source_signature(instance.type_id, function);
+                                    self.specialized_callables
+                                        .insert((instance.type_id, function.id), signature);
+                                    StructMemberSignatureKind::AssociatedFunction {
+                                        declaration: function.id,
+                                    }
+                                }
+                            }
+                            _ => continue,
+                        };
+                        self.insert_struct_member(
+                            &mut collected,
+                            name,
+                            StructMemberSignature {
+                                kind,
+                                span: function.name,
+                            },
+                        );
+                    }
+                }
+            }
+            self.generated_structs.insert(
+                instance.type_id,
+                StructSignature {
+                    type_id: instance.type_id,
+                    members: collected,
+                    field_order,
+                },
+            );
+        }
+    }
+
+    fn specialized_source_signature(
+        &mut self,
+        owner: TypeId,
+        function: &Function,
+    ) -> CallableSignature {
+        let mut receiver = None;
+        let mut parameters = Vec::new();
+        for parameter in &function.parameters {
+            match &parameter.kind {
+                FunctionParameterKind::Receiver { storage, .. } => {
+                    receiver = Some(ReceiverSignature {
+                        storage: *storage,
+                        capability: parameter.qualifiers.value.into(),
+                    });
+                }
+                FunctionParameterKind::Named { type_annotation, .. } => {
+                    let resolved = match self
+                        .types
+                        .specialized_type_for_syntax(owner, type_annotation.id)
+                    {
+                        Some(resolved) => resolved,
+                        None => self.resolved_type(type_annotation.id),
+                    };
+                    let resolved = self
+                        .types
+                        .types_mut()
+                        .with_capability(resolved, parameter.qualifiers.value.into())
+                        .expect("specialized parameter type belongs to the program store");
+                    parameters.push(resolved);
+                }
+                FunctionParameterKind::Comptime { .. } => {}
+            }
+        }
+        let return_type = match &function.return_type {
+            None => {
+                self.types
+                    .types_mut()
+                    .primitive(PrimitiveType::Unit, AccessCapability::Const)
+            },
+            Some(return_type) => match self
+                .types
+                .specialized_type_for_syntax(owner, return_type.id)
+            {
+                Some(resolved) => resolved,
+                None => self.resolved_type(return_type.id),
+            },
+        };
+        CallableSignature {
+            receiver,
+            parameters,
+            return_type,
+        }
+    }
+
     fn visit_declaration(&mut self, declaration: &Declaration) {
         match declaration {
             Declaration::Function(function) => {
+                if function
+                    .return_type
+                    .as_ref()
+                    .is_some_and(|return_type| matches!(&return_type.kind, TypeKind::ComptimeType))
+                {
+                    return;
+                }
                 self.collect_function_header(function);
                 if self.text(function.name) == "main" {
                     self.validate_main(function);
@@ -837,6 +1094,24 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                 }
                 StructMember::Function(function) => {
                     self.reject_reserved_copy(function.name);
+                    if function
+                        .return_type
+                        .as_ref()
+                        .is_some_and(|return_type| matches!(&return_type.kind, TypeKind::ComptimeType))
+                    {
+                        let name = self.text(function.name).to_string();
+                        self.insert_struct_member(
+                            &mut members,
+                            name,
+                            StructMemberSignature {
+                                kind: StructMemberSignatureKind::AssociatedTypeFactory {
+                                    declaration: function.id,
+                                },
+                                span: function.name,
+                            },
+                        );
+                        continue;
+                    }
                     let signature = self.collect_function_header(function);
                     let kind = match self.context.callable_kind(function.id) {
                         Some(CallableKind::NamedStructMethod) => {
@@ -1043,6 +1318,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
         match &expression.kind {
             ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {
             }
+            ExpressionKind::TypeValue(_) => {}
             ExpressionKind::FormattedString { parts } => {
                 for part in parts {
                     if let FormattedStringPart::Interpolation { value, .. } = part {
@@ -1666,6 +1942,78 @@ mod tests {
         assert!(matches!(
             types.types().get(instantiated.return_type),
             Some(SemanticType::Union { members, .. }) if members.len() == 2
+        ));
+    }
+
+    #[test]
+    fn specializes_generated_struct_fields_methods_and_associated_members() {
+        let source = concat!(
+            "fn Box(comptime T: type) -> type {\n",
+            "    struct {\n",
+            "        inner: T,\n",
+            "        fn get(self) -> T { self.inner }\n",
+            "        fn make(value: T) -> Box(T) { Box(T) { inner: value } }\n",
+            "        fn Pair(comptime U: type) -> type { struct { left: T, right: U, } }\n",
+            "    }\n",
+            "}\n",
+            "type IntBox = Box(int);\n",
+            "fn main() {}",
+        );
+        let (module, program, names, context, mut types) = prepare(source);
+        let signatures = collect(&module, &program, &names, &context, &mut types);
+        assert_eq!(signatures.generated_structs().len(), 1);
+        let (&owner, generated) = signatures
+            .generated_structs()
+            .iter()
+            .next()
+            .expect("Box(int) must be materialized");
+
+        let Some(StructMemberSignature {
+            kind: StructMemberSignatureKind::Field(FieldSignature {
+                type_id: Some(inner),
+                ..
+            }),
+            ..
+        }) = generated.member("inner")
+        else {
+            panic!("expected generated inner field")
+        };
+        assert!(matches!(
+            types.types().get(*inner),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                ..
+            })
+        ));
+
+        let Some(StructMemberSignature {
+            kind: StructMemberSignatureKind::Method { declaration, .. },
+            ..
+        }) = generated.member("get")
+        else {
+            panic!("expected generated get method")
+        };
+        let get = signatures
+            .specialized_callable(owner, *declaration)
+            .expect("get must have a specialized signature");
+        assert!(get.receiver.is_some());
+        assert_eq!(get.return_type, *inner);
+
+        let Some(StructMemberSignature {
+            kind: StructMemberSignatureKind::AssociatedFunction { declaration },
+            ..
+        }) = generated.member("make")
+        else {
+            panic!("expected generated make function")
+        };
+        let make = signatures
+            .specialized_callable(owner, *declaration)
+            .expect("make must have a specialized signature");
+        assert_eq!(make.parameters, vec![*inner]);
+        assert_eq!(make.return_type, owner);
+        assert!(matches!(
+            generated.member("Pair").map(|member| member.kind),
+            Some(StructMemberSignatureKind::AssociatedTypeFactory { .. })
         ));
     }
 }

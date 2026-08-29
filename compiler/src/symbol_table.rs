@@ -87,6 +87,7 @@ impl std::error::Error for SymbolLookupError {}
 pub enum SymbolKind {
     BuiltinValue,
     Function,
+    TypeFactory,
     Binding,
     Parameter,
     ComptimeParameter,
@@ -199,6 +200,7 @@ impl SymbolTable {
                         existing.kind,
                         SymbolKind::BuiltinValue
                             | SymbolKind::Function
+                            | SymbolKind::TypeFactory
                             | SymbolKind::Struct
                             | SymbolKind::Interface
                             | SymbolKind::TypeAlias
@@ -211,6 +213,7 @@ impl SymbolTable {
                         SymbolKind::Parameter
                             | SymbolKind::ComptimeParameter
                             | SymbolKind::Function
+                            | SymbolKind::TypeFactory
                             | SymbolKind::BuiltinValue
                             | SymbolKind::Struct
                             | SymbolKind::Interface
@@ -284,6 +287,7 @@ impl SymbolTable {
                 | SymbolKind::Interface
                 | SymbolKind::TypeAlias
                 | SymbolKind::ComptimeParameter
+                | SymbolKind::TypeFactory
         ) {
             Ok(symbol)
         } else {

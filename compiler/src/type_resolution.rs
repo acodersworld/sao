@@ -15,7 +15,7 @@ use crate::{
         AnonymousStructMember, Block, BuiltinType, ConditionalElse, Declaration, Expression,
         ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
         InterfaceMethodRequirement, NodeId, PrimitiveType, Program, Statement, StatementKind,
-        StructMember, TypeKind, TypeSyntax,
+        StructMember, TypeAliasDeclaration, TypeKind, TypeSyntax,
     },
     name_resolution::NameResolution,
     semantic_types::{AccessCapability, SemanticType, TypeId, TypeStore},
@@ -29,6 +29,19 @@ pub struct TypeResolution {
     types: TypeStore,
     syntax_types: HashMap<NodeId, TypeId>,
     declaration_types: HashMap<NodeId, TypeId>,
+    generated_structs: HashMap<TypeId, GeneratedStructInstantiation>,
+    specialized_syntax_types: HashMap<(TypeId, NodeId), TypeId>,
+}
+
+/// One canonical struct materialized from a type-factory body.
+#[derive(Debug, Clone)]
+pub struct GeneratedStructInstantiation {
+    pub type_id: TypeId,
+    pub template: NodeId,
+    pub factory: NodeId,
+    pub arguments: Vec<TypeId>,
+    pub field_types: HashMap<NodeId, TypeId>,
+    pub substitutions: HashMap<SymbolId, TypeId>,
 }
 
 impl TypeResolution {
@@ -68,6 +81,16 @@ impl TypeResolution {
     pub const fn declaration_types(&self) -> &HashMap<NodeId, TypeId> {
         &self.declaration_types
     }
+
+    #[must_use]
+    pub const fn generated_structs(&self) -> &HashMap<TypeId, GeneratedStructInstantiation> {
+        &self.generated_structs
+    }
+
+    #[must_use]
+    pub fn specialized_type_for_syntax(&self, owner: TypeId, syntax: NodeId) -> Option<TypeId> {
+        self.specialized_syntax_types.get(&(owner, syntax)).copied()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +111,16 @@ pub enum TypeResolutionErrorKind {
     },
     QueueElementContainsNone,
     InvalidIntersectionMember,
+    AliasCycle,
+    InvalidTypeFactorySignature,
+    TypeFactoryNotAllowedHere,
+    InvalidTypeFactoryArgumentCount { expected: usize, found: usize },
+    ExpandingTypeFactoryInstantiation,
+    RecursiveTypeFactoryWithoutNominalResult,
+    AssociatedTypeFactoryThroughParameter,
+    GeneratedStructOutsideFactory,
+    InvalidAssociatedTypeFactoryOwner,
+    UnknownAssociatedTypeFactory,
 }
 
 impl fmt::Display for TypeResolutionError {
@@ -115,6 +148,56 @@ impl fmt::Display for TypeResolutionError {
             TypeResolutionErrorKind::InvalidIntersectionMember => write!(
                 formatter,
                 "intersection members must be plain interface types at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::AliasCycle => write!(
+                formatter,
+                "type alias forms a direct or indirect cycle at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::InvalidTypeFactorySignature => write!(
+                formatter,
+                "a type factory may currently declare only unconstrained compile-time type parameters at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::TypeFactoryNotAllowedHere => write!(
+                formatter,
+                "type factories may be declared only at file scope or as receiverless struct members at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::InvalidTypeFactoryArgumentCount { expected, found } => write!(
+                formatter,
+                "type factory expects {expected} type arguments, but {found} were supplied at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::ExpandingTypeFactoryInstantiation => write!(
+                formatter,
+                "type factory recursively requests an expanding specialization at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::RecursiveTypeFactoryWithoutNominalResult => write!(
+                formatter,
+                "recursive type factory must establish a generated nominal type at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::AssociatedTypeFactoryThroughParameter => write!(
+                formatter,
+                "associated type factories cannot be selected through a type parameter at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::GeneratedStructOutsideFactory => write!(
+                formatter,
+                "generated struct types may appear only as type-factory results at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::InvalidAssociatedTypeFactoryOwner => write!(
+                formatter,
+                "associated type factory requires a statically known concrete struct at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::UnknownAssociatedTypeFactory => write!(
+                formatter,
+                "unknown associated type factory at {}..{}",
                 self.span.start, self.span.end
             ),
         }
@@ -151,6 +234,19 @@ struct Resolver<'source, 'names> {
     syntax_types: HashMap<NodeId, TypeId>,
     declaration_types: HashMap<NodeId, TypeId>,
     symbol_types: HashMap<SymbolId, TypeId>,
+    aliases: HashMap<SymbolId, TypeAliasDeclaration>,
+    factories: HashMap<SymbolId, Function>,
+    factories_by_id: HashMap<NodeId, Function>,
+    associated_factories: HashMap<(NodeId, String), Function>,
+    alias_cache: HashMap<SymbolId, TypeId>,
+    alias_stack: Vec<SymbolId>,
+    factory_cache: HashMap<(NodeId, Vec<TypeId>), TypeId>,
+    factory_stack: Vec<(NodeId, Vec<TypeId>)>,
+    environments: Vec<HashMap<SymbolId, TypeId>>,
+    current_factory: Option<(NodeId, Vec<TypeId>)>,
+    current_specialized_owner: Option<TypeId>,
+    generated_structs: HashMap<TypeId, GeneratedStructInstantiation>,
+    specialized_syntax_types: HashMap<(TypeId, NodeId), TypeId>,
     errors: Vec<TypeResolutionError>,
 }
 
@@ -163,11 +259,25 @@ impl<'source, 'names> Resolver<'source, 'names> {
             syntax_types: HashMap::new(),
             declaration_types: HashMap::new(),
             symbol_types: HashMap::new(),
+            aliases: HashMap::new(),
+            factories: HashMap::new(),
+            factories_by_id: HashMap::new(),
+            associated_factories: HashMap::new(),
+            alias_cache: HashMap::new(),
+            alias_stack: Vec::new(),
+            factory_cache: HashMap::new(),
+            factory_stack: Vec::new(),
+            environments: Vec::new(),
+            current_factory: None,
+            current_specialized_owner: None,
+            generated_structs: HashMap::new(),
+            specialized_syntax_types: HashMap::new(),
             errors: Vec::new(),
         }
     }
 
     fn resolve(mut self, program: &Program) -> TypeResolutionResult {
+        self.index_type_declarations(program);
         self.predeclare_nominal_types(program);
         for declaration in &program.declarations {
             self.visit_declaration(declaration);
@@ -178,9 +288,89 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 types: self.types,
                 syntax_types: self.syntax_types,
                 declaration_types: self.declaration_types,
+                generated_structs: self.generated_structs,
+                specialized_syntax_types: self.specialized_syntax_types,
             })
         } else {
             Err(self.errors)
+        }
+    }
+
+    fn index_type_declarations(&mut self, program: &Program) {
+        for declaration in &program.declarations {
+            match declaration {
+                Declaration::TypeAlias(alias) => {
+                    let symbol = self
+                        .names
+                        .symbol_for_declaration(alias.id)
+                        .expect("type alias must have a resolved symbol");
+                    self.aliases.insert(symbol, alias.clone());
+                }
+                Declaration::Function(function)
+                    if function
+                        .return_type
+                        .as_ref()
+                        .is_some_and(|return_type| matches!(&return_type.kind, TypeKind::ComptimeType)) =>
+                {
+                    let symbol = self
+                        .names
+                        .symbol_for_declaration(function.id)
+                        .expect("type factory must have a resolved symbol");
+                    self.factories.insert(symbol, function.clone());
+                    self.factories_by_id.insert(function.id, function.clone());
+                }
+                Declaration::Struct(structure) => {
+                    for member in &structure.members {
+                        if let StructMember::Function(function) = member
+                            && self.is_type_factory(function)
+                        {
+                            let name = self
+                                .module
+                                .text(function.name)
+                                .expect("member name belongs to the source module")
+                                .to_string();
+                            self.associated_factories
+                                .insert((structure.id, name), function.clone());
+                            self.factories_by_id.insert(function.id, function.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for factory in self.factories_by_id.values().cloned().collect::<Vec<_>>() {
+            if let Some(type_syntax) = type_factory_result(&factory)
+                && let TypeKind::GeneratedStruct { members } = &type_syntax.kind
+            {
+                self.index_generated_factories(type_syntax.id, members);
+            }
+        }
+    }
+
+    fn index_generated_factories(
+        &mut self,
+        template: NodeId,
+        members: &[StructMember],
+    ) {
+        for member in members {
+            if let StructMember::Function(function) = member
+                && self.is_type_factory(function)
+            {
+                let name = self
+                    .module
+                    .text(function.name)
+                    .expect("member name belongs to the source module")
+                    .to_string();
+                self.associated_factories
+                    .insert((template, name), function.clone());
+                self.factories_by_id.insert(function.id, function.clone());
+                if let Some(type_syntax) = type_factory_result(function)
+                    && let TypeKind::GeneratedStruct { members } = &type_syntax.kind
+                {
+                    self.index_generated_factories(type_syntax.id, members);
+                }
+            }
         }
     }
 
@@ -209,12 +399,18 @@ impl<'source, 'names> Resolver<'source, 'names> {
 
     fn visit_declaration(&mut self, declaration: &Declaration) {
         match declaration {
+            Declaration::Function(function) if self.is_type_factory(function) => {
+                self.validate_type_factory_signature(function);
+            }
             Declaration::Function(function) => self.visit_function(function),
             Declaration::Struct(structure) => {
                 for member in &structure.members {
                     match member {
                         StructMember::Field(field) => {
                             self.resolve_type(&field.type_annotation);
+                        }
+                        StructMember::Function(function) if self.is_type_factory(function) => {
+                            self.validate_type_factory_signature(function);
                         }
                         StructMember::Function(function) => self.visit_function(function),
                     }
@@ -225,7 +421,39 @@ impl<'source, 'names> Resolver<'source, 'names> {
                     self.visit_interface_requirement(requirement);
                 }
             }
-            Declaration::TypeAlias(_) => {}
+            Declaration::TypeAlias(alias) => {
+                let symbol = self
+                    .names
+                    .symbol_for_declaration(alias.id)
+                    .expect("type alias must have a resolved symbol");
+                let _ = self.resolve_alias(symbol, alias.span);
+            }
+        }
+    }
+
+    fn is_type_factory(&self, function: &Function) -> bool {
+        function
+            .return_type
+            .as_ref()
+            .is_some_and(|return_type| matches!(&return_type.kind, TypeKind::ComptimeType))
+    }
+
+    fn validate_type_factory_signature(&mut self, function: &Function) {
+        let valid = function.where_clause.is_none()
+            && function.parameters.iter().all(|parameter| {
+                matches!(
+                    &parameter.kind,
+                    FunctionParameterKind::Comptime {
+                        constraint: crate::ast::ComptimeParameterConstraint::Type { .. },
+                        ..
+                    }
+                )
+            });
+        if !valid {
+            self.error(
+                TypeResolutionErrorKind::InvalidTypeFactorySignature,
+                function.name,
+            );
         }
     }
 
@@ -282,7 +510,16 @@ impl<'source, 'names> Resolver<'source, 'names> {
             StatementKind::Expression(expression)
             | StatementKind::Defer(expression)
             | StatementKind::Coroutine(expression) => self.visit_expression(expression),
-            StatementKind::Function(function) => self.visit_function(function),
+            StatementKind::Function(function) => {
+                if self.is_type_factory(function) {
+                    self.error(
+                        TypeResolutionErrorKind::TypeFactoryNotAllowedHere,
+                        function.name,
+                    );
+                } else {
+                    self.visit_function(function);
+                }
+            }
             StatementKind::Break(value) | StatementKind::Return(value) => {
                 if let Some(value) = value {
                     self.visit_expression(value);
@@ -295,6 +532,9 @@ impl<'source, 'names> Resolver<'source, 'names> {
     fn visit_expression(&mut self, expression: &Expression) {
         match &expression.kind {
             ExpressionKind::Identifier | ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {
+            }
+            ExpressionKind::TypeValue(type_syntax) => {
+                self.resolve_type(type_syntax);
             }
             ExpressionKind::FormattedString { parts } => {
                 for part in parts {
@@ -360,7 +600,8 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 }
                 self.visit_block(body);
             }
-            ExpressionKind::StructConstruction { fields, .. } => {
+            ExpressionKind::StructConstruction { owner, fields } => {
+                self.resolve_type(owner);
                 for field in fields {
                     self.visit_expression(&field.value);
                 }
@@ -374,7 +615,16 @@ impl<'source, 'names> Resolver<'source, 'names> {
                             }
                             self.visit_expression(&field.initializer);
                         }
-                        AnonymousStructMember::Method(function) => self.visit_function(function),
+                        AnonymousStructMember::Method(function) => {
+                            if self.is_type_factory(function) {
+                                self.error(
+                                    TypeResolutionErrorKind::TypeFactoryNotAllowedHere,
+                                    function.name,
+                                );
+                            } else {
+                                self.visit_function(function);
+                            }
+                        }
                     }
                 }
             }
@@ -437,7 +687,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
 
     fn resolve_type(&mut self, syntax: &TypeSyntax) -> TypeId {
         let resolved = match &syntax.kind {
-            TypeKind::Meta => self.types.recovery(),
+            TypeKind::ComptimeType => self.types.recovery(),
             TypeKind::Primitive(primitive) => {
                 self.types.primitive(*primitive, AccessCapability::Const)
             }
@@ -445,6 +695,14 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 self.resolve_builtin(*builtin, arguments, syntax.span)
             }
             TypeKind::Named { arguments, .. } => self.resolve_named(syntax, arguments),
+            TypeKind::GeneratedStruct { members } => {
+                self.resolve_generated_struct(syntax, members)
+            }
+            TypeKind::Associated {
+                owner,
+                member,
+                arguments,
+            } => self.resolve_associated_factory(owner, *member, arguments, syntax.span),
             TypeKind::Mutable(inner) => {
                 let inner = self.resolve_type(inner);
                 self.types
@@ -481,22 +739,18 @@ impl<'source, 'names> Resolver<'source, 'names> {
         };
 
         self.syntax_types.insert(syntax.id, resolved);
+        if let Some(owner) = self.current_specialized_owner {
+            self.specialized_syntax_types
+                .insert((owner, syntax.id), resolved);
+        }
         resolved
     }
 
     fn resolve_named(&mut self, syntax: &TypeSyntax, arguments: &[TypeSyntax]) -> TypeId {
-        for argument in arguments {
-            self.resolve_type(argument);
-        }
-        if !arguments.is_empty() {
-            self.error(
-                TypeResolutionErrorKind::TypeArgumentsNotSupported {
-                    found: arguments.len(),
-                },
-                syntax.span,
-            );
-            return self.types.recovery();
-        }
+        let resolved_arguments: Vec<_> = arguments
+            .iter()
+            .map(|argument| self.resolve_type(argument))
+            .collect();
 
         let symbol = self
             .names
@@ -509,13 +763,318 @@ impl<'source, 'names> Resolver<'source, 'names> {
             .expect("resolved type symbol must exist")
             .kind
         {
-            SymbolKind::TypeAlias | SymbolKind::ComptimeParameter => self.types.recovery(),
-            SymbolKind::Struct | SymbolKind::Interface => *self
-                .symbol_types
-                .get(&symbol)
-                .expect("nominal type declaration must have been predeclared"),
+            SymbolKind::TypeAlias => {
+                if !arguments.is_empty() {
+                    self.error(
+                        TypeResolutionErrorKind::TypeArgumentsNotSupported {
+                            found: arguments.len(),
+                        },
+                        syntax.span,
+                    );
+                    self.types.recovery()
+                } else {
+                    self.resolve_alias(symbol, syntax.span)
+                }
+            }
+            SymbolKind::ComptimeParameter => {
+                if !arguments.is_empty() {
+                    self.error(
+                        TypeResolutionErrorKind::TypeArgumentsNotSupported {
+                            found: arguments.len(),
+                        },
+                        syntax.span,
+                    );
+                    self.types.recovery()
+                } else {
+                    self.environments
+                        .iter()
+                        .rev()
+                        .find_map(|environment| environment.get(&symbol).copied())
+                        .unwrap_or_else(|| self.types.recovery())
+                }
+            }
+            SymbolKind::TypeFactory => {
+                let factory = self
+                    .factories
+                    .get(&symbol)
+                    .expect("resolved type-factory symbol must be indexed")
+                    .clone();
+                self.instantiate_factory(
+                    &factory,
+                    resolved_arguments,
+                    HashMap::new(),
+                    Vec::new(),
+                    syntax.span,
+                )
+            }
+            SymbolKind::Struct | SymbolKind::Interface => {
+                if !arguments.is_empty() {
+                    self.error(
+                        TypeResolutionErrorKind::TypeArgumentsNotSupported {
+                            found: arguments.len(),
+                        },
+                        syntax.span,
+                    );
+                    self.types.recovery()
+                } else {
+                    *self
+                        .symbol_types
+                        .get(&symbol)
+                        .expect("nominal type declaration must have been predeclared")
+                }
+            }
             _ => unreachable!("name resolution only records type-context symbols here"),
         }
+    }
+
+    fn resolve_alias(&mut self, symbol: SymbolId, use_span: Span) -> TypeId {
+        if let Some(type_id) = self.alias_cache.get(&symbol).copied() {
+            return type_id;
+        }
+        if self.alias_stack.contains(&symbol) {
+            self.error(TypeResolutionErrorKind::AliasCycle, use_span);
+            return self.types.recovery();
+        }
+        let alias = self
+            .aliases
+            .get(&symbol)
+            .expect("resolved alias symbol must be indexed")
+            .clone();
+        self.alias_stack.push(symbol);
+        let resolved = self.resolve_type(&alias.target);
+        self.alias_stack.pop();
+        self.alias_cache.insert(symbol, resolved);
+        resolved
+    }
+
+    fn instantiate_factory(
+        &mut self,
+        factory: &Function,
+        arguments: Vec<TypeId>,
+        mut inherited_environment: HashMap<SymbolId, TypeId>,
+        mut identity_arguments: Vec<TypeId>,
+        span: Span,
+    ) -> TypeId {
+        let parameters: Vec<_> = factory
+            .parameters
+            .iter()
+            .filter(|parameter| matches!(&parameter.kind, FunctionParameterKind::Comptime { .. }))
+            .collect();
+        if parameters.len() != arguments.len() {
+            self.error(
+                TypeResolutionErrorKind::InvalidTypeFactoryArgumentCount {
+                    expected: parameters.len(),
+                    found: arguments.len(),
+                },
+                span,
+            );
+            return self.types.recovery();
+        }
+        identity_arguments.extend(arguments.iter().copied());
+        let key = (factory.id, identity_arguments.clone());
+        if let Some(type_id) = self.factory_cache.get(&key).copied() {
+            return type_id;
+        }
+        if self.factory_stack.contains(&key) {
+            self.error(
+                TypeResolutionErrorKind::RecursiveTypeFactoryWithoutNominalResult,
+                span,
+            );
+            return self.types.recovery();
+        }
+        if self
+            .factory_stack
+            .iter()
+            .any(|(active, active_arguments)| {
+                *active == factory.id && *active_arguments != identity_arguments
+            })
+        {
+            self.error(
+                TypeResolutionErrorKind::ExpandingTypeFactoryInstantiation,
+                span,
+            );
+            return self.types.recovery();
+        }
+        for (parameter, argument) in parameters.iter().zip(&arguments) {
+            let symbol = self
+                .names
+                .symbol_for_declaration(parameter.id)
+                .expect("compile-time parameter must have a resolved symbol");
+            inherited_environment.insert(symbol, *argument);
+        }
+        let Some(result) = type_factory_result(factory) else {
+            self.error(TypeResolutionErrorKind::InvalidTypeFactorySignature, factory.name);
+            return self.types.recovery();
+        };
+
+        self.factory_stack.push(key.clone());
+        self.environments.push(inherited_environment);
+        let previous_factory = self
+            .current_factory
+            .replace((factory.id, identity_arguments.clone()));
+
+        let resolved = if matches!(&result.kind, TypeKind::GeneratedStruct { .. }) {
+            let placeholder = self.types.generated_struct(
+                result.id,
+                identity_arguments.clone(),
+                AccessCapability::Const,
+            );
+            self.factory_cache.insert(key.clone(), placeholder);
+            self.resolve_type(result)
+        } else {
+            self.resolve_type(result)
+        };
+
+        self.current_factory = previous_factory;
+        self.environments.pop();
+        self.factory_stack.pop();
+        self.factory_cache.insert(key, resolved);
+        resolved
+    }
+
+    fn resolve_generated_struct(
+        &mut self,
+        syntax: &TypeSyntax,
+        members: &[StructMember],
+    ) -> TypeId {
+        let Some((factory, arguments)) = self.current_factory.clone() else {
+            self.error(
+                TypeResolutionErrorKind::GeneratedStructOutsideFactory,
+                syntax.span,
+            );
+            return self.types.recovery();
+        };
+        let type_id = self.types.generated_struct(
+            syntax.id,
+            arguments.clone(),
+            AccessCapability::Const,
+        );
+        if self.generated_structs.contains_key(&type_id) {
+            return type_id;
+        }
+        self.generated_structs.insert(
+            type_id,
+            GeneratedStructInstantiation {
+                type_id,
+                template: syntax.id,
+                factory,
+                arguments,
+                field_types: HashMap::new(),
+                substitutions: self.environments.last().cloned().unwrap_or_default(),
+            },
+        );
+
+        let mut field_types = HashMap::new();
+        for member in members {
+            match member {
+                StructMember::Field(field) => {
+                    let resolved = self.resolve_type(&field.type_annotation);
+                    self.specialized_syntax_types
+                        .insert((type_id, field.type_annotation.id), resolved);
+                    field_types.insert(field.id, resolved);
+                }
+                StructMember::Function(function) if self.is_type_factory(function) => {
+                    self.validate_type_factory_signature(function);
+                }
+                StructMember::Function(function) => self.resolve_specialized_function(type_id, function),
+            }
+        }
+        self.generated_structs
+            .get_mut(&type_id)
+            .expect("generated struct placeholder must remain installed")
+            .field_types = field_types;
+        type_id
+    }
+
+    fn resolve_specialized_function(&mut self, owner: TypeId, function: &Function) {
+        let previous = self.current_specialized_owner.replace(owner);
+        for parameter in &function.parameters {
+            if let FunctionParameterKind::Named { type_annotation, .. } = &parameter.kind {
+                let resolved = self.resolve_type(type_annotation);
+                self.specialized_syntax_types
+                    .insert((owner, type_annotation.id), resolved);
+            }
+        }
+        if let Some(return_type) = &function.return_type {
+            let resolved = self.resolve_type(return_type);
+            self.specialized_syntax_types
+                .insert((owner, return_type.id), resolved);
+        }
+        self.visit_block(&function.body);
+        self.current_specialized_owner = previous;
+    }
+
+    fn resolve_associated_factory(
+        &mut self,
+        owner: &TypeSyntax,
+        member: Span,
+        arguments: &[TypeSyntax],
+        span: Span,
+    ) -> TypeId {
+        let selected_through_parameter = if let TypeKind::Named { .. } = &owner.kind {
+            let symbol = self
+                .names
+                .symbol_for_reference(owner.id)
+                .expect("associated owner must have resolved type metadata");
+            self
+                .names
+                .symbols()
+                .symbol(symbol)
+                .is_some_and(|symbol| symbol.kind == SymbolKind::ComptimeParameter)
+        } else {
+            false
+        };
+        let owner_type = self.resolve_type(owner);
+        let resolved_arguments = arguments
+            .iter()
+            .map(|argument| self.resolve_type(argument))
+            .collect();
+        if selected_through_parameter {
+            self.error(
+                TypeResolutionErrorKind::AssociatedTypeFactoryThroughParameter,
+                owner.span,
+            );
+            return self.types.recovery();
+        }
+        let (owner_key, inherited) = match self.types.get(owner_type).cloned() {
+            Some(SemanticType::NamedStruct { declaration, .. }) => {
+                (declaration, HashMap::new())
+            }
+            Some(SemanticType::GeneratedStruct {
+                template,
+                ..
+            }) => {
+                let environment = self
+                    .generated_structs
+                    .get(&owner_type)
+                    .map(|instance| instance.substitutions.clone())
+                    .unwrap_or_default();
+                (template, environment)
+            }
+            _ => {
+                self.error(
+                    TypeResolutionErrorKind::InvalidAssociatedTypeFactoryOwner,
+                    owner.span,
+                );
+                return self.types.recovery();
+            }
+        };
+        let name = self
+            .module
+            .text(member)
+            .expect("associated member belongs to the source module")
+            .to_string();
+        let Some(factory) = self.associated_factories.get(&(owner_key, name)).cloned() else {
+            self.error(TypeResolutionErrorKind::UnknownAssociatedTypeFactory, member);
+            return self.types.recovery();
+        };
+        self.instantiate_factory(
+            &factory,
+            resolved_arguments,
+            inherited,
+            vec![owner_type],
+            span,
+        )
     }
 
     fn resolve_builtin(
@@ -611,6 +1170,21 @@ const fn builtin_type_argument_count(builtin: BuiltinType) -> usize {
     }
 }
 
+fn type_factory_result(function: &Function) -> Option<&TypeSyntax> {
+    if let Some(value) = &function.body.value
+        && let ExpressionKind::TypeValue(type_syntax) = &value.kind
+    {
+        return Some(type_syntax);
+    }
+    if function.body.statements.len() == 1
+        && let StatementKind::Return(Some(value)) = &function.body.statements[0].kind
+        && let ExpressionKind::TypeValue(type_syntax) = &value.kind
+    {
+        return Some(type_syntax);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,8 +1240,8 @@ mod tests {
             "    user: &mut User,\n",
             "    stream: &mut (Reader & Writer),\n",
             "    callback: fn(int) -> string,\n",
-            "    table: Map<string, Vector<int>>,\n",
-            "    boxed_none: Queue<&none>,\n",
+            "    table: Map(string, Vector(int)),\n",
+            "    boxed_none: Queue(&none),\n",
             ") {}\n",
         ));
         let main = top_level_function(&program, 3);
@@ -798,10 +1372,10 @@ mod tests {
             "}\n",
         ));
 
-        // This program contains fifteen TypeSyntax nodes, all deliberately in
+        // This program contains sixteen TypeSyntax nodes, all deliberately in
         // distinct annotation-bearing AST locations. Nested type syntax would
         // add further entries to this same map.
-        assert_eq!(resolution.syntax_types().len(), 15);
+        assert_eq!(resolution.syntax_types().len(), 16);
         assert!(
             resolution
                 .syntax_types()
@@ -817,8 +1391,8 @@ mod tests {
             "struct User {}\n",
             "interface Reader { fn read(self); }\n",
             "fn main(\n",
-            "    generic: User<int>,\n",
-            "    messages: Queue<int | none>,\n",
+            "    generic: User(int),\n",
+            "    messages: Queue(int | none),\n",
             "    mixed: User & Reader,\n",
             "    qualified_member: &Reader & Reader,\n",
             ") {}\n",
@@ -852,7 +1426,7 @@ mod tests {
 
     #[test]
     fn defensively_rejects_invalid_builtin_arity() {
-        let (module, mut program) = parse("fn main(value: Queue<int>) {}");
+        let (module, mut program) = parse("fn main(value: Queue(int)) {}");
         let names = resolve_program(&module, &program).expect("test names should resolve");
         let main = match &mut program.declarations[0] {
             Declaration::Function(function) => function,
@@ -906,7 +1480,7 @@ mod tests {
         };
         assert_eq!(resolution.type_for_syntax(owner.id), None);
 
-        let (module, mut program) = parse("fn main(value: Error<int>) {}");
+        let (module, mut program) = parse("fn main(value: Error(int)) {}");
         let names = resolve_program(&module, &program).expect("test names should resolve");
         let Declaration::Function(main) = &mut program.declarations[0] else {
             panic!("expected main")
@@ -951,6 +1525,155 @@ mod tests {
                     ..
                 }]
             )
+        ));
+    }
+
+    #[test]
+    fn resolves_and_caches_generated_type_factory_applications() {
+        let source = concat!(
+            "fn Box(comptime T: type) -> type { struct { inner: T, } }\n",
+            "type First = Box(int);\n",
+            "type Second = Box(int);\n",
+            "type Different = Box(string);\n",
+            "fn main(left: First, right: Second, other: Different) {}",
+        );
+        let (module, program) = parse(source);
+        let names = resolve_program(&module, &program).expect("factory names should resolve");
+        let resolution =
+            resolve_types(&module, &program, &names).expect("factory types should resolve");
+        assert_eq!(resolution.generated_structs().len(), 2);
+        let Declaration::Function(main) = &program.declarations[4] else {
+            panic!("expected main");
+        };
+        assert_eq!(
+            resolution.type_for_syntax(named_parameter_type(main, 0).id),
+            resolution.type_for_syntax(named_parameter_type(main, 1).id),
+        );
+        assert_ne!(
+            resolution.type_for_syntax(named_parameter_type(main, 0).id),
+            resolution.type_for_syntax(named_parameter_type(main, 2).id),
+        );
+    }
+
+    #[test]
+    fn resolves_forward_aliases_and_concrete_associated_type_factories() {
+        let source = concat!(
+            "type Forward = Pair;\n",
+            "fn Box(comptime T: type) -> type {\n",
+            "    struct {\n",
+            "        inner: T,\n",
+            "        fn Pair(comptime U: type) -> type { struct { left: T, right: U, } }\n",
+            "    }\n",
+            "}\n",
+            "type Pair = Box(int)::Pair(string);\n",
+            "fn use_pair(value: Forward) {}\n",
+            "fn main() {}",
+        );
+        let (program, resolution) = resolve(source);
+        assert_eq!(resolution.generated_structs().len(), 2);
+
+        let Declaration::Function(use_pair) = &program.declarations[3] else {
+            panic!("expected use_pair")
+        };
+        let forward = resolution
+            .type_for_syntax(named_parameter_type(use_pair, 0).id)
+            .expect("forward alias use must have a type");
+        let pair = resolution
+            .generated_structs()
+            .get(&forward)
+            .expect("forward alias must preserve the generated pair identity");
+        assert!(pair.field_types.values().any(|field| matches!(
+            resolution.types().get(*field),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                ..
+            })
+        )));
+        assert!(pair.field_types.values().any(|field| matches!(
+            resolution.types().get(*field),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::String,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn caches_exact_recursive_factory_applications_and_rejects_parameter_selection() {
+        let (program, resolution) = resolve(concat!(
+            "fn Node(comptime T: type) -> type { struct { value: T, next: &Node(T), } }\n",
+            "type IntNode = Node(int);\n",
+            "fn main() {}",
+        ));
+        assert_eq!(resolution.generated_structs().len(), 1);
+        let Declaration::TypeAlias(alias) = &program.declarations[1] else {
+            panic!("expected IntNode alias")
+        };
+        let node = resolution
+            .type_for_syntax(alias.target.id)
+            .expect("recursive application must resolve");
+        let instance = resolution.generated_structs()[&node].clone();
+        assert!(instance.field_types.values().any(|field| matches!(
+            resolution.types().get(*field),
+            Some(SemanticType::Gc { target, .. }) if *target == node
+        )));
+
+        let (module, program) = parse(concat!(
+            "fn Invalid(comptime T: type) -> type { T::Member(int) }\n",
+            "type Result = Invalid(int);\n",
+            "fn main() {}",
+        ));
+        let names = resolve_program(&module, &program).expect("test names should resolve");
+        assert!(matches!(
+            resolve_types(&module, &program, &names),
+            Err(errors) if errors.iter().any(|error| {
+                error.kind == TypeResolutionErrorKind::AssociatedTypeFactoryThroughParameter
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_local_type_factories() {
+        let (module, program) = parse(concat!(
+            "fn main() {\n",
+            "    fn Local(comptime T: type) -> type { T }\n",
+            "}\n",
+        ));
+        let names = resolve_program(&module, &program).expect("test names should resolve");
+        assert!(matches!(
+            resolve_types(&module, &program, &names),
+            Err(errors) if errors.iter().any(|error| {
+                error.kind == TypeResolutionErrorKind::TypeFactoryNotAllowedHere
+            })
+        ));
+    }
+
+    #[test]
+    fn reports_alias_cycles_and_expanding_factory_instantiation() {
+        let (module, program) = parse(concat!(
+            "type A = B;\n",
+            "type B = A;\n",
+            "fn main() {}",
+        ));
+        let names = resolve_program(&module, &program).expect("cyclic aliases still resolve names");
+        assert!(matches!(
+            resolve_types(&module, &program, &names),
+            Err(errors) if errors.iter().any(|error| error.kind == TypeResolutionErrorKind::AliasCycle)
+        ));
+
+        let (module, program) = parse(concat!(
+            "fn Bad(comptime T: type) -> type {\n",
+            "    struct { next: Bad(Vector(T)), }\n",
+            "}\n",
+            "type Expanded = Bad(int);\n",
+            "fn main() {}",
+        ));
+        let names = resolve_program(&module, &program).expect("factory recursion names should resolve");
+        assert!(matches!(
+            resolve_types(&module, &program, &names),
+            Err(errors) if errors.iter().any(|error| {
+                error.kind == TypeResolutionErrorKind::ExpandingTypeFactoryInstantiation
+            })
         ));
     }
 }

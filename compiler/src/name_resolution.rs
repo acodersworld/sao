@@ -202,11 +202,20 @@ impl<'source> Resolver<'source> {
                     if self.text(function.name) == "main" {
                         self.top_level_main_count += 1;
                     }
+                    let kind = if function
+                        .return_type
+                        .as_ref()
+                        .is_some_and(|return_type| matches!(&return_type.kind, TypeKind::ComptimeType))
+                    {
+                        SymbolKind::TypeFactory
+                    } else {
+                        SymbolKind::Function
+                    };
                     self.declare(
                         self.program_scope,
                         function.id,
                         function.name,
-                        SymbolKind::Function,
+                        kind,
                     );
                 }
                 Declaration::Struct(structure) => {
@@ -449,6 +458,7 @@ impl<'source> Resolver<'source> {
             ExpressionKind::Identifier => {
                 self.resolve_value_name(scope, expression.id, expression.span);
             }
+            ExpressionKind::TypeValue(type_syntax) => self.resolve_type(scope, type_syntax),
             ExpressionKind::SelfValue | ExpressionKind::Literal(_) => {}
             ExpressionKind::FormattedString { parts } => {
                 for part in parts {
@@ -526,8 +536,8 @@ impl<'source> Resolver<'source> {
                 self.resolve_block_contents(body_scope, body);
             }
             ExpressionKind::GcAllocate(value) => self.resolve_expression(scope, value),
-            ExpressionKind::StructConstruction { name, fields } => {
-                self.resolve_type_name(scope, expression.id, *name);
+            ExpressionKind::StructConstruction { owner, fields } => {
+                self.resolve_type(scope, owner);
                 for field in fields {
                     self.resolve_expression(scope, &field.value);
                 }
@@ -592,11 +602,29 @@ impl<'source> Resolver<'source> {
 
     fn resolve_type(&mut self, scope: ScopeId, type_syntax: &TypeSyntax) {
         match &type_syntax.kind {
-            TypeKind::Meta | TypeKind::Primitive(_) => {}
+            TypeKind::ComptimeType | TypeKind::Primitive(_) => {}
             TypeKind::Builtin { arguments, .. } | TypeKind::Named { arguments, .. } => {
                 if let TypeKind::Named { name, .. } = &type_syntax.kind {
                     self.resolve_type_name(scope, type_syntax.id, *name);
                 }
+                for argument in arguments {
+                    self.resolve_type(scope, argument);
+                }
+            }
+            TypeKind::GeneratedStruct { members } => {
+                for member in members {
+                    match member {
+                        StructMember::Field(field) => {
+                            self.resolve_type(scope, &field.type_annotation);
+                        }
+                        StructMember::Function(function) => self.resolve_function(function, scope),
+                    }
+                }
+            }
+            TypeKind::Associated {
+                owner, arguments, ..
+            } => {
+                self.resolve_type(scope, owner);
                 for argument in arguments {
                     self.resolve_type(scope, argument);
                 }
@@ -782,12 +810,15 @@ mod tests {
         };
         let main = function(&program.declarations[2]);
         let helper_reference = call_callee(expression(&main.body.statements[0])).id;
-        let construction_reference = main
+        let construction = main
             .body
             .value
             .as_ref()
-            .expect("main should have a value")
-            .id;
+            .expect("main should have a value");
+        let ExpressionKind::StructConstruction { owner, .. } = &construction.kind else {
+            panic!("expected Later construction")
+        };
+        let construction_reference = owner.id;
         let helper_declaration = function(&program.declarations[3]).id;
 
         let later = resolution
@@ -835,7 +866,7 @@ mod tests {
 
     #[test]
     fn resolves_types_inside_builtin_associated_access() {
-        let source = concat!("struct Item {}\n", "fn main() { Queue<Item>::new(); }",);
+        let source = concat!("struct Item {}\n", "fn main() { Queue(Item)::new(); }",);
         let (_, program, resolution) = resolve(source);
         let Declaration::Struct(item) = &program.declarations[0] else {
             panic!("expected Item struct");

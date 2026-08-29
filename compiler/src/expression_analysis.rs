@@ -475,6 +475,7 @@ struct ExpressionCheckingError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExpressionCheckingErrorKind {
+    TypeValueOutsideFactory,
     IntegerLiteralOutOfRange,
     TypeMismatch {
         expected: TypeId,
@@ -606,11 +607,26 @@ struct ExpressionChecking {
     /// AST; these facts identify each single-evaluation value and its parsed
     /// formatting behavior for typed IR and lowering.
     formatted_strings: HashMap<NodeId, Vec<ResolvedInterpolation>>,
+    generated_methods: HashMap<(TypeId, NodeId), GeneratedMethodChecking>,
     /// Bindings written by assignment. For object-like locals, lowering uses
     /// this to decide when the source-level reference needs indirection in
     /// addition to any frame-owned backing storage.
     reassigned_bindings: HashSet<SymbolId>,
     errors: Vec<ExpressionCheckingError>,
+}
+
+/// A specialization-scoped snapshot for a generated method. Generated type
+/// applications reuse one source AST, so `NodeId` alone cannot distinguish
+/// `Box(int).get` from `Box(string).get`. Keeping the owner type in the key
+/// prevents one checked application from overwriting another before typed IR
+/// gives specializations their final identities.
+#[derive(Debug, Clone)]
+struct GeneratedMethodChecking {
+    expressions: HashMap<NodeId, TypedExpression>,
+    bindings: HashMap<SymbolId, BindingSemantics>,
+    transfers: HashMap<NodeId, ValueTransfer>,
+    places: HashMap<NodeId, Place>,
+    resolved_members: HashMap<NodeId, ResolvedMember>,
 }
 
 #[derive(Debug, Default)]
@@ -716,6 +732,7 @@ impl LexicalIndex {
             | ExpressionKind::SelfValue
             | ExpressionKind::Literal(_)
             | ExpressionKind::AssociatedAccess { .. } => {}
+            ExpressionKind::TypeValue(type_syntax) => self.visit_type(type_syntax, names),
             ExpressionKind::FormattedString { parts } => {
                 for part in parts {
                     if let FormattedStringPart::Interpolation { value, .. } = part {
@@ -787,7 +804,8 @@ impl LexicalIndex {
                 self.record_parameters(expression.id, parameters, names);
                 self.visit_block(body, expression.id, names);
             }
-            ExpressionKind::StructConstruction { fields, .. } => {
+            ExpressionKind::StructConstruction { owner, fields } => {
+                self.visit_type(owner, names);
                 for field in fields {
                     self.visit_expression(&field.value, callable, names);
                 }
@@ -835,6 +853,54 @@ impl LexicalIndex {
             }
         }
     }
+
+    fn visit_type(&mut self, type_syntax: &TypeSyntax, names: &NameResolution) {
+        match &type_syntax.kind {
+            crate::ast::TypeKind::GeneratedStruct { members } => {
+                for member in members {
+                    match member {
+                        StructMember::Field(_) => {}
+                        StructMember::Function(function) => {
+                            self.visit_function(function, None, names);
+                        }
+                    }
+                }
+            }
+            crate::ast::TypeKind::Builtin { arguments, .. }
+            | crate::ast::TypeKind::Named { arguments, .. } => {
+                for argument in arguments {
+                    self.visit_type(argument, names);
+                }
+            }
+            crate::ast::TypeKind::Associated {
+                owner, arguments, ..
+            } => {
+                self.visit_type(owner, names);
+                for argument in arguments {
+                    self.visit_type(argument, names);
+                }
+            }
+            crate::ast::TypeKind::Mutable(inner)
+            | crate::ast::TypeKind::Gc(inner)
+            | crate::ast::TypeKind::Group(inner) => self.visit_type(inner, names),
+            crate::ast::TypeKind::Callable {
+                parameters,
+                return_type,
+            } => {
+                for parameter in parameters {
+                    self.visit_type(parameter, names);
+                }
+                self.visit_type(return_type, names);
+            }
+            crate::ast::TypeKind::Intersection { members }
+            | crate::ast::TypeKind::Union { members } => {
+                for member in members {
+                    self.visit_type(member, names);
+                }
+            }
+            crate::ast::TypeKind::ComptimeType | crate::ast::TypeKind::Primitive(_) => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -842,6 +908,12 @@ struct LayoutField {
     declaration: NodeId,
     span: Span,
     type_id: TypeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AggregateOwner {
+    Source(NodeId),
+    Generated(TypeId),
 }
 
 #[derive(Debug, Clone)]
@@ -857,16 +929,13 @@ struct Analyzer<'semantic> {
     signatures: &'semantic SignatureCollection,
     types: &'semantic mut TypeResolution,
     method_owners: HashMap<NodeId, TypeId>,
-    /// Connects the type symbol resolved on `Name { ... }` to the declaration
-    /// whose collected field signature must be checked.
-    named_struct_symbols: HashMap<SymbolId, NodeId>,
     callable_parents: HashMap<NodeId, Option<NodeId>>,
     symbol_owners: HashMap<SymbolId, NodeId>,
     receiver_qualifiers: HashMap<NodeId, BindingQualifiers>,
     /// Aggregate declarations and expressions in source discovery order. The
     /// order is retained so recursive-layout diagnostics are deterministic.
-    aggregate_order: Vec<NodeId>,
-    aggregate_layouts: HashMap<NodeId, AggregateLayout>,
+    aggregate_order: Vec<TypeId>,
+    aggregate_layouts: HashMap<TypeId, AggregateLayout>,
     /// Flow-sensitive provenance of the storage currently denoted by each
     /// binding. Declared type and qualifiers remain in `checking.bindings`.
     current_binding_categories: HashMap<SymbolId, ValueCategory>,
@@ -877,6 +946,7 @@ struct Analyzer<'semantic> {
     /// beginning of its enclosing block. Unreachable syntax is still checked,
     /// but its loop transfers cannot contribute runtime exits.
     current_path_reachable: bool,
+    current_specialized_owner: Option<TypeId>,
     /// Loops whose bodies are currently being checked. Resolved transfer
     /// targets select an entry here, so nested-loop breaks never leak outward.
     active_loops: Vec<ActiveLoop>,
@@ -916,17 +986,12 @@ impl<'semantic> Analyzer<'semantic> {
             receiver_qualifiers,
         } = LexicalIndex::build(program, names);
         let mut method_owners = HashMap::new();
-        let mut named_struct_symbols = HashMap::new();
         let mut aggregate_order = Vec::new();
         let mut aggregate_layouts = HashMap::new();
         for declaration in &program.declarations {
             let Declaration::Struct(structure) = declaration else {
                 continue;
             };
-            let symbol = names
-                .symbol_for_declaration(structure.id)
-                .expect("named struct must have a semantic symbol");
-            named_struct_symbols.insert(symbol, structure.id);
             let signature = signatures
                 .named_struct(structure.id)
                 .expect("named struct signature must have been collected");
@@ -958,9 +1023,9 @@ impl<'semantic> Analyzer<'semantic> {
                     })
                 })
                 .collect();
-            aggregate_order.push(structure.id);
+            aggregate_order.push(owner);
             aggregate_layouts.insert(
-                structure.id,
+                owner,
                 AggregateLayout {
                     type_id: owner,
                     fields,
@@ -976,6 +1041,33 @@ impl<'semantic> Analyzer<'semantic> {
                 }
             }
         }
+        let mut generated: Vec<_> = signatures.generated_structs().values().collect();
+        generated.sort_by_key(|signature| signature.type_id.as_usize());
+        for signature in generated {
+            let fields = signature
+                .field_order()
+                .iter()
+                .filter_map(|name| {
+                    let member = signature.member(name)?;
+                    let StructMemberSignatureKind::Field(field) = member.kind else {
+                        return None;
+                    };
+                    Some(LayoutField {
+                        declaration: field.declaration,
+                        span: member.span,
+                        type_id: field.type_id?,
+                    })
+                })
+                .collect();
+            aggregate_order.push(signature.type_id);
+            aggregate_layouts.insert(
+                signature.type_id,
+                AggregateLayout {
+                    type_id: signature.type_id,
+                    fields,
+                },
+            );
+        }
 
         Self {
             module,
@@ -984,7 +1076,6 @@ impl<'semantic> Analyzer<'semantic> {
             signatures,
             types,
             method_owners,
-            named_struct_symbols,
             callable_parents,
             symbol_owners,
             receiver_qualifiers,
@@ -993,6 +1084,7 @@ impl<'semantic> Analyzer<'semantic> {
             current_binding_categories: HashMap::new(),
             current_narrowings: HashMap::new(),
             current_path_reachable: true,
+            current_specialized_owner: None,
             active_loops: Vec::new(),
             checking: ExpressionChecking::default(),
         }
@@ -1002,21 +1094,82 @@ impl<'semantic> Analyzer<'semantic> {
         for declaration in &program.declarations {
             self.visit_declaration(declaration);
         }
+        self.visit_generated_struct_methods(program);
         self.validate_finite_inline_layouts();
         self.checking
     }
 
     fn visit_declaration(&mut self, declaration: &Declaration) {
         match declaration {
+            Declaration::Function(function)
+                if function
+                    .return_type
+                    .as_ref()
+                    .is_some_and(|return_type| matches!(&return_type.kind, crate::ast::TypeKind::ComptimeType)) => {}
             Declaration::Function(function) => self.visit_function(function),
             Declaration::Struct(structure) => {
                 for member in &structure.members {
-                    if let StructMember::Function(function) = member {
+                    if let StructMember::Function(function) = member
+                        && !function
+                            .return_type
+                            .as_ref()
+                            .is_some_and(|return_type| matches!(&return_type.kind, crate::ast::TypeKind::ComptimeType))
+                    {
                         self.visit_function(function);
                     }
                 }
             }
             Declaration::Interface(_) | Declaration::TypeAlias(_) => {}
+        }
+    }
+
+    fn visit_generated_struct_methods(&mut self, program: &Program) {
+        let mut instances: Vec<_> = self
+            .types
+            .generated_structs()
+            .values()
+            .map(|instance| (instance.type_id, instance.template))
+            .collect();
+        instances.sort_by_key(|(type_id, _)| type_id.as_usize());
+        for (owner, template) in instances {
+            let Some(crate::ast::TypeKind::GeneratedStruct { members }) =
+                find_type_syntax(program, template).map(|syntax| &syntax.kind)
+            else {
+                continue;
+            };
+            let functions: Vec<_> = members
+                .iter()
+                .filter_map(|member| {
+                    let StructMember::Function(function) = member else {
+                        return None;
+                    };
+                    self.signatures
+                        .specialized_callable(owner, function.id)
+                        .map(|_| function.clone())
+                })
+                .collect();
+            let previous_owner = self.current_specialized_owner.replace(owner);
+            for function in functions {
+                if self
+                    .signatures
+                    .specialized_callable(owner, function.id)
+                    .is_some_and(|signature| signature.receiver.is_some())
+                {
+                    self.method_owners.insert(function.id, owner);
+                }
+                self.visit_function(&function);
+                let checking = GeneratedMethodChecking {
+                    expressions: self.checking.expressions.clone(),
+                    bindings: self.checking.bindings.clone(),
+                    transfers: self.checking.transfers.clone(),
+                    places: self.checking.places.clone(),
+                    resolved_members: self.checking.resolved_members.clone(),
+                };
+                self.checking
+                    .generated_methods
+                    .insert((owner, function.id), checking);
+            }
+            self.current_specialized_owner = previous_owner;
         }
     }
 
@@ -1027,11 +1180,13 @@ impl<'semantic> Analyzer<'semantic> {
         let enclosing_loops = std::mem::take(&mut self.active_loops);
         self.current_path_reachable = true;
         self.seed_callable_parameters(function.id, &function.parameters);
-        let return_type = self
-            .signatures
-            .callable(function.id)
+        let signature = self
+            .current_specialized_owner
+            .and_then(|owner| self.signatures.specialized_callable(owner, function.id))
+            .or_else(|| self.signatures.callable(function.id))
             .expect("function signature must have been collected")
-            .return_type;
+            .clone();
+        let return_type = signature.return_type;
         self.visit_callable_body(&function.body, return_type);
         self.release_all_narrowings(function.body.id, NarrowingEdgeKind::CallableCompletion);
         self.current_binding_categories = enclosing_categories;
@@ -1048,8 +1203,9 @@ impl<'semantic> Analyzer<'semantic> {
     /// included because `self` is typed separately from receiver metadata.
     fn seed_callable_parameters(&mut self, callable: NodeId, parameters: &[FunctionParameter]) {
         let signature = self
-            .signatures
-            .callable(callable)
+            .current_specialized_owner
+            .and_then(|owner| self.signatures.specialized_callable(owner, callable))
+            .or_else(|| self.signatures.callable(callable))
             .expect("callable signature must have been collected");
         let mut semantic_parameters = signature.parameters.clone().into_iter();
 
@@ -1157,8 +1313,9 @@ impl<'semantic> Analyzer<'semantic> {
                     .callable_for_return(statement.id)
                     .expect("return statement must have a resolved callable target");
                 let expected = self
-                    .signatures
-                    .callable(callable)
+                    .current_specialized_owner
+                    .and_then(|owner| self.signatures.specialized_callable(owner, callable))
+                    .or_else(|| self.signatures.callable(callable))
                     .expect("return target must have a collected signature")
                     .return_type;
                 if let Some(value) = value {
@@ -1329,8 +1486,7 @@ impl<'semantic> Analyzer<'semantic> {
     ) -> Option<TypedExpression> {
         let expected = annotation.map(|id| {
             let resolved = self
-                .types
-                .type_for_syntax(id)
+                .resolved_type_syntax(id)
                 .expect("binding annotation must have a resolved type");
             self.with_value_capability(resolved, qualifiers.value)
         });
@@ -1840,8 +1996,7 @@ impl<'semantic> Analyzer<'semantic> {
             .union_members(possible_type)
             .unwrap_or_else(|| vec![possible_type]);
         let tested = self
-            .types
-            .type_for_syntax(type_syntax.id)
+            .resolved_type_syntax(type_syntax.id)
             .expect("type-test syntax must have been resolved");
         let tested_members = self.union_members(tested).unwrap_or_else(|| vec![tested]);
         let matching: Vec<_> = possible
@@ -2810,6 +2965,13 @@ impl<'semantic> Analyzer<'semantic> {
 
         let typed = match &expression.kind {
             ExpressionKind::Literal(literal) => self.synthesize_literal(expression, *literal),
+            ExpressionKind::TypeValue(_) => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::TypeValueOutsideFactory,
+                    span: expression.span,
+                });
+                self.recovery_temporary()
+            }
             ExpressionKind::FormattedString { parts } => {
                 self.synthesize_formatted_string(expression, parts)?
             }
@@ -2843,8 +3005,8 @@ impl<'semantic> Analyzer<'semantic> {
                 parameters, body, ..
             } => self.synthesize_lambda(expression, parameters, body)?,
             ExpressionKind::GcAllocate(value) => self.synthesize_gc_allocation(value)?,
-            ExpressionKind::StructConstruction { fields, .. } => {
-                self.synthesize_named_struct_construction(expression, fields)?
+            ExpressionKind::StructConstruction { owner, fields } => {
+                self.synthesize_named_struct_construction(expression, owner, fields)?
             }
             ExpressionKind::AnonymousStruct { members } => {
                 self.synthesize_anonymous_struct(expression, members)?
@@ -2921,8 +3083,7 @@ impl<'semantic> Analyzer<'semantic> {
         type_syntax: &TypeSyntax,
     ) -> Option<TypedExpression> {
         let expected = self
-            .types
-            .type_for_syntax(type_syntax.id)
+            .resolved_type_syntax(type_syntax.id)
             .expect("ascribed source type must have been resolved");
         if self.primitive_kind(expected).is_some() {
             let found = self.synthesize(value)?;
@@ -3009,8 +3170,7 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         };
         let tested = self
-            .types
-            .type_for_syntax(type_syntax.id)
+            .resolved_type_syntax(type_syntax.id)
             .expect("type-test syntax must have been resolved");
         let tested_members = self.union_members(tested).unwrap_or_else(|| vec![tested]);
         if tested_members.is_empty()
@@ -3188,7 +3348,9 @@ impl<'semantic> Analyzer<'semantic> {
                     push_unique_capture(LambdaCaptureSource::SelfValue { method }, captures, seen);
                 }
             }
-            ExpressionKind::Literal(_) | ExpressionKind::AssociatedAccess { .. } => {}
+            ExpressionKind::Literal(_)
+            | ExpressionKind::TypeValue(_)
+            | ExpressionKind::AssociatedAccess { .. } => {}
             ExpressionKind::FormattedString { parts } => {
                 for part in parts {
                     if let FormattedStringPart::Interpolation { value, .. } = part {
@@ -3666,7 +3828,7 @@ impl<'semantic> Analyzer<'semantic> {
 
     fn match_concrete_interface_methods(
         &self,
-        owner: NodeId,
+        owner: AggregateOwner,
         requirements: &[RequiredInterfaceMethod],
     ) -> Result<(), ExpressionCheckingErrorKind> {
         let signature = self
@@ -3684,7 +3846,8 @@ impl<'semantic> Analyzer<'semantic> {
                     method_id,
                 } => (declaration, Some(method_id)),
                 StructMemberSignatureKind::Field(field) => (field.declaration, None),
-                StructMemberSignatureKind::AssociatedFunction { declaration } => {
+                StructMemberSignatureKind::AssociatedFunction { declaration }
+                | StructMemberSignatureKind::AssociatedTypeFactory { declaration } => {
                     (declaration, None)
                 }
             };
@@ -4451,13 +4614,13 @@ impl<'semantic> Analyzer<'semantic> {
     fn synthesize_named_struct_construction(
         &mut self,
         expression: &Expression,
+        owner: &TypeSyntax,
         fields: &[StructFieldInitializer],
     ) -> Option<TypedExpression> {
-        let symbol = self
-            .names
-            .symbol_for_reference(expression.id)
-            .expect("named construction must have a resolved type symbol");
-        let Some(declaration) = self.named_struct_symbols.get(&symbol).copied() else {
+        let Some(owner_type) = self.resolved_type_syntax(owner.id) else {
+            return None;
+        };
+        let Some((aggregate_owner, _, _)) = self.aggregate_parts(owner_type) else {
             self.checking.errors.push(ExpressionCheckingError {
                 kind: ExpressionCheckingErrorKind::InvalidConstructionOwner,
                 span: expression.span,
@@ -4468,9 +4631,8 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         };
         let signature = self
-            .signatures
-            .named_struct(declaration)
-            .expect("named struct signature must have been collected")
+            .aggregate_signature(aggregate_owner)
+            .expect("constructible struct signature must have been collected")
             .clone();
 
         let mut seen = HashSet::new();
@@ -4643,11 +4805,11 @@ impl<'semantic> Analyzer<'semantic> {
             }
         }
 
-        if !self.aggregate_layouts.contains_key(&expression.id) {
-            self.aggregate_order.push(expression.id);
+        if !self.aggregate_layouts.contains_key(&signature.type_id) {
+            self.aggregate_order.push(signature.type_id);
         }
         self.aggregate_layouts.insert(
-            expression.id,
+            signature.type_id,
             AggregateLayout {
                 type_id: signature.type_id,
                 fields: layout_fields,
@@ -4839,7 +5001,8 @@ impl<'semantic> Analyzer<'semantic> {
                 });
                 Some(self.recovery_temporary())
             }
-            StructMemberSignatureKind::AssociatedFunction { .. } => {
+            StructMemberSignatureKind::AssociatedFunction { .. }
+            | StructMemberSignatureKind::AssociatedTypeFactory { .. } => {
                 self.checking.errors.push(ExpressionCheckingError {
                     kind: ExpressionCheckingErrorKind::AssociatedFunctionRequiresType,
                     span: member,
@@ -4875,7 +5038,7 @@ impl<'semantic> Analyzer<'semantic> {
         owner: &TypeSyntax,
         member: Span,
     ) -> Option<TypedExpression> {
-        let owner_type = self.types.type_for_syntax(owner.id)?;
+        let owner_type = self.resolved_type_syntax(owner.id)?;
         if self.primitive_kind(owner_type) == Some(PrimitiveType::Bytes) {
             let name = self
                 .module
@@ -4920,9 +5083,7 @@ impl<'semantic> Analyzer<'semantic> {
                 category: ValueCategory::FreshTemporary,
             });
         }
-        let Some(SemanticType::NamedStruct { declaration, .. }) =
-            self.types.types().get(owner_type).cloned()
-        else {
+        let Some((aggregate_owner, _, false)) = self.aggregate_parts(owner_type) else {
             return None;
         };
         let name = self
@@ -4937,8 +5098,7 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         }
         let Some(selected) = self
-            .signatures
-            .named_struct(declaration)
+            .aggregate_signature(aggregate_owner)
             .and_then(|signature| signature.member(name))
             .copied()
         else {
@@ -4950,6 +5110,13 @@ impl<'semantic> Analyzer<'semantic> {
         };
         let declaration = match selected.kind {
             StructMemberSignatureKind::AssociatedFunction { declaration } => declaration,
+            StructMemberSignatureKind::AssociatedTypeFactory { .. } => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::UnknownMember,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            }
             StructMemberSignatureKind::Field(_) => {
                 self.checking.errors.push(ExpressionCheckingError {
                     kind: ExpressionCheckingErrorKind::FieldRequiresValue,
@@ -4965,10 +5132,13 @@ impl<'semantic> Analyzer<'semantic> {
                 return Some(self.recovery_temporary());
             }
         };
-        let signature = self
-            .signatures
-            .callable(declaration)
-            .expect("associated function signature must have been collected");
+        let signature = match aggregate_owner {
+            AggregateOwner::Source(_) => self.signatures.callable(declaration),
+            AggregateOwner::Generated(owner) => {
+                self.signatures.specialized_callable(owner, declaration)
+            }
+        }
+        .expect("associated function signature must have been collected");
         let type_id = self.types.types_mut().callable(
             signature.parameters.clone(),
             signature.return_type,
@@ -4987,7 +5157,7 @@ impl<'semantic> Analyzer<'semantic> {
     /// Peels a plain or GC-qualified concrete struct into the information
     /// shared by field, method, copy, and structural-interface checking. The
     /// boolean distinguishes GC storage for receiver validation.
-    fn aggregate_parts(&self, type_id: TypeId) -> Option<(NodeId, AccessCapability, bool)> {
+    fn aggregate_parts(&self, type_id: TypeId) -> Option<(AggregateOwner, AccessCapability, bool)> {
         match self.types.types().get(type_id)? {
             SemanticType::NamedStruct {
                 declaration,
@@ -4996,19 +5166,49 @@ impl<'semantic> Analyzer<'semantic> {
             | SemanticType::AnonymousStruct {
                 expression: declaration,
                 capability,
-            } => Some((*declaration, *capability, false)),
+            } => Some((AggregateOwner::Source(*declaration), *capability, false)),
+            SemanticType::GeneratedStruct { capability, .. } => Some((
+                AggregateOwner::Generated(self.canonical_generated_owner(type_id)?),
+                *capability,
+                false,
+            )),
             SemanticType::Gc { target, capability } => {
                 match self.types.types().get(*target)? {
                     SemanticType::NamedStruct { declaration, .. }
                     | SemanticType::AnonymousStruct {
                         expression: declaration,
                         ..
-                    } => Some((*declaration, *capability, true)),
+                    } => Some((AggregateOwner::Source(*declaration), *capability, true)),
+                    SemanticType::GeneratedStruct { .. } => Some((
+                        AggregateOwner::Generated(self.canonical_generated_owner(*target)?),
+                        *capability,
+                        true,
+                    )),
                     _ => None,
                 }
             }
             _ => None,
         }
+    }
+
+    /// Maps a capability-selected generated struct back to the canonical
+    /// factory instance that owns its collected fields and specialized
+    /// callables. Capability is part of a value's `TypeId`, but it does not
+    /// create a second declaration or a second method specialization.
+    fn canonical_generated_owner(&self, type_id: TypeId) -> Option<TypeId> {
+        if self.signatures.generated_struct(type_id).is_some() {
+            return Some(type_id);
+        }
+        self.signatures
+            .generated_structs()
+            .values()
+            .find(|signature| {
+                self.types
+                    .types()
+                    .has_same_shape(signature.type_id, type_id)
+                    == Some(true)
+            })
+            .map(|signature| signature.type_id)
     }
 
     /// Peels a plain or GC-qualified string/byte sequence. The capability is
@@ -5205,12 +5405,16 @@ impl<'semantic> Analyzer<'semantic> {
         })
     }
 
-    /// Finds the collected member table for either a source-named struct or a
-    /// compiler-named anonymous struct.
-    fn aggregate_signature(&self, owner: NodeId) -> Option<&StructSignature> {
-        self.signatures
-            .named_struct(owner)
-            .or_else(|| self.signatures.anonymous_struct(owner))
+    /// Finds the collected member table for a source aggregate or a canonical
+    /// factory-generated struct instance.
+    fn aggregate_signature(&self, owner: AggregateOwner) -> Option<&StructSignature> {
+        match owner {
+            AggregateOwner::Source(owner) => self
+                .signatures
+                .named_struct(owner)
+                .or_else(|| self.signatures.anonymous_struct(owner)),
+            AggregateOwner::Generated(type_id) => self.signatures.generated_struct(type_id),
+        }
     }
 
     /// Completes a field signature by consulting expression-time inference for
@@ -5900,6 +6104,7 @@ impl<'semantic> Analyzer<'semantic> {
             if matches!(
                 selected.kind,
                 StructMemberSignatureKind::AssociatedFunction { .. }
+                    | StructMemberSignatureKind::AssociatedTypeFactory { .. }
             ) {
                 self.checking.errors.push(ExpressionCheckingError {
                     kind: ExpressionCheckingErrorKind::AssociatedFunctionRequiresType,
@@ -5912,11 +6117,14 @@ impl<'semantic> Analyzer<'semantic> {
             }
             return None;
         };
-        let signature = self
-            .signatures
-            .callable(declaration)
-            .expect("method signature must have been collected")
-            .clone();
+        let signature = match owner {
+            AggregateOwner::Source(_) => self.signatures.callable(declaration),
+            AggregateOwner::Generated(owner) => {
+                self.signatures.specialized_callable(owner, declaration)
+            }
+        }
+        .expect("method signature must have been collected")
+        .clone();
         let receiver = signature
             .receiver
             .expect("instance method must have a receiver signature");
@@ -6420,8 +6628,9 @@ impl<'semantic> Analyzer<'semantic> {
             .get(&method)
             .expect("named method must have a recorded owner type");
         let receiver = self
-            .signatures
-            .callable(method)
+            .current_specialized_owner
+            .and_then(|owner| self.signatures.specialized_callable(owner, method))
+            .or_else(|| self.signatures.callable(method))
             .and_then(|signature| signature.receiver)
             .expect("self target must have a receiver signature");
         let owner = self
@@ -6533,7 +6742,7 @@ impl<'semantic> Analyzer<'semantic> {
     /// the aggregate itself. GC references and external-buffer built-ins stop
     /// traversal because their payloads are not embedded inline.
     fn validate_finite_inline_layouts(&mut self) {
-        let mut edges: HashMap<NodeId, Vec<(NodeId, LayoutField)>> = HashMap::new();
+        let mut edges: HashMap<TypeId, Vec<(TypeId, LayoutField)>> = HashMap::new();
         for owner in &self.aggregate_order {
             let Some(layout) = self.aggregate_layouts.get(owner) else {
                 continue;
@@ -6554,7 +6763,7 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         for component in strongly_connected_components(&self.aggregate_order, &edges) {
-            let members: HashSet<NodeId> = component.iter().copied().collect();
+            let members: HashSet<TypeId> = component.iter().copied().collect();
             let cyclic = component.len() > 1
                 || component.first().is_some_and(|owner| {
                     edges
@@ -6593,7 +6802,7 @@ impl<'semantic> Analyzer<'semantic> {
     fn inline_aggregate_dependencies(
         &self,
         type_id: TypeId,
-        dependencies: &mut Vec<NodeId>,
+        dependencies: &mut Vec<TypeId>,
         visited: &mut HashSet<TypeId>,
     ) {
         if !visited.insert(type_id) {
@@ -6601,13 +6810,30 @@ impl<'semantic> Analyzer<'semantic> {
         }
         match self.types.types().get(type_id) {
             Some(SemanticType::NamedStruct { declaration, .. }) => {
-                if !dependencies.contains(declaration) {
-                    dependencies.push(*declaration);
+                let dependency = self
+                    .types
+                    .type_for_declaration(*declaration)
+                    .expect("named aggregate must have a declared type");
+                if !dependencies.contains(&dependency) {
+                    dependencies.push(dependency);
                 }
             }
             Some(SemanticType::AnonymousStruct { expression, .. }) => {
-                if !dependencies.contains(expression) {
-                    dependencies.push(*expression);
+                if let Some(dependency) = self.aggregate_layouts.keys().copied().find(|candidate| {
+                    matches!(
+                        self.types.types().get(*candidate),
+                        Some(SemanticType::AnonymousStruct { expression: candidate, .. })
+                            if candidate == expression
+                    )
+                }) && !dependencies.contains(&dependency) {
+                    dependencies.push(dependency);
+                }
+            }
+            Some(SemanticType::GeneratedStruct { .. }) => {
+                if let Some(dependency) = self.aggregate_layouts.keys().copied().find(|candidate| {
+                    self.types.types().has_same_shape(*candidate, type_id) == Some(true)
+                }) && !dependencies.contains(&dependency) {
+                    dependencies.push(dependency);
                 }
             }
             Some(SemanticType::Union { members, .. }) => {
@@ -6663,6 +6889,12 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("semantic type belongs to the program type store")
     }
 
+    fn resolved_type_syntax(&self, syntax: NodeId) -> Option<TypeId> {
+        self.current_specialized_owner
+            .and_then(|owner| self.types.specialized_type_for_syntax(owner, syntax))
+            .or_else(|| self.types.type_for_syntax(syntax))
+    }
+
     /// Returns whether an already analyzed expression explicitly produces a
     /// value. For example, `{ 1 }` does, while `{ 1; }` completes implicitly
     /// with unit. Successful expression analysis must always record this fact.
@@ -6701,6 +6933,7 @@ impl<'semantic> Analyzer<'semantic> {
             Some(SemanticType::Gc { .. }
             | SemanticType::Primitive { .. }
             | SemanticType::NamedStruct { .. }
+            | SemanticType::GeneratedStruct { .. }
             | SemanticType::AnonymousStruct { .. }
             | SemanticType::Builtin { .. }
             | SemanticType::Recovery
@@ -6852,13 +7085,99 @@ fn push_unique_capture(
     }
 }
 
+fn find_type_syntax(program: &Program, target: NodeId) -> Option<&TypeSyntax> {
+    for declaration in &program.declarations {
+        let functions: Vec<&Function> = match declaration {
+            Declaration::Function(function) => vec![function],
+            Declaration::Struct(structure) => structure
+                .members
+                .iter()
+                .filter_map(|member| match member {
+                    StructMember::Function(function) => Some(function),
+                    StructMember::Field(_) => None,
+                })
+                .collect(),
+            Declaration::Interface(_) | Declaration::TypeAlias(_) => Vec::new(),
+        };
+        for function in functions {
+            if let Some(found) = find_type_in_factory(function, target) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn find_type_in_factory(function: &Function, target: NodeId) -> Option<&TypeSyntax> {
+    let values = function
+        .body
+        .value
+        .iter()
+        .map(Box::as_ref)
+        .chain(function.body.statements.iter().filter_map(|statement| {
+            let StatementKind::Return(Some(value)) = &statement.kind else {
+                return None;
+            };
+            Some(value)
+        }));
+    for value in values {
+        if let ExpressionKind::TypeValue(type_syntax) = &value.kind
+            && let Some(found) = find_nested_type(type_syntax, target)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_nested_type(type_syntax: &TypeSyntax, target: NodeId) -> Option<&TypeSyntax> {
+    if type_syntax.id == target {
+        return Some(type_syntax);
+    }
+    match &type_syntax.kind {
+        crate::ast::TypeKind::Builtin { arguments, .. }
+        | crate::ast::TypeKind::Named { arguments, .. } => arguments
+            .iter()
+            .find_map(|argument| find_nested_type(argument, target)),
+        crate::ast::TypeKind::GeneratedStruct { members } => {
+            members.iter().find_map(|member| match member {
+                StructMember::Field(field) => find_nested_type(&field.type_annotation, target),
+                StructMember::Function(function) => find_type_in_factory(function, target),
+            })
+        }
+        crate::ast::TypeKind::Associated {
+            owner, arguments, ..
+        } => find_nested_type(owner, target).or_else(|| {
+            arguments
+                .iter()
+                .find_map(|argument| find_nested_type(argument, target))
+        }),
+        crate::ast::TypeKind::Mutable(inner)
+        | crate::ast::TypeKind::Gc(inner)
+        | crate::ast::TypeKind::Group(inner) => find_nested_type(inner, target),
+        crate::ast::TypeKind::Callable {
+            parameters,
+            return_type,
+        } => parameters
+            .iter()
+            .find_map(|parameter| find_nested_type(parameter, target))
+            .or_else(|| find_nested_type(return_type, target)),
+        crate::ast::TypeKind::Intersection { members }
+        | crate::ast::TypeKind::Union { members } => members
+            .iter()
+            .find_map(|member| find_nested_type(member, target)),
+        crate::ast::TypeKind::ComptimeType | crate::ast::TypeKind::Primitive(_) => None,
+    }
+}
+
 /// Partitions the inline aggregate-containment graph using Robert Tarjan's
 /// strongly connected components algorithm.
 ///
 /// Robert Tarjan introduced this depth-first-search algorithm in 1972. A
 /// strongly connected component is a maximal group of graph nodes in which
 /// every node can reach every other node. Here, nodes are named or anonymous
-/// structs and an edge `A -> B` means that `A` contains `B` inline. A component
+/// structs (including factory-generated structs) and an edge `A -> B` means
+/// that `A` contains `B` inline. A component
 /// containing multiple structs therefore describes mutually recursive inline
 /// storage; a one-node component is recursive only when it has a self-edge.
 /// Both shapes have infinite size and are rejected by layout validation.
@@ -6874,22 +7193,22 @@ fn push_unique_capture(
 /// emitted together. This finds every component in linear time relative to the
 /// number of aggregate nodes and inline-containment edges.
 fn strongly_connected_components(
-    nodes: &[NodeId],
-    edges: &HashMap<NodeId, Vec<(NodeId, LayoutField)>>,
-) -> Vec<Vec<NodeId>> {
+    nodes: &[TypeId],
+    edges: &HashMap<TypeId, Vec<(TypeId, LayoutField)>>,
+) -> Vec<Vec<TypeId>> {
     struct Tarjan {
         next_index: usize,
-        indices: HashMap<NodeId, usize>,
-        low_links: HashMap<NodeId, usize>,
-        stack: Vec<NodeId>,
-        on_stack: HashSet<NodeId>,
-        components: Vec<Vec<NodeId>>,
+        indices: HashMap<TypeId, usize>,
+        low_links: HashMap<TypeId, usize>,
+        stack: Vec<TypeId>,
+        on_stack: HashSet<TypeId>,
+        components: Vec<Vec<TypeId>>,
     }
 
     fn visit(
-        node: NodeId,
-        node_set: &HashSet<NodeId>,
-        edges: &HashMap<NodeId, Vec<(NodeId, LayoutField)>>,
+        node: TypeId,
+        node_set: &HashSet<TypeId>,
+        edges: &HashMap<TypeId, Vec<(TypeId, LayoutField)>>,
         state: &mut Tarjan,
     ) {
         let index = state.next_index;
@@ -6935,7 +7254,7 @@ fn strongly_connected_components(
         state.components.push(component);
     }
 
-    let node_set: HashSet<NodeId> = nodes.iter().copied().collect();
+    let node_set: HashSet<TypeId> = nodes.iter().copied().collect();
     let mut state = Tarjan {
         next_index: 0,
         indices: HashMap::new(),
@@ -10350,8 +10669,8 @@ mod tests {
             "struct Direct { next: Direct, }\n",
             "struct Left { right: Right | none, }\n",
             "struct Right { left: Left, }\n",
-            "struct Safe { next: &Safe | none, items: Vector<Safe>, }\n",
-            "struct Wrapped { failure: Error<Wrapped>, }\n",
+            "struct Safe { next: &Safe | none, items: Vector(Safe), }\n",
+            "struct Wrapped { failure: Error(Wrapped), }\n",
             "fn main() {}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);
@@ -10912,7 +11231,7 @@ fn main() {
         let source = r#"
 interface Reader {}
 struct Item {}
-fn bad(data: bytes, choice: int | float, action: fn() -> int, reader: Reader, queue: Queue<int>) {
+fn bad(data: bytes, choice: int | float, action: fn() -> int, reader: Reader, queue: Queue(int)) {
     const result: string = f"{Item {}}|{data}|{choice}|{action}|{reader}|{queue}|{panic("stop")}|{"text":+}|{1:.2f}|{1:q}";
 }
 fn main() {}
@@ -10974,5 +11293,58 @@ fn main() {
             values
         );
         assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn checks_generated_construction_methods_and_associated_functions() {
+        let source = concat!(
+            "fn Box(comptime T: type) -> type {\n",
+            "    struct {\n",
+            "        inner: T,\n",
+            "        fn get(self) -> T { self.inner }\n",
+            "        fn make(value: T) -> Box(T) { Box(T) { inner: value } }\n",
+            "    }\n",
+            "}\n",
+            "interface Reader { fn get(self) -> int; }\n",
+            "fn main() {\n",
+            "    const box: Box(int) = Box(int) { inner: 10 };\n",
+            "    const read: int = box.get();\n",
+            "    const made: Box(int) = Box(int)::make(20);\n",
+            "    const direct: int = Box(int) { inner: 30 }.get();\n",
+            "    const reader: Reader = box;\n",
+            "    const dynamic: int = reader.get();\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        assert_eq!(checking.generated_methods.len(), 2);
+
+        let main = function(&program.declarations[2]);
+        for statement in &main.body.statements {
+            let initializer = binding_initializer(statement);
+            assert!(
+                checking.expressions.contains_key(&initializer.id),
+                "every generated-type boundary must be checked"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_infinite_factory_generated_inline_layouts() {
+        let source = concat!(
+            "fn Node(comptime T: type) -> type { struct { value: T, next: Node(T), } }\n",
+            "type IntNode = Node(int);\n",
+            "fn main() {}",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(matches!(
+            checking.errors.as_slice(),
+            [ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InfiniteInlineLayout { .. },
+                ..
+            }]
+        ));
     }
 }

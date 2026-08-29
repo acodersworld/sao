@@ -174,17 +174,6 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::ExpectedBuiltinTypeArguments { builtin, found } => {
             format!("expected type arguments after {builtin:?}, found {found:?}")
         }
-        ParseErrorKind::InvalidBuiltinTypeArgumentCount {
-            builtin,
-            expected,
-            found,
-        } => format!(
-            "{builtin:?} expects {expected} type {}, found {found}",
-            argument_word(expected)
-        ),
-        ParseErrorKind::ExpectedBuiltinAssociatedAccess { builtin, found } => {
-            format!("expected :: after {builtin:?}, found {found:?}")
-        }
         ParseErrorKind::InclusiveSliceNotSupported => {
             "inclusive slice ends are not supported; use ..".to_owned()
         }
@@ -230,10 +219,6 @@ fn syntax_error_message(error: ParseError) -> String {
             format!("token belongs to module {found:?}, expected {expected:?}")
         }
     }
-}
-
-const fn argument_word(count: usize) -> &'static str {
-    if count == 1 { "argument" } else { "arguments" }
 }
 
 fn character_count(source: &str, span: Span) -> usize {
@@ -368,32 +353,11 @@ mod tests {
             syntax_error_message(ParseError {
                 kind: ParseErrorKind::ExpectedBuiltinTypeArguments {
                     builtin: BuiltinType::Queue,
-                    found: sao_compiler::lexer::TokenKind::LeftParen,
+                    found: sao_compiler::lexer::TokenKind::Less,
                 },
                 span: Span::new(ModuleId::PRELUDE, 5, 6),
             }),
-            "expected type arguments after Queue, found LeftParen"
-        );
-        assert_eq!(
-            syntax_error_message(ParseError {
-                kind: ParseErrorKind::InvalidBuiltinTypeArgumentCount {
-                    builtin: BuiltinType::Map,
-                    expected: 2,
-                    found: 1,
-                },
-                span: Span::new(ModuleId::PRELUDE, 0, 8),
-            }),
-            "Map expects 2 type arguments, found 1"
-        );
-        assert_eq!(
-            syntax_error_message(ParseError {
-                kind: ParseErrorKind::ExpectedBuiltinAssociatedAccess {
-                    builtin: BuiltinType::Vector,
-                    found: sao_compiler::lexer::TokenKind::Eof,
-                },
-                span: Span::new(ModuleId::PRELUDE, 11, 11),
-            }),
-            "expected :: after Vector, found Eof"
+            "expected type arguments after Queue, found Less"
         );
     }
 

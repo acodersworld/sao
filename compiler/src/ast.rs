@@ -499,18 +499,29 @@ pub enum RangeInclusivity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
     /// The compile-time type-of-types, spelled `type`.
-    Meta,
+    ComptimeType,
     Primitive(PrimitiveType),
     Builtin {
         builtin: BuiltinType,
         arguments: Vec<TypeSyntax>,
     },
     /// A type referenced by its declared source name. Parenthesized arguments
-    /// represent a type-factory application; their semantics are added in the
-    /// next template increment. Legacy angle-bracket arguments remain in the
-    /// syntax tree until compiler-known built-ins migrate in that increment.
+    /// represent a type-factory application.
     Named {
         name: Span,
+        arguments: Vec<TypeSyntax>,
+    },
+    /// A nominal struct type produced inside a type factory. Its source node,
+    /// together with the factory's canonical type arguments, identifies each
+    /// concrete generated type.
+    GeneratedStruct {
+        members: Vec<StructMember>,
+    },
+    /// A receiverless type factory selected from a statically known concrete
+    /// struct, as in `Container::Entry(T)`.
+    Associated {
+        owner: Box<TypeSyntax>,
+        member: Span,
         arguments: Vec<TypeSyntax>,
     },
     Mutable(Box<TypeSyntax>),
@@ -560,6 +571,11 @@ pub enum ExpressionKind {
     Identifier,
     SelfValue,
     Literal(LiteralKind),
+    /// A type-valued expression produced by the restricted body of a function
+    /// returning `type`. The parser may also form one while disambiguating a
+    /// construction or associated access; any remaining runtime use is
+    /// rejected by expression analysis.
+    TypeValue(TypeSyntax),
     /// A string whose literal and evaluated portions are interleaved in
     /// source order, as in `f"name: {name:>10}"`.
     FormattedString {
@@ -599,7 +615,7 @@ pub enum ExpressionKind {
     /// `&` to an already GC-qualified value is semantically idempotent.
     GcAllocate(Box<Expression>),
     StructConstruction {
-        name: Span,
+        owner: TypeSyntax,
         fields: Vec<StructFieldInitializer>,
     },
     AnonymousStruct {

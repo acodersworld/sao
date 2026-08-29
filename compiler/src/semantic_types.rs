@@ -17,6 +17,13 @@ use crate::ast::{BuiltinType, NodeId, PrimitiveType, ValueCapability};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(usize);
 
+impl TypeId {
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
 /// The access capability carried as part of a semantic type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccessCapability {
@@ -116,6 +123,13 @@ pub enum SemanticType {
         declaration: NodeId,
         capability: AccessCapability,
     },
+    /// A nominal struct materialized by one type-factory body for a canonical
+    /// list of type arguments.
+    GeneratedStruct {
+        template: NodeId,
+        arguments: Vec<TypeId>,
+        capability: AccessCapability,
+    },
     AnonymousStruct {
         expression: NodeId,
         capability: AccessCapability,
@@ -155,6 +169,7 @@ impl SemanticType {
             | Self::Primitive { capability, .. }
             | Self::Callable { capability, .. }
             | Self::NamedStruct { capability, .. }
+            | Self::GeneratedStruct { capability, .. }
             | Self::AnonymousStruct { capability, .. }
             | Self::Interface { capability, .. }
             | Self::Builtin { capability, .. }
@@ -176,6 +191,7 @@ impl SemanticType {
             }
             Self::Primitive { .. }
             | Self::NamedStruct { .. }
+            | Self::GeneratedStruct { .. }
             | Self::AnonymousStruct { .. }
             | Self::Builtin { .. }
             | Self::Union { .. } => Some(StorageSemantics::Inline),
@@ -202,6 +218,7 @@ impl SemanticType {
             }
             Self::Primitive { .. }
             | Self::NamedStruct { .. }
+            | Self::GeneratedStruct { .. }
             | Self::AnonymousStruct { .. }
             | Self::Builtin { .. }
             | Self::Union { .. } => Some(CopySemantics::Recursive),
@@ -242,8 +259,20 @@ impl SemanticType {
                 Self::NamedStruct {
                     declaration: right, ..
                 },
-            )
-            | (
+            ) => left == right,
+            (
+                Self::GeneratedStruct {
+                    template: left,
+                    arguments: left_arguments,
+                    ..
+                },
+                Self::GeneratedStruct {
+                    template: right,
+                    arguments: right_arguments,
+                    ..
+                },
+            ) => left == right && left_arguments == right_arguments,
+            (
                 Self::Interface {
                     declaration: left, ..
                 },
@@ -378,6 +407,20 @@ impl TypeStore {
     pub fn named_struct(&mut self, declaration: NodeId, capability: AccessCapability) -> TypeId {
         self.intern(SemanticType::NamedStruct {
             declaration,
+            capability,
+        })
+    }
+
+    /// Returns the canonical identity for one generated-struct application.
+    pub fn generated_struct(
+        &mut self,
+        template: NodeId,
+        arguments: Vec<TypeId>,
+        capability: AccessCapability,
+    ) -> TypeId {
+        self.intern(SemanticType::GeneratedStruct {
+            template,
+            arguments,
             capability,
         })
     }
@@ -528,6 +571,11 @@ impl TypeStore {
             SemanticType::NamedStruct { declaration, .. } => {
                 Some(self.named_struct(declaration, capability))
             }
+            SemanticType::GeneratedStruct {
+                template,
+                arguments,
+                ..
+            } => Some(self.generated_struct(template, arguments, capability)),
             SemanticType::AnonymousStruct { expression, .. } => {
                 Some(self.anonymous_struct(expression, capability))
             }

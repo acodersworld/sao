@@ -569,16 +569,17 @@ fn format_expression_into(
             );
             child_expression(output, source, "value", inner, depth);
         }
-        ExpressionKind::StructConstruction { name, fields } => {
+        ExpressionKind::TypeValue(type_syntax) => {
+            line(output, depth, format_args!("TypeValue {}", location(span)));
+            child_type(output, source, "type", type_syntax, depth);
+        }
+        ExpressionKind::StructConstruction { owner, fields } => {
             line(
                 output,
                 depth,
-                format_args!(
-                    "StructConstruction {:?} {}",
-                    text(source, *name),
-                    location(span)
-                ),
+                format_args!("StructConstruction {}", location(span)),
             );
+            child_type(output, source, "owner", owner, depth);
             struct_initializer_list(output, source, fields, depth);
         }
         ExpressionKind::AnonymousStruct { members } => {
@@ -858,7 +859,7 @@ fn format_type_into(
     let span = type_syntax.span;
 
     match &type_syntax.kind {
-        TypeKind::Meta => line(output, depth, format_args!("Type {}", location(span))),
+        TypeKind::ComptimeType => line(output, depth, format_args!("ComptimeType {}", location(span))),
         TypeKind::Primitive(primitive) => line(
             output,
             depth,
@@ -881,6 +882,41 @@ fn format_type_into(
             if !arguments.is_empty() {
                 type_list(output, source, "arguments", arguments, depth);
             }
+        }
+        TypeKind::GeneratedStruct { members } => {
+            line(
+                output,
+                depth,
+                format_args!("GeneratedStruct {}", location(span)),
+            );
+            line(output, depth + 1, format_args!("members:"));
+            if members.is_empty() {
+                line(output, depth + 2, format_args!("(empty)"));
+            }
+            for (index, member) in members.iter().enumerate() {
+                line(output, depth + 2, format_args!("[{index}]:"));
+                match member {
+                    StructMember::Field(field) => {
+                        format_struct_field_into(output, source, field, depth + 3);
+                    }
+                    StructMember::Function(function) => {
+                        format_function_into(output, source, function, depth + 3);
+                    }
+                }
+            }
+        }
+        TypeKind::Associated {
+            owner,
+            member,
+            arguments,
+        } => {
+            line(
+                output,
+                depth,
+                format_args!("AssociatedType {:?} {}", text(source, *member), location(span)),
+            );
+            child_type(output, source, "owner", owner, depth);
+            type_list(output, source, "arguments", arguments, depth);
         }
         TypeKind::Mutable(inner) => {
             line(output, depth, format_args!("Mutable {}", location(span)));
@@ -1105,9 +1141,9 @@ mod tests {
     #[test]
     fn formats_parameterized_builtin_associated_calls() {
         for (source, builtin) in [
-            ("Queue<int>::new()", "Queue"),
-            ("Vector<string>::new()", "Vector"),
-            ("Map<string, int>::new()", "Map"),
+            ("Queue(int)::new()", "Queue"),
+            ("Vector(string)::new()", "Vector"),
+            ("Map(string, int)::new()", "Map"),
         ] {
             let expression = parse_expression_source(source);
             let output = format_expression(&module(source), &expression);
@@ -1116,7 +1152,7 @@ mod tests {
             assert!(output.contains("AssociatedAccess \"new\""));
         }
 
-        let source = "Error<string>::new(message)";
+        let source = "Error(string)::new(message)";
         let expression = parse_expression_source(source);
         let output = format_expression(&module(source), &expression);
         assert!(output.starts_with("Call @ 0..27"));
@@ -1133,10 +1169,10 @@ mod tests {
         assert!(output.contains("Builtin Error @ 0..5"));
 
         for (source, builtin) in [
-            ("Queue<int>", "Queue"),
-            ("Vector<string>", "Vector"),
-            ("Map<string, int>", "Map"),
-            ("Error<int>", "Error"),
+            ("Queue(int)", "Queue"),
+            ("Vector(string)", "Vector"),
+            ("Map(string, int)", "Map"),
+            ("Error(int)", "Error"),
         ] {
             let type_syntax = parse_type_source(source);
             assert!(
@@ -1152,7 +1188,8 @@ mod tests {
         let expression = parse_expression_source(source);
         let output = format_expression(&module(source), &expression);
 
-        assert!(output.starts_with("StructConstruction \"Point\" @ 0..18"));
+        assert!(output.starts_with("StructConstruction @ 0..18"));
+        assert!(output.contains("owner:\n    Named \"Point\" @ 0..5"));
         assert!(output.contains("FieldInitializer \"x\" @ 8..16"));
         assert!(output.contains("Binary Add @ 11..16"));
 
@@ -1179,7 +1216,7 @@ mod tests {
 
     #[test]
     fn formats_type_test_expressions() {
-        let source = "result is Error<string> | none";
+        let source = "result is Error(string) | none";
         let expression = parse_expression_source(source);
 
         assert_eq!(

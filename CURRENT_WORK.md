@@ -39,16 +39,20 @@ and typed-expression value-category metadata are implemented.
 Source type resolution is complete. It predeclares nominal struct and interface
 types, resolves every concrete type-syntax node to a canonical type identity,
 leaves the unspecialized `Error::new` owner for built-in inference, supports
-forward and recursive references, and diagnoses invalid named type
-arguments, built-in arity, queue element types, and intersection members. Unknown
-type names remain diagnostics of the preceding name-resolution pass.
+forward aliases and recursive references, materializes and caches nominal
+generated structs from type factories, specializes their captured type syntax,
+and diagnoses invalid applications, alias cycles, and expanding factory
+recursion. It also diagnoses invalid named type arguments, built-in arity,
+queue element types, and intersection members. Unknown type names remain
+diagnostics of the preceding name-resolution pass.
 
 Declaration and signature collection is complete. It records named and anonymous
-struct members, every explicit callable header, interface requirements,
+struct members, factory-generated struct instances and their specialized
+callables, every explicit callable header, interface requirements,
 owner-independent canonical method identities, callable value types, and the
 specified compiler-known signature catalogue. It also validates shared member
-namespaces and the required `main` signature while preserving deferred anonymous
-field inference.
+namespaces and the required `main` signature while preserving deferred
+anonymous field inference.
 
 ## Semantic analysis work queue
 
@@ -283,39 +287,41 @@ reviewable phases:
          entry, but not by both forms or by repeated `where` entries. Named
          constraints must denote interfaces; concrete types are rejected.
        - Review and commit this change before implementing type-factory semantics.
-     - Change 2, type factories, generated structs, and built-in migration (next):
-       - Support type-producing functions at file level and as receiverless
+     - Change 2, type factories, generated structs, and built-in migration (complete):
+       - Complete: support type-producing functions at file level and as receiverless
          struct members. A function returning `type` has no receiver or runtime
-         parameters and contains one final type expression or explicit
-         type-valued return.
-       - Restrict type-producing bodies to type parameters, existing type
+         parameters, uses only unconstrained `comptime T: type` parameters in
+         this change, and contains one final type expression or explicit
+         type-valued return. Local and anonymous-struct type factories remain
+         rejected.
+       - Complete: restrict type-producing bodies to type parameters, existing type
          composition, generated struct type literals, aliases, and calls to
          known type factories. Defer locals, runtime expressions, conditionals,
          loops, mutation, and arbitrary compile-time execution.
-       - Generated structs declare explicitly typed fields without initializers,
-         may declare ordinary methods and receiverless associated type
-         factories, may reference enclosing compile-time type parameters, and
-         cannot capture runtime values.
-       - Give generated structs nominal identity derived from their declaration
+       - Complete: generated structs declare explicitly typed fields without initializers,
+         may declare ordinary methods, receiverless associated functions, and
+         receiverless associated type factories, may reference enclosing
+         compile-time type parameters, and cannot capture runtime values.
+       - Complete: give generated structs nominal identity derived from their declaration
          and concrete type arguments. Cache factory applications by factory
          identity and canonical argument types, install in-progress placeholders
          for exact recursion, and diagnose expanding instantiation and invalid
          inline recursive layouts deterministically.
-       - Permit construction and associated selection through applications such
+       - Complete: permit construction and associated selection through applications such
          as `Box(int) { inner: 10 }` and `Box(int)::function()`. Permit
          associated type-factory calls through statically known concrete types,
          but reject them through a type parameter.
-       - Resolve aliases forward, preserve their exact underlying identity, and
+       - Complete: resolve aliases forward, preserve their exact underlying identity, and
          diagnose direct and indirect alias cycles.
-       - Replace the compiler-known angle-bracket forms with `Queue(T)`,
+       - Complete: replace the compiler-known angle-bracket forms with `Queue(T)`,
          `Vector(T)`, `Map(K, V)`, and `Error(T)` without compatibility aliases.
          Use `Queue(T)::new()`, `Vector(T)::new()`, `Map(K, V)::new()`, and
          `Error(T)::new(value)`, while retaining compiler-known
          `Error::new(value)` expected-type or payload inference.
-       - Keep built-in runtime representations compiler-known while routing
+       - Complete: keep built-in runtime representations compiler-known while routing
          their arity and type application through the shared factory machinery.
        - Stop for review and commit before implementing runtime templates.
-     - Change 3, bounded runtime templates and specialization:
+     - Change 3, bounded runtime templates and specialization (next):
        - Support top-level templated runtime functions and templated struct
          methods. Type arguments are explicit, appear in declared order, and
          are never inferred; unspecialized templates are not first-class
