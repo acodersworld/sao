@@ -215,6 +215,9 @@ fn main() {
     const comparison = calculated >= initial && truth || false;
     const formatted = f"{{total}} {summary.name:<20}: {calculated:+08} ({decimal:.2f})";
     const boxed: IntBox = Box(int) { inner: calculated };
+    const inline_inspection = inspect_inline(BriefFormatter, BriefFormatter {});
+    const named_inspection = inspect_named(DetailedFormatter, DetailedFormatter {});
+    const private_inspection = inspect_private(BriefFormatter, BriefFormatter {});
 
     summary.total = calculated;
     summary.total += recovered;
@@ -234,6 +237,9 @@ fn main() {
     character;
     announce(character_code);
     println(formatted);
+    println(inline_inspection);
+    println(named_inspection);
+    println(private_inspection);
     announce(boxed.get());
     heap_formatter.format(text);
     heap_scale(initial);

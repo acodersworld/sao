@@ -115,6 +115,41 @@ impl StructSignature {
     pub fn field_order(&self) -> &[String] {
         &self.field_order
     }
+
+    /// Materializes the field portion of a generated struct signature for one
+    /// runtime-template substitution. Method specialization is deliberately
+    /// left to Phase 7.4.5; member identities remain source identities here.
+    pub(crate) fn substitute_template_parameters(
+        &self,
+        substitutions: &HashMap<NodeId, TypeId>,
+        types: &mut TypeStore,
+    ) -> Self {
+        let type_id = types
+            .substitute_template_parameters(self.type_id, substitutions)
+            .expect("generated struct type belongs to the program store");
+        let members = self
+            .members
+            .iter()
+            .map(|(name, member)| {
+                let mut member = *member;
+                if let StructMemberSignatureKind::Field(field) = &mut member.kind
+                    && let Some(type_id) = field.type_id
+                {
+                    field.type_id = Some(
+                        types
+                            .substitute_template_parameters(type_id, substitutions)
+                            .expect("generated field type belongs to the program store"),
+                    );
+                }
+                (name.clone(), member)
+            })
+            .collect();
+        Self {
+            type_id,
+            members,
+            field_order: self.field_order.clone(),
+        }
+    }
 }
 
 /// One structurally matched interface requirement.

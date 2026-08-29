@@ -9,6 +9,7 @@ use crate::ast::{
     ReceiverStorage, Statement, StatementKind, StructDeclaration, StructField,
     StructFieldInitializer, StructMember, TypeAliasDeclaration, TypeKind, TypeSyntax,
     UnaryOperator, ValueCapability, WhereClause, WhereConstraint,
+    expression_as_type_syntax,
 };
 use crate::lexer::{LexError, Token, TokenKind};
 use crate::source::{ModuleId, Span};
@@ -541,7 +542,11 @@ where
                     ),
                 }
             } else {
-                InterfaceConstraint::Named(self.named_type()?)
+                // A `where` bound may guarantee several interfaces at once.
+                // Parse only the intersection layer: unions are not valid
+                // constraints, while the following comma or body brace still
+                // delimits this entry unambiguously.
+                InterfaceConstraint::Named(self.intersection_type()?)
             };
             let end = match &interface {
                 InterfaceConstraint::Named(interface) => interface.span.end,
@@ -2662,42 +2667,6 @@ fn invalid_formatted_string_expression<T>(span: Span) -> ParseResult<T> {
 /// a construction or `::` as type syntax. This resolves the surface ambiguity
 /// between `Factory(T)` and an ordinary call only once the following `{` or
 /// `::` proves that the source denotes a type application.
-fn expression_as_type_syntax(expression: &Expression) -> Option<TypeSyntax> {
-    match &expression.kind {
-        ExpressionKind::Identifier => Some(TypeSyntax::new(
-            TypeKind::Named {
-                name: expression.span,
-                arguments: Vec::new(),
-            },
-            expression.span,
-        )),
-        ExpressionKind::TypeValue(type_syntax) => Some(type_syntax.clone()),
-        ExpressionKind::Group(inner) => {
-            let inner = expression_as_type_syntax(inner)?;
-            Some(TypeSyntax::new(
-                TypeKind::Group(Box::new(inner)),
-                expression.span,
-            ))
-        }
-        ExpressionKind::Call { callee, arguments }
-            if matches!(&callee.kind, ExpressionKind::Identifier) =>
-        {
-            let arguments = arguments
-                .iter()
-                .map(expression_as_type_syntax)
-                .collect::<Option<Vec<_>>>()?;
-            Some(TypeSyntax::new(
-                TypeKind::Named {
-                    name: callee.span,
-                    arguments,
-                },
-                expression.span,
-            ))
-        }
-        _ => None,
-    }
-}
-
 const fn primitive_token(primitive: PrimitiveType) -> TokenKind {
     match primitive {
         PrimitiveType::Unit => TokenKind::LeftParen,
@@ -7365,8 +7334,9 @@ mod tests {
         let source = concat!(
             "type IntBox = Box(int);\n",
             "interface Reader { fn read(self) -> int; }\n",
+            "interface Writer { fn write(self, value: int); }\n",
             "fn make(comptime T: type, comptime R: Reader, comptime U: type, input: T) -> ()\n",
-            "where T: Reader, U: interface { fn read(self) -> int; }, {}\n",
+            "where T: Reader & Writer, U: interface { fn read(self) -> int; }, {}\n",
             "fn main() {}",
         );
         let program = parse_program_source(source).expect("template syntax should parse");
@@ -7379,7 +7349,7 @@ mod tests {
             TypeKind::Named { arguments, .. } if arguments.len() == 1
         ));
 
-        let Declaration::Function(function) = &program.declarations[2] else {
+        let Declaration::Function(function) = &program.declarations[3] else {
             panic!("expected a function");
         };
         assert!(matches!(
@@ -7411,7 +7381,10 @@ mod tests {
         assert_eq!(where_clause.constraints.len(), 2);
         assert!(matches!(
             &where_clause.constraints[0].interface,
-            InterfaceConstraint::Named(_)
+            InterfaceConstraint::Named(TypeSyntax {
+                kind: TypeKind::Intersection { members },
+                ..
+            }) if members.len() == 2
         ));
         assert!(matches!(
             &where_clause.constraints[1].interface,

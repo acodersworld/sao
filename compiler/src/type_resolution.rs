@@ -16,7 +16,7 @@ use crate::{
         ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
         ComptimeParameterConstraint, InterfaceConstraint, InterfaceMethodRequirement, NodeId,
         PrimitiveType, Program, Statement, StatementKind, StructMember, TypeAliasDeclaration,
-        TypeKind, TypeSyntax,
+        TypeKind, TypeSyntax, expression_as_type_syntax,
     },
     name_resolution::NameResolution,
     semantic_types::{AccessCapability, SemanticType, TypeId, TypeStore},
@@ -34,6 +34,16 @@ pub struct TypeResolution {
     specialized_syntax_types: HashMap<(TypeId, NodeId), TypeId>,
     template_parameter_bounds: HashMap<NodeId, Option<TypeId>>,
     specialized_template_parameter_bounds: HashMap<(TypeId, NodeId), Option<TypeId>>,
+    runtime_template_calls: HashMap<NodeId, RuntimeTemplateCall>,
+}
+
+/// Concrete type arguments attached to one explicit top-level runtime-template
+/// call. Runtime arguments remain in the call AST after this leading prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeTemplateCall {
+    pub(crate) declaration: NodeId,
+    pub(crate) type_arguments: Vec<TypeId>,
+    pub(crate) comptime_argument_count: usize,
 }
 
 /// One canonical struct materialized from a type-factory body.
@@ -124,6 +134,11 @@ impl TypeResolution {
         }
         self.template_parameter_bounds.get(declaration).copied()
     }
+
+    #[must_use]
+    pub(crate) fn runtime_template_call(&self, call: NodeId) -> Option<&RuntimeTemplateCall> {
+        self.runtime_template_calls.get(&call)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +172,7 @@ pub enum TypeResolutionErrorKind {
     InvalidRuntimeTemplateDeclaration,
     InvalidTemplateConstraint,
     InvalidInterfaceRequirementType,
+    InvalidRuntimeTemplateTypeArgument,
 }
 
 impl fmt::Display for TypeResolutionError {
@@ -251,6 +267,11 @@ impl fmt::Display for TypeResolutionError {
                 "an interface requirement cannot return `type` at {}..{}",
                 self.span.start, self.span.end
             ),
+            TypeResolutionErrorKind::InvalidRuntimeTemplateTypeArgument => write!(
+                formatter,
+                "runtime template argument must be a type at {}..{}",
+                self.span.start, self.span.end
+            ),
         }
     }
 }
@@ -288,6 +309,7 @@ struct Resolver<'source, 'names> {
     aliases: HashMap<SymbolId, TypeAliasDeclaration>,
     factories: HashMap<SymbolId, Function>,
     factories_by_id: HashMap<NodeId, Function>,
+    runtime_templates: HashMap<SymbolId, Function>,
     associated_factories: HashMap<(NodeId, String), Function>,
     alias_cache: HashMap<SymbolId, TypeId>,
     alias_stack: Vec<SymbolId>,
@@ -300,6 +322,7 @@ struct Resolver<'source, 'names> {
     specialized_syntax_types: HashMap<(TypeId, NodeId), TypeId>,
     template_parameter_bounds: HashMap<NodeId, Option<TypeId>>,
     specialized_template_parameter_bounds: HashMap<(TypeId, NodeId), Option<TypeId>>,
+    runtime_template_calls: HashMap<NodeId, RuntimeTemplateCall>,
     errors: Vec<TypeResolutionError>,
 }
 
@@ -315,6 +338,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
             aliases: HashMap::new(),
             factories: HashMap::new(),
             factories_by_id: HashMap::new(),
+            runtime_templates: HashMap::new(),
             associated_factories: HashMap::new(),
             alias_cache: HashMap::new(),
             alias_stack: Vec::new(),
@@ -327,6 +351,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
             specialized_syntax_types: HashMap::new(),
             template_parameter_bounds: HashMap::new(),
             specialized_template_parameter_bounds: HashMap::new(),
+            runtime_template_calls: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -347,6 +372,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 specialized_syntax_types: self.specialized_syntax_types,
                 template_parameter_bounds: self.template_parameter_bounds,
                 specialized_template_parameter_bounds: self.specialized_template_parameter_bounds,
+                runtime_template_calls: self.runtime_template_calls,
             })
         } else {
             Err(self.errors)
@@ -375,6 +401,13 @@ impl<'source, 'names> Resolver<'source, 'names> {
                         .expect("type factory must have a resolved symbol");
                     self.factories.insert(symbol, function.clone());
                     self.factories_by_id.insert(function.id, function.clone());
+                }
+                Declaration::Function(function) if self.is_runtime_template(function) => {
+                    let symbol = self
+                        .names
+                        .symbol_for_declaration(function.id)
+                        .expect("runtime template must have a resolved symbol");
+                    self.runtime_templates.insert(symbol, function.clone());
                 }
                 Declaration::Struct(structure) => {
                     for member in &structure.members {
@@ -847,8 +880,47 @@ impl<'source, 'names> Resolver<'source, 'names> {
             }
             ExpressionKind::Call { callee, arguments } => {
                 self.visit_expression(callee);
-                for argument in arguments {
-                    self.visit_expression(argument);
+                let template = self
+                    .names
+                    .symbol_for_reference(callee.id)
+                    .and_then(|symbol| self.runtime_templates.get(&symbol))
+                    .cloned();
+                if let Some(template) = template {
+                    let comptime_argument_count = template
+                        .parameters
+                        .iter()
+                        .take_while(|parameter| {
+                            matches!(&parameter.kind, FunctionParameterKind::Comptime { .. })
+                        })
+                        .count();
+                    let mut type_arguments = Vec::new();
+                    for argument in arguments.iter().take(comptime_argument_count) {
+                        if let Some(type_syntax) = expression_as_type_syntax(argument) {
+                            type_arguments.push(self.resolve_type(&type_syntax));
+                        } else {
+                            self.error(
+                                TypeResolutionErrorKind::InvalidRuntimeTemplateTypeArgument,
+                                argument.span,
+                            );
+                            type_arguments.push(self.types.recovery());
+                            self.visit_expression(argument);
+                        }
+                    }
+                    for argument in arguments.iter().skip(comptime_argument_count) {
+                        self.visit_expression(argument);
+                    }
+                    self.runtime_template_calls.insert(
+                        expression.id,
+                        RuntimeTemplateCall {
+                            declaration: template.id,
+                            type_arguments,
+                            comptime_argument_count,
+                        },
+                    );
+                } else {
+                    for argument in arguments {
+                        self.visit_expression(argument);
+                    }
                 }
             }
             ExpressionKind::MemberAccess { object, .. } => self.visit_expression(object),

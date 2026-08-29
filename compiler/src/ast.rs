@@ -678,6 +678,46 @@ pub enum ExpressionKind {
     },
 }
 
+/// Reinterprets expression-shaped syntax in a compile-time type-argument
+/// position while preserving its source node identities.
+///
+/// This interpretation is deliberately delayed: `inspect(Item, value)` is
+/// indistinguishable from an ordinary call until name resolution establishes
+/// that `inspect` declares leading `comptime` parameters.
+#[must_use]
+pub fn expression_as_type_syntax(expression: &Expression) -> Option<TypeSyntax> {
+    let kind = match &expression.kind {
+        ExpressionKind::Identifier => TypeKind::Named {
+            name: expression.span,
+            arguments: Vec::new(),
+        },
+        ExpressionKind::TypeValue(type_syntax) => return Some(type_syntax.clone()),
+        ExpressionKind::Group(inner) => {
+            TypeKind::Group(Box::new(expression_as_type_syntax(inner)?))
+        }
+        ExpressionKind::Call { callee, arguments }
+            if matches!(&callee.kind, ExpressionKind::Identifier) =>
+        {
+            TypeKind::Named {
+                name: callee.span,
+                arguments: arguments
+                    .iter()
+                    .map(expression_as_type_syntax)
+                    .collect::<Option<Vec<_>>>()?,
+            }
+        }
+        ExpressionKind::GcAllocate(inner) => {
+            TypeKind::Gc(Box::new(expression_as_type_syntax(inner)?))
+        }
+        _ => return None,
+    };
+    Some(TypeSyntax {
+        id: expression.id,
+        kind,
+        span: expression.span,
+    })
+}
+
 /// One source-ordered portion of a formatted string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormattedStringPart {

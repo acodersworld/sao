@@ -13,7 +13,7 @@ use crate::{
         AnonymousStructMember, Block, ComptimeParameterConstraint, ConditionalElse, Declaration,
         Expression, ExpressionKind, FormattedStringPart, Function, FunctionParameter,
         FunctionParameterKind, InterfaceConstraint, InterfaceMethodRequirement, NodeId, Program,
-        Statement, StatementKind, StructMember, TypeKind, TypeSyntax,
+        Statement, StatementKind, StructMember, TypeKind, TypeSyntax, expression_as_type_syntax,
     },
     source::{ModuleId, SourceModule, Span},
     symbol_table::{
@@ -142,6 +142,10 @@ struct Resolver<'source> {
     references: HashMap<NodeId, SymbolId>,
     errors: Vec<NameResolutionError>,
     top_level_main_count: usize,
+    /// Leading compile-time argument count for top-level runtime templates.
+    /// It lets call arguments enter the type namespace before later passes
+    /// validate and materialize the specialization.
+    runtime_template_arities: HashMap<SymbolId, usize>,
 }
 
 impl<'source> Resolver<'source> {
@@ -172,6 +176,7 @@ impl<'source> Resolver<'source> {
             references: HashMap::new(),
             errors: Vec::new(),
             top_level_main_count: 0,
+            runtime_template_arities: HashMap::new(),
         }
     }
 
@@ -217,12 +222,26 @@ impl<'source> Resolver<'source> {
                     } else {
                         SymbolKind::Function
                     };
-                    self.declare(
+                    let symbol = self.declare(
                         self.program_scope,
                         function.id,
                         function.name,
                         kind,
                     );
+                    let comptime_count = function
+                        .parameters
+                        .iter()
+                        .take_while(|parameter| {
+                            matches!(&parameter.kind, FunctionParameterKind::Comptime { .. })
+                        })
+                        .count();
+                    if kind == SymbolKind::Function
+                        && comptime_count != 0
+                        && let Some(symbol) = symbol
+                    {
+                        self.runtime_template_arities
+                            .insert(symbol, comptime_count);
+                    }
                 }
                 Declaration::Struct(structure) => {
                     self.declare(
@@ -580,8 +599,20 @@ impl<'source> Resolver<'source> {
             }
             ExpressionKind::Call { callee, arguments } => {
                 self.resolve_expression(scope, callee);
-                for argument in arguments {
-                    self.resolve_expression(scope, argument);
+                let comptime_count = self
+                    .references
+                    .get(&callee.id)
+                    .and_then(|symbol| self.runtime_template_arities.get(symbol))
+                    .copied()
+                    .unwrap_or(0);
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index < comptime_count
+                        && let Some(type_syntax) = expression_as_type_syntax(argument)
+                    {
+                        self.resolve_type(scope, &type_syntax);
+                    } else {
+                        self.resolve_expression(scope, argument);
+                    }
                 }
             }
             ExpressionKind::MemberAccess { object, .. } => {

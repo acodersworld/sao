@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-29
+Last reviewed: 2026-08-30
 
 ## Current phase
 
@@ -345,38 +345,39 @@ reviewable phases:
          declared constraints so an invalid template is diagnosed independently
          of whether it is ever specialized.
        - Stop for review and commit before implementing specialization.
-     - Change 4, top-level runtime specialization (next):
-       - Support explicit specialization of top-level templated runtime
-         functions. Type arguments appear in declared order and are never
-         inferred.
-       - Verify every concrete type argument against its declared constraint
-         before analyzing the specialization, with deterministic diagnostics
-         and recovery for independently invalid arguments.
-       - At each requested specialization, substitute concrete type identities
-         and reuse ordinary expression analysis for exact capabilities, places,
-         transfers, returns, layouts, and diagnostics. Cache callable
-         specializations and record their identities for typed IR and lowering.
-       - Permit exact recursive specialization and diagnose unbounded
-         type-expanding specialization deterministically.
-       - Stop for review and commit before implementing method specialization.
-     - Change 5, method specialization and completion (pending):
-       - Support explicit specialization of templated methods on named and
-         generated structs. Combine the concrete owner identity with the
-         method's declared type arguments when forming the canonical callable
-         specialization identity.
-       - Reuse bounded-template checking, constraint satisfaction, substitution,
-         recursion handling, ordinary expression analysis, and lowering
-         metadata from top-level specialization.
-       - Defer local template declarations and local type aliases.
-       - Add focused coverage for namespace collisions, aliases, factory
-         composition and identity, generated structs, recursion, constraints,
-         explicit top-level and method specializations,
-         specialization-dependent value semantics, diagnostics, recovery, and
-         the migrated built-in syntax. Update the complex-program test to
-         exercise the complete feature.
-       - Update the language design and implementation-status documents and
-         mark Phase 7.4 complete only after this fifth change has been reviewed.
-       Stop for review and commit before beginning Phase 7.5.
+      - Change 4, top-level runtime specialization (complete):
+        - Complete: support explicit specialization of top-level templated runtime
+          functions. Calls supply type arguments in the leading declared
+          positions, as in `inspect(File, file)`. They are never inferred and
+          are not runtime-evaluated expressions.
+        - Complete: verify every concrete type argument against its declared constraint
+          before analyzing the specialization, with deterministic diagnostics
+          and recovery for independently invalid arguments.
+        - Complete: at each requested specialization, substitute concrete type identities
+          and reuse ordinary expression analysis for exact capabilities, places,
+          transfers, returns, layouts, and diagnostics. Cache callable
+          specializations and record their identities for typed IR and lowering.
+        - Complete: permit exact recursive specialization and diagnose unbounded
+          type-expanding specialization deterministically.
+        - Stop for review and commit before implementing method specialization.
+      - Change 5, method specialization and completion (next):
+        - Support explicit specialization of templated methods on named and
+          generated structs. Combine the concrete owner identity with the
+          method's declared type arguments when forming the canonical callable
+          specialization identity.
+        - Reuse bounded-template checking, constraint satisfaction, substitution,
+          recursion handling, ordinary expression analysis, and lowering
+          metadata from top-level specialization.
+        - Defer local template declarations and local type aliases.
+        - Add focused coverage for namespace collisions, aliases, factory
+          composition and identity, generated structs, recursion, constraints,
+          explicit top-level and method specializations,
+          specialization-dependent value semantics, diagnostics, recovery, and
+          the migrated built-in syntax. Update the complex-program test to
+          exercise the complete feature.
+        - Update the language design and implementation-status documents and
+          mark Phase 7.4 complete only after this fifth change has been reviewed.
+        Stop for review and commit before beginning Phase 7.5.
      - Compile-time values other than types, arbitrary compile-time execution,
        generic inference, first-class template values, local templates, and
        compile-time duck typing remain deferred.

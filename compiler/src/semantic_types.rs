@@ -631,6 +631,86 @@ impl TypeStore {
         }
     }
 
+    /// Replaces symbolic runtime-template parameters throughout a canonical
+    /// type. The capability written at each use of `T` is applied to the
+    /// concrete argument, so `const value: T` and `const vmut value: T` remain
+    /// distinct after specialization.
+    pub fn substitute_template_parameters(
+        &mut self,
+        id: TypeId,
+        substitutions: &HashMap<NodeId, TypeId>,
+    ) -> Option<TypeId> {
+        let semantic = self.get(id)?.clone();
+        Some(match semantic {
+            SemanticType::TemplateParameter {
+                declaration,
+                capability,
+            } => {
+                let concrete = substitutions.get(&declaration).copied().unwrap_or(id);
+                self.with_capability(concrete, capability)?
+            }
+            SemanticType::Gc { target, .. } => {
+                let target = self.substitute_template_parameters(target, substitutions)?;
+                self.gc(target)?
+            }
+            SemanticType::Callable {
+                parameters,
+                return_type,
+                capability,
+            } => {
+                let parameters = parameters
+                    .into_iter()
+                    .map(|parameter| self.substitute_template_parameters(parameter, substitutions))
+                    .collect::<Option<Vec<_>>>()?;
+                let return_type =
+                    self.substitute_template_parameters(return_type, substitutions)?;
+                self.callable(parameters, return_type, capability)
+            }
+            SemanticType::GeneratedStruct {
+                template,
+                arguments,
+                capability,
+            } => {
+                let arguments = arguments
+                    .into_iter()
+                    .map(|argument| self.substitute_template_parameters(argument, substitutions))
+                    .collect::<Option<Vec<_>>>()?;
+                self.generated_struct(template, arguments, capability)
+            }
+            SemanticType::Builtin {
+                builtin,
+                arguments,
+                capability,
+            } => {
+                let arguments = arguments
+                    .into_iter()
+                    .map(|argument| self.substitute_template_parameters(argument, substitutions))
+                    .collect::<Option<Vec<_>>>()?;
+                self.builtin(builtin, arguments, capability)
+            }
+            SemanticType::Union { members, capability } => {
+                let members = members
+                    .into_iter()
+                    .map(|member| self.substitute_template_parameters(member, substitutions))
+                    .collect::<Option<Vec<_>>>()?;
+                self.union(members, capability)
+            }
+            SemanticType::Intersection { members, capability } => {
+                let members = members
+                    .into_iter()
+                    .map(|member| self.substitute_template_parameters(member, substitutions))
+                    .collect::<Option<Vec<_>>>()?;
+                self.intersection(members, capability)
+            }
+            SemanticType::Primitive { .. }
+            | SemanticType::NamedStruct { .. }
+            | SemanticType::AnonymousStruct { .. }
+            | SemanticType::Interface { .. }
+            | SemanticType::Recovery
+            | SemanticType::Divergence => id,
+        })
+    }
+
     /// Returns the number of canonical types currently held by this store.
     #[must_use]
     pub const fn len(&self) -> usize {

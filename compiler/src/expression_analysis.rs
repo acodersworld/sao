@@ -27,8 +27,9 @@ use crate::{
         ValueCategory, ValueTransfer,
     },
     signature_collection::{
-        BuiltinMemberOwner, BuiltinMemberSignature, InterfaceRequirementSignature, MethodId,
-        ReceiverSignature, SignatureCollection, StructMemberSignatureKind, StructSignature,
+        BuiltinMemberOwner, BuiltinMemberSignature, CallableSignature,
+        InterfaceRequirementSignature, MethodId, ReceiverSignature, SignatureCollection,
+        StructMemberSignatureKind, StructSignature,
     },
     source::{SourceModule, Span},
     symbol_table::{SymbolId, SymbolKind},
@@ -549,6 +550,10 @@ enum ExpressionCheckingErrorKind {
     MethodRequiresValue,
     MethodRequiresCall,
     TemplateRequiresSpecialization,
+    InvalidRuntimeTemplateArgument {
+        found: TypeId,
+    },
+    ExpandingRuntimeTemplateSpecialization,
     CopyRequiresCall,
     CopyRequiresValue,
     ReceiverStorageMismatch,
@@ -609,6 +614,8 @@ struct ExpressionChecking {
     /// formatting behavior for typed IR and lowering.
     formatted_strings: HashMap<NodeId, Vec<ResolvedInterpolation>>,
     generated_methods: HashMap<(TypeId, NodeId), GeneratedMethodChecking>,
+    runtime_specialization_calls: HashMap<NodeId, RuntimeCallableSpecializationId>,
+    runtime_specializations: Vec<RuntimeCallableSpecialization>,
     /// Bindings written by assignment. For object-like locals, lowering uses
     /// this to decide when the source-level reference needs indirection in
     /// addition to any frame-owned backing storage.
@@ -628,6 +635,24 @@ struct GeneratedMethodChecking {
     transfers: HashMap<NodeId, ValueTransfer>,
     places: HashMap<NodeId, Place>,
     resolved_members: HashMap<NodeId, ResolvedMember>,
+    runtime_specialization_calls: HashMap<NodeId, RuntimeCallableSpecializationId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RuntimeCallableSpecializationId(usize);
+
+/// One canonical top-level runtime-template instantiation. Its declaration and
+/// ordered concrete type arguments form the identity used by typed IR and
+/// lowering; the source body is checked independently for each identity.
+#[derive(Debug, Clone)]
+struct RuntimeCallableSpecialization {
+    declaration: NodeId,
+    type_arguments: Vec<TypeId>,
+    signature: CallableSignature,
+    /// Full ordinary-analysis result for this reuse of the source AST. A box
+    /// breaks the recursive metadata shape because checking can itself refer
+    /// to further callable specializations.
+    checking: Box<ExpressionChecking>,
 }
 
 #[derive(Debug, Default)]
@@ -937,6 +962,10 @@ struct Analyzer<'semantic> {
     /// order is retained so recursive-layout diagnostics are deterministic.
     aggregate_order: Vec<TypeId>,
     aggregate_layouts: HashMap<TypeId, AggregateLayout>,
+    /// Concrete generated owners first reached by substituting a runtime
+    /// template, rather than by explicit source type syntax.
+    runtime_generated_structs: HashMap<TypeId, StructSignature>,
+    runtime_generated_callables: HashMap<(TypeId, NodeId), CallableSignature>,
     /// Flow-sensitive provenance of the storage currently denoted by each
     /// binding. Declared type and qualifiers remain in `checking.bindings`.
     current_binding_categories: HashMap<SymbolId, ValueCategory>,
@@ -948,6 +977,22 @@ struct Analyzer<'semantic> {
     /// but its loop transfers cannot contribute runtime exits.
     current_path_reachable: bool,
     current_specialized_owner: Option<TypeId>,
+    /// Concrete `T` identities while rechecking one top-level runtime-template
+    /// body. The source AST and collected symbolic signature stay immutable.
+    current_template_substitutions: Option<HashMap<NodeId, TypeId>>,
+    /// Per-syntax-node view of the same substitution, used by annotations,
+    /// constructions, ascriptions, and every other ordinary type boundary.
+    current_template_syntax_types: Option<HashMap<NodeId, TypeId>>,
+    top_level_templates: HashMap<NodeId, Function>,
+    /// Canonical declaration-plus-argument identities. An entry is installed
+    /// before body analysis so exact recursive calls reuse it immediately.
+    specialization_cache:
+        HashMap<(NodeId, Vec<TypeId>), RuntimeCallableSpecializationId>,
+    /// In-progress keys used to distinguish exact recursion from a request
+    /// which keeps expanding the same declaration's type arguments.
+    active_specializations: Vec<(NodeId, Vec<TypeId>)>,
+    runtime_specialization_calls: HashMap<NodeId, RuntimeCallableSpecializationId>,
+    runtime_specializations: Vec<RuntimeCallableSpecialization>,
     /// Loops whose bodies are currently being checked. Resolved transfer
     /// targets select an entry here, so nested-loop breaks never leak outward.
     active_loops: Vec<ActiveLoop>,
@@ -1082,10 +1127,30 @@ impl<'semantic> Analyzer<'semantic> {
             receiver_qualifiers,
             aggregate_order,
             aggregate_layouts,
+            runtime_generated_structs: HashMap::new(),
+            runtime_generated_callables: HashMap::new(),
             current_binding_categories: HashMap::new(),
             current_narrowings: HashMap::new(),
             current_path_reachable: true,
             current_specialized_owner: None,
+            current_template_substitutions: None,
+            current_template_syntax_types: None,
+            top_level_templates: program
+                .declarations
+                .iter()
+                .filter_map(|declaration| {
+                    let Declaration::Function(function) = declaration else {
+                        return None;
+                    };
+                    signatures
+                        .is_runtime_template(function.id)
+                        .then(|| (function.id, function.clone()))
+                })
+                .collect(),
+            specialization_cache: HashMap::new(),
+            active_specializations: Vec::new(),
+            runtime_specialization_calls: HashMap::new(),
+            runtime_specializations: Vec::new(),
             active_loops: Vec::new(),
             checking: ExpressionChecking::default(),
         }
@@ -1097,6 +1162,8 @@ impl<'semantic> Analyzer<'semantic> {
         }
         self.visit_generated_struct_methods(program);
         self.validate_finite_inline_layouts();
+        self.checking.runtime_specialization_calls = self.runtime_specialization_calls;
+        self.checking.runtime_specializations = self.runtime_specializations;
         self.checking
     }
 
@@ -1158,13 +1225,31 @@ impl<'semantic> Analyzer<'semantic> {
                 {
                     self.method_owners.insert(function.id, owner);
                 }
+                // Every generated owner reuses the same source NodeIds. Check
+                // it in an isolated result set so `Box(T).get` cannot leave a
+                // cached `self.inner: T` which is then reused while checking
+                // `Box(Item).get`.
+                let parent_checking = std::mem::take(&mut self.checking);
+                let parent_specialization_calls =
+                    std::mem::take(&mut self.runtime_specialization_calls);
                 self.visit_function(&function);
+                let local_checking = std::mem::take(&mut self.checking);
+                let method_specialization_calls =
+                    std::mem::take(&mut self.runtime_specialization_calls);
+                self.checking = parent_checking;
+                for error in &local_checking.errors {
+                    if !self.checking.errors.contains(error) {
+                        self.checking.errors.push(error.clone());
+                    }
+                }
+                self.runtime_specialization_calls = parent_specialization_calls;
                 let checking = GeneratedMethodChecking {
-                    expressions: self.checking.expressions.clone(),
-                    bindings: self.checking.bindings.clone(),
-                    transfers: self.checking.transfers.clone(),
-                    places: self.checking.places.clone(),
-                    resolved_members: self.checking.resolved_members.clone(),
+                    expressions: local_checking.expressions,
+                    bindings: local_checking.bindings,
+                    transfers: local_checking.transfers,
+                    places: local_checking.places,
+                    resolved_members: local_checking.resolved_members,
+                    runtime_specialization_calls: method_specialization_calls,
                 };
                 self.checking
                     .generated_methods
@@ -1181,12 +1266,7 @@ impl<'semantic> Analyzer<'semantic> {
         let enclosing_loops = std::mem::take(&mut self.active_loops);
         self.current_path_reachable = true;
         self.seed_callable_parameters(function.id, &function.parameters);
-        let signature = self
-            .current_specialized_owner
-            .and_then(|owner| self.signatures.specialized_callable(owner, function.id))
-            .or_else(|| self.signatures.callable(function.id))
-            .expect("function signature must have been collected")
-            .clone();
+        let signature = self.resolved_callable_signature(function.id);
         let return_type = signature.return_type;
         self.visit_callable_body(&function.body, return_type);
         self.release_all_narrowings(function.body.id, NarrowingEdgeKind::CallableCompletion);
@@ -1203,12 +1283,8 @@ impl<'semantic> Analyzer<'semantic> {
     /// category are recorded against its resolved symbol. Receivers are not
     /// included because `self` is typed separately from receiver metadata.
     fn seed_callable_parameters(&mut self, callable: NodeId, parameters: &[FunctionParameter]) {
-        let signature = self
-            .current_specialized_owner
-            .and_then(|owner| self.signatures.specialized_callable(owner, callable))
-            .or_else(|| self.signatures.callable(callable))
-            .expect("callable signature must have been collected");
-        let mut semantic_parameters = signature.parameters.clone().into_iter();
+        let signature = self.resolved_callable_signature(callable);
+        let mut semantic_parameters = signature.parameters.into_iter();
 
         for parameter in parameters {
             let FunctionParameterKind::Named { .. } = &parameter.kind else {
@@ -1313,12 +1389,7 @@ impl<'semantic> Analyzer<'semantic> {
                     .context
                     .callable_for_return(statement.id)
                     .expect("return statement must have a resolved callable target");
-                let expected = self
-                    .current_specialized_owner
-                    .and_then(|owner| self.signatures.specialized_callable(owner, callable))
-                    .or_else(|| self.signatures.callable(callable))
-                    .expect("return target must have a collected signature")
-                    .return_type;
+                let expected = self.resolved_callable_signature(callable).return_type;
                 if let Some(value) = value {
                     self.analyze_return_value(value, expected);
                 } else {
@@ -5176,9 +5247,10 @@ impl<'semantic> Analyzer<'semantic> {
         }
         let signature = match aggregate_owner {
             AggregateOwner::Source(_) => self.signatures.callable(declaration),
-            AggregateOwner::Generated(owner) => {
-                self.signatures.specialized_callable(owner, declaration)
-            }
+            AggregateOwner::Generated(owner) => self
+                .signatures
+                .specialized_callable(owner, declaration)
+                .or_else(|| self.runtime_generated_callables.get(&(owner, declaration))),
         }
         .expect("associated function signature must have been collected");
         let type_id = self.types.types_mut().callable(
@@ -5238,7 +5310,9 @@ impl<'semantic> Analyzer<'semantic> {
     /// callables. Capability is part of a value's `TypeId`, but it does not
     /// create a second declaration or a second method specialization.
     fn canonical_generated_owner(&self, type_id: TypeId) -> Option<TypeId> {
-        if self.signatures.generated_struct(type_id).is_some() {
+        if self.signatures.generated_struct(type_id).is_some()
+            || self.runtime_generated_structs.contains_key(&type_id)
+        {
             return Some(type_id);
         }
         self.signatures
@@ -5251,6 +5325,17 @@ impl<'semantic> Analyzer<'semantic> {
                     == Some(true)
             })
             .map(|signature| signature.type_id)
+            .or_else(|| {
+                self.runtime_generated_structs
+                    .values()
+                    .find(|signature| {
+                        self.types
+                            .types()
+                            .has_same_shape(signature.type_id, type_id)
+                            == Some(true)
+                    })
+                    .map(|signature| signature.type_id)
+            })
     }
 
     /// Peels a plain or GC-qualified string/byte sequence. The capability is
@@ -5455,7 +5540,10 @@ impl<'semantic> Analyzer<'semantic> {
                 .signatures
                 .named_struct(owner)
                 .or_else(|| self.signatures.anonymous_struct(owner)),
-            AggregateOwner::Generated(type_id) => self.signatures.generated_struct(type_id),
+            AggregateOwner::Generated(type_id) => self
+                .signatures
+                .generated_struct(type_id)
+                .or_else(|| self.runtime_generated_structs.get(&type_id)),
         }
     }
 
@@ -5975,6 +6063,9 @@ impl<'semantic> Analyzer<'semantic> {
         callee: &Expression,
         arguments: &[Expression],
     ) -> Option<TypedExpression> {
+        if self.types.runtime_template_call(expression.id).is_some() {
+            return self.synthesize_runtime_template_call(expression, arguments);
+        }
         if let Some(result) = self.synthesize_member_call(expression, callee, arguments) {
             return result;
         }
@@ -6022,6 +6113,412 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         }
         Some(self.call_result(return_type))
+    }
+
+    /// Checks one explicit top-level template invocation. Compile-time type
+    /// arguments occupy the declaration's leading parameter positions; only
+    /// the remaining expressions are evaluated at runtime.
+    fn synthesize_runtime_template_call(
+        &mut self,
+        call: &Expression,
+        arguments: &[Expression],
+    ) -> Option<TypedExpression> {
+        let request = self
+            .types
+            .runtime_template_call(call.id)
+            .expect("runtime template call was classified by type resolution")
+            .clone();
+        let function = self
+            .top_level_templates
+            .get(&request.declaration)
+            .expect("top-level runtime template declaration must be indexed")
+            .clone();
+
+        let mut concrete_arguments = Vec::new();
+        for argument in request.type_arguments {
+            let concrete = if let Some(substitutions) = self.current_template_substitutions.clone()
+            {
+                self.types
+                    .types_mut()
+                    .substitute_template_parameters(argument, &substitutions)
+                    .expect("template argument belongs to the program type store")
+            } else {
+                argument
+            };
+            concrete_arguments.push(concrete);
+        }
+
+        let type_parameters: Vec<_> = function
+            .parameters
+            .iter()
+            .take_while(|parameter| {
+                matches!(&parameter.kind, FunctionParameterKind::Comptime { .. })
+            })
+            .collect();
+        let runtime_arguments = arguments
+            .get(request.comptime_argument_count..)
+            .unwrap_or(&[]);
+        let base_signature = self
+            .signatures
+            .callable(function.id)
+            .expect("runtime template signature must have been collected")
+            .clone();
+        let expected_total = type_parameters.len() + base_signature.parameters.len();
+        let arity_matches = expected_total == arguments.len()
+            && concrete_arguments.len() == type_parameters.len();
+        if !arity_matches {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                    expected: expected_total,
+                    found: arguments.len(),
+                },
+                span: call.span,
+            });
+        }
+
+        let mut constraints_valid = concrete_arguments.len() == type_parameters.len();
+        for (index, (parameter, concrete)) in type_parameters
+            .iter()
+            .zip(concrete_arguments.iter().copied())
+            .enumerate()
+        {
+            let symbolic = self
+                .types
+                .types_mut()
+                .template_parameter(parameter.id, AccessCapability::Const);
+            let Some(bound) = self.types.template_parameter_bound(symbolic).flatten() else {
+                continue;
+            };
+            if !self.runtime_template_constraint_source_is_concrete(concrete) {
+                constraints_valid = false;
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::InvalidRuntimeTemplateArgument {
+                        found: concrete,
+                    },
+                    span: arguments
+                        .get(index)
+                        .map_or(call.span, |argument| argument.span),
+                });
+                continue;
+            }
+            let category = if matches!(
+                self.types.types().get(concrete),
+                Some(SemanticType::Gc { .. })
+            ) {
+                ValueCategory::GcReference
+            } else {
+                ValueCategory::BorrowedPlace
+            };
+            let found = TypedExpression {
+                type_id: concrete,
+                category,
+            };
+            if let Err(kind) = self.validate_interface_view_source(found, bound, None) {
+                constraints_valid = false;
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind,
+                    span: arguments
+                        .get(index)
+                        .map_or(call.span, |argument| argument.span),
+                });
+            }
+        }
+
+        let substitutions: HashMap<_, _> = type_parameters
+            .iter()
+            .zip(concrete_arguments.iter().copied())
+            .map(|(parameter, concrete)| (parameter.id, concrete))
+            .collect();
+        let signature = self.substitute_callable_signature(base_signature, &substitutions);
+        let symbolic_request = concrete_arguments
+            .iter()
+            .copied()
+            .any(|argument| self.type_contains_template_parameter(argument));
+        let specialization = if constraints_valid && arity_matches && !symbolic_request {
+            self.request_runtime_specialization(
+                &function,
+                concrete_arguments,
+                signature.clone(),
+                call.span,
+            )
+        } else {
+            None
+        };
+        if let Some(specialization) = specialization {
+            self.runtime_specialization_calls
+                .insert(call.id, specialization);
+        }
+
+        let runtime_valid = self.analyze_runtime_template_arguments(
+            runtime_arguments,
+            &signature.parameters,
+        )?;
+        if (!symbolic_request && specialization.is_none())
+            || !arity_matches
+            || !constraints_valid
+            || !runtime_valid
+            || self.is_recovery(signature.return_type)
+        {
+            return Some(self.recovery_temporary());
+        }
+        Some(self.call_result(signature.return_type))
+    }
+
+    fn substitute_callable_signature(
+        &mut self,
+        mut signature: CallableSignature,
+        substitutions: &HashMap<NodeId, TypeId>,
+    ) -> CallableSignature {
+        signature.parameters = signature
+            .parameters
+            .into_iter()
+            .map(|parameter| {
+                self.types
+                    .types_mut()
+                    .substitute_template_parameters(parameter, substitutions)
+                    .expect("specialized parameter type belongs to the program store")
+            })
+            .collect();
+        signature.return_type = self
+            .types
+            .types_mut()
+            .substitute_template_parameters(signature.return_type, substitutions)
+            .expect("specialized return type belongs to the program store");
+        signature
+    }
+
+    fn request_runtime_specialization(
+        &mut self,
+        function: &Function,
+        type_arguments: Vec<TypeId>,
+        signature: CallableSignature,
+        request_span: Span,
+    ) -> Option<RuntimeCallableSpecializationId> {
+        let key = (function.id, type_arguments.clone());
+        if let Some(existing) = self.specialization_cache.get(&key).copied() {
+            return Some(existing);
+        }
+        if self
+            .active_specializations
+            .iter()
+            .any(|(declaration, _)| *declaration == function.id)
+        {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ExpandingRuntimeTemplateSpecialization,
+                span: request_span,
+            });
+            return None;
+        }
+
+        let id = RuntimeCallableSpecializationId(self.runtime_specializations.len());
+        self.specialization_cache.insert(key.clone(), id);
+        self.runtime_specializations.push(RuntimeCallableSpecialization {
+            declaration: function.id,
+            type_arguments: type_arguments.clone(),
+            signature: signature.clone(),
+            checking: Box::default(),
+        });
+
+        let substitutions: HashMap<_, _> = function
+            .parameters
+            .iter()
+            .filter(|parameter| {
+                matches!(&parameter.kind, FunctionParameterKind::Comptime { .. })
+            })
+            .zip(type_arguments.iter().copied())
+            .map(|(parameter, concrete)| (parameter.id, concrete))
+            .collect();
+        let generated_signatures: Vec<_> = self
+            .signatures
+            .generated_structs()
+            .values()
+            .filter(|signature| self.type_contains_template_parameter(signature.type_id))
+            .cloned()
+            .collect();
+        for source in generated_signatures {
+            let callable_declarations: Vec<_> = source
+                .members()
+                .values()
+                .filter_map(|member| match member.kind {
+                    StructMemberSignatureKind::Method { declaration, .. }
+                    | StructMemberSignatureKind::AssociatedFunction { declaration } => {
+                        Some(declaration)
+                    }
+                    StructMemberSignatureKind::Field(_)
+                    | StructMemberSignatureKind::AssociatedTypeFactory { .. } => None,
+                })
+                .collect();
+            let specialized = source.substitute_template_parameters(
+                &substitutions,
+                self.types.types_mut(),
+            );
+            if specialized.type_id == source.type_id {
+                continue;
+            }
+            for declaration in callable_declarations {
+                if let Some(signature) = self
+                    .signatures
+                    .specialized_callable(source.type_id, declaration)
+                    .cloned()
+                {
+                    let signature =
+                        self.substitute_callable_signature(signature, &substitutions);
+                    self.runtime_generated_callables
+                        .insert((specialized.type_id, declaration), signature);
+                }
+            }
+            let fields = specialized
+                .field_order()
+                .iter()
+                .filter_map(|name| {
+                    let member = specialized.member(name)?;
+                    let StructMemberSignatureKind::Field(field) = member.kind else {
+                        return None;
+                    };
+                    Some(LayoutField {
+                        declaration: field.declaration,
+                        span: member.span,
+                        type_id: field.type_id?,
+                    })
+                })
+                .collect();
+            self.aggregate_layouts.insert(
+                specialized.type_id,
+                AggregateLayout {
+                    type_id: specialized.type_id,
+                    fields,
+                },
+            );
+            if !self.aggregate_order.contains(&specialized.type_id) {
+                self.aggregate_order.push(specialized.type_id);
+            }
+            self.runtime_generated_structs
+                .insert(specialized.type_id, specialized);
+        }
+        let syntax_entries: Vec<_> = self
+            .types
+            .syntax_types()
+            .iter()
+            .map(|(syntax, type_id)| (*syntax, *type_id))
+            .collect();
+        let specialized_syntax = syntax_entries
+            .into_iter()
+            .map(|(syntax, type_id)| {
+                let specialized = self
+                    .types
+                    .types_mut()
+                    .substitute_template_parameters(type_id, &substitutions)
+                    .expect("specialized syntax type belongs to the program store");
+                (syntax, specialized)
+            })
+            .collect();
+
+        self.active_specializations.push(key);
+        let previous_substitutions = self
+            .current_template_substitutions
+            .replace(substitutions);
+        let previous_syntax = self
+            .current_template_syntax_types
+            .replace(specialized_syntax);
+        let parent_checking = std::mem::take(&mut self.checking);
+        let parent_calls = std::mem::take(&mut self.runtime_specialization_calls);
+        self.visit_function(function);
+        let mut local_checking = std::mem::take(&mut self.checking);
+        let local_calls = std::mem::take(&mut self.runtime_specialization_calls);
+        self.checking = parent_checking;
+        for error in &local_checking.errors {
+            if !self.checking.errors.contains(error) {
+                self.checking.errors.push(error.clone());
+            }
+        }
+        self.runtime_specialization_calls = parent_calls;
+        self.current_template_substitutions = previous_substitutions;
+        self.current_template_syntax_types = previous_syntax;
+        self.active_specializations.pop();
+
+        local_checking.runtime_specialization_calls = local_calls;
+        self.runtime_specializations[id.0].checking = Box::new(local_checking);
+        Some(id)
+    }
+
+    fn type_contains_template_parameter(&self, type_id: TypeId) -> bool {
+        match self.types.types().get(type_id) {
+            Some(SemanticType::TemplateParameter { .. }) => true,
+            Some(SemanticType::Gc { target, .. }) => {
+                self.type_contains_template_parameter(*target)
+            }
+            Some(SemanticType::Callable {
+                parameters,
+                return_type,
+                ..
+            }) => parameters
+                .iter()
+                .copied()
+                .any(|parameter| self.type_contains_template_parameter(parameter))
+                || self.type_contains_template_parameter(*return_type),
+            Some(
+                SemanticType::GeneratedStruct { arguments, .. }
+                | SemanticType::Builtin { arguments, .. },
+            ) => arguments
+                .iter()
+                .copied()
+                .any(|argument| self.type_contains_template_parameter(argument)),
+            Some(
+                SemanticType::Union { members, .. }
+                | SemanticType::Intersection { members, .. },
+            ) => members
+                .iter()
+                .copied()
+                .any(|member| self.type_contains_template_parameter(member)),
+            _ => false,
+        }
+    }
+
+    /// Interface constraints are implemented by concrete object method tables.
+    /// An unconstrained `T: type` does not use this restriction and may be a
+    /// primitive, callable, union, built-in, or any other valid semantic type.
+    fn runtime_template_constraint_source_is_concrete(&self, type_id: TypeId) -> bool {
+        match self.types.types().get(type_id) {
+            Some(
+                SemanticType::NamedStruct { .. }
+                | SemanticType::GeneratedStruct { .. }
+                | SemanticType::TemplateParameter { .. },
+            ) => true,
+            Some(SemanticType::Gc { target, .. }) => matches!(
+                self.types.types().get(*target),
+                Some(
+                    SemanticType::NamedStruct { .. }
+                        | SemanticType::GeneratedStruct { .. }
+                        | SemanticType::TemplateParameter { .. }
+                )
+            ),
+            _ => false,
+        }
+    }
+
+    fn analyze_runtime_template_arguments(
+        &mut self,
+        arguments: &[Expression],
+        parameters: &[TypeId],
+    ) -> Option<bool> {
+        let mut valid = arguments.len() == parameters.len();
+        let mut supported = true;
+        for (index, argument) in arguments.iter().enumerate() {
+            let Some(expected) = parameters.get(index).copied() else {
+                supported &= self.synthesize(argument).is_some();
+                continue;
+            };
+            let Some(checked) = self.check(argument, expected) else {
+                supported = false;
+                continue;
+            };
+            if self.is_recovery(checked.type_id) {
+                valid = false;
+            } else if let Some(transfer) = self.argument_transfer(checked) {
+                self.checking.transfers.insert(argument.id, transfer);
+            }
+        }
+        supported.then_some(valid)
     }
 
     /// Handles compiler-provided copies and concrete or interface methods before an
@@ -6172,9 +6669,10 @@ impl<'semantic> Analyzer<'semantic> {
         }
         let signature = match owner {
             AggregateOwner::Source(_) => self.signatures.callable(declaration),
-            AggregateOwner::Generated(owner) => {
-                self.signatures.specialized_callable(owner, declaration)
-            }
+            AggregateOwner::Generated(owner) => self
+                .signatures
+                .specialized_callable(owner, declaration)
+                .or_else(|| self.runtime_generated_callables.get(&(owner, declaration))),
         }
         .expect("method signature must have been collected")
         .clone();
@@ -6957,10 +7455,43 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("semantic type belongs to the program type store")
     }
 
+    /// Returns a callable header in the currently active specialization. The
+    /// declaration collector owns the symbolic header; concrete instances are
+    /// derived canonically rather than mutating or duplicating source AST.
+    fn resolved_callable_signature(&mut self, declaration: NodeId) -> CallableSignature {
+        let mut signature = self
+            .current_specialized_owner
+            .and_then(|owner| self.signatures.specialized_callable(owner, declaration))
+            .or_else(|| self.signatures.callable(declaration))
+            .expect("callable signature must have been collected")
+            .clone();
+        if let Some(substitutions) = self.current_template_substitutions.clone() {
+            signature.parameters = signature
+                .parameters
+                .into_iter()
+                .map(|parameter| {
+                    self.types
+                        .types_mut()
+                        .substitute_template_parameters(parameter, &substitutions)
+                        .expect("specialized parameter type belongs to the program store")
+                })
+                .collect();
+            signature.return_type = self
+                .types
+                .types_mut()
+                .substitute_template_parameters(signature.return_type, &substitutions)
+                .expect("specialized return type belongs to the program store");
+        }
+        signature
+    }
+
     fn resolved_type_syntax(&self, syntax: NodeId) -> Option<TypeId> {
-        self.current_specialized_owner
+        self.current_template_syntax_types
+            .as_ref()
+            .and_then(|types| types.get(&syntax).copied())
+            .or_else(|| self.current_specialized_owner
             .and_then(|owner| self.types.specialized_type_for_syntax(owner, syntax))
-            .or_else(|| self.types.type_for_syntax(syntax))
+            .or_else(|| self.types.type_for_syntax(syntax)))
     }
 
     fn template_parameter_bound(&self, type_id: TypeId) -> Option<Option<TypeId>> {
@@ -11485,5 +12016,189 @@ fn main() {
             checking.errors[4].kind,
             ExpressionCheckingErrorKind::TemplateRequiresSpecialization
         );
+    }
+
+    #[test]
+    fn specializes_top_level_runtime_templates_and_reuses_canonical_instances() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "struct File { fn read(self) -> int { 7 } }\n",
+            "fn inspect(comptime T: Reader, value: T) -> T { value.read(); value }\n",
+            "fn main() {\n",
+            "    const first = inspect(File, File {});\n",
+            "    const second = inspect(File, File {});\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        assert_eq!(checking.runtime_specializations.len(), 1);
+
+        let main = function(&program.declarations[3]);
+        let first = binding_initializer(&main.body.statements[0]);
+        let second = binding_initializer(&main.body.statements[1]);
+        let first_id = checking.runtime_specialization_calls[&first.id];
+        assert_eq!(checking.runtime_specialization_calls[&second.id], first_id);
+        let specialization = &checking.runtime_specializations[first_id.0];
+        assert_eq!(specialization.declaration, function(&program.declarations[2]).id);
+        assert_eq!(specialization.type_arguments.len(), 1);
+        assert_eq!(specialization.signature.parameters, specialization.type_arguments);
+        assert_eq!(specialization.signature.return_type, specialization.type_arguments[0]);
+        assert!(!specialization.checking.expressions.is_empty());
+    }
+
+    #[test]
+    fn reports_template_constraint_failures_and_still_checks_runtime_arguments() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "struct Missing {}\n",
+            "fn inspect(comptime T: Reader, value: T, count: int) -> int { count }\n",
+            "fn main() { inspect(Missing, Missing {}, false); }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 2, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::MissingInterfaceMethod { .. }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(checking.runtime_specializations.is_empty());
+    }
+
+    #[test]
+    fn specializes_unconstrained_runtime_templates_with_primitive_types() {
+        let source = concat!(
+            "fn inspect(comptime T: type, value: T) {}\n",
+            "fn main() { inspect(int, 1); }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        assert_eq!(checking.runtime_specializations.len(), 1);
+        let specialization = &checking.runtime_specializations[0];
+        assert_eq!(specialization.type_arguments.len(), 1);
+        assert_eq!(
+            types.types().get(specialization.type_arguments[0]),
+            Some(&SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                capability: AccessCapability::Const,
+            })
+        );
+        assert_eq!(specialization.signature.parameters, specialization.type_arguments);
+    }
+
+    #[test]
+    fn specializes_gc_qualified_concrete_type_arguments() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "struct File { fn read(self) -> int { 1 } }\n",
+            "fn inspect(comptime T: Reader, value: T) -> int { value.read() }\n",
+            "fn main() { inspect(&File, &File {}); }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let specialization = &checking.runtime_specializations[0];
+        assert!(matches!(
+            types.types().get(specialization.type_arguments[0]),
+            Some(SemanticType::Gc { .. })
+        ));
+        assert_eq!(specialization.signature.parameters, specialization.type_arguments);
+    }
+
+    #[test]
+    fn diagnoses_runtime_template_arity_without_skipping_surplus_values() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn inspect(comptime T: type, value: T) {}\n",
+            "fn main() { inspect(Item); inspect(Item, Item {}, false); }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 2, "{:#?}", checking.errors);
+        assert!(checking.errors.iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 2,
+                ..
+            }
+        )));
+        assert!(checking.runtime_specializations.is_empty());
+    }
+
+    #[test]
+    fn permits_exact_recursive_runtime_specialization() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "struct File { fn read(self) -> int { 1 } }\n",
+            "fn read_many(comptime T: Reader, value: T, count: int) -> int {\n",
+            "    if count == 0 { return value.read(); }\n",
+            "    read_many(T, value, count - 1)\n",
+            "}\n",
+            "fn main() { read_many(File, File {}, 2); }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        assert_eq!(checking.runtime_specializations.len(), 1);
+        let specialization = &checking.runtime_specializations[0];
+        assert_eq!(specialization.checking.runtime_specialization_calls.len(), 1);
+        assert!(specialization
+            .checking
+            .runtime_specialization_calls
+            .values()
+            .all(|called| *called == RuntimeCallableSpecializationId(0)));
+    }
+
+    #[test]
+    fn rejects_type_expanding_runtime_specialization() {
+        let source = concat!(
+            "fn Box(comptime T: type) -> type { struct { inner: T, } }\n",
+            "struct Item {}\n",
+            "fn expand(comptime T: type) {\n",
+            "    expand(Box(T));\n",
+            "}\n",
+            "fn main() { expand(Item); }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.iter().any(|error| {
+            error.kind
+                == ExpressionCheckingErrorKind::ExpandingRuntimeTemplateSpecialization
+        }), "{:#?}", checking.errors);
+        assert_eq!(checking.runtime_specializations.len(), 1);
+    }
+
+    #[test]
+    fn specializes_generated_types_used_by_top_level_templates() {
+        let source = concat!(
+            "fn Box(comptime T: type) -> type {\n",
+            "    struct { inner: T, fn get(self) -> T { self.inner } }\n",
+            "}\n",
+            "struct Item {}\n",
+            "fn inspect(comptime T: type, boxed: Box(T)) -> T {\n",
+            "    boxed.get()\n",
+            "}\n",
+            "fn main() { const item = inspect(Item, Box(Item) { inner: Item {} }); item; }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        assert_eq!(checking.runtime_specializations.len(), 1);
+        let main = function(&program.declarations[3]);
+        let item = binding_initializer(&main.body.statements[0]);
+        assert!(matches!(
+            types.types().get(checking.expressions[&item.id].type_id),
+            Some(SemanticType::NamedStruct { .. })
+        ));
+        assert!(checking.runtime_specializations[0]
+            .checking
+            .resolved_members
+            .values()
+            .any(|member| matches!(member, ResolvedMember::Method { .. })));
     }
 }
