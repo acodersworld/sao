@@ -65,7 +65,7 @@ const result: int | none = none;
 ```
 
 An optional value is therefore an ordinary union such as `int | none`; SAO does
-not require a separate built-in `Option<T>` type. Operations on the non-`none`
+not require a separate built-in `Option(T)` type. Operations on the non-`none`
 member require the same narrowing as other union types.
 
 SAO uses `&` for intersection types:
@@ -178,11 +178,11 @@ projections.
 ## 8.2 Recoverable errors and propagation
 
 Recoverable errors are ordinary union values. SAO provides the built-in nominal
-parameterized type `Error<T>`, whose value carries error information of type
+parameterized type `Error(T)`, whose value carries error information of type
 `T`:
 
 ```text
-fn myfunc() -> int | Error<string> {
+fn myfunc() -> int | Error(string) {
     if operation_failed() {
         Error::new("operation failed")
     } else {
@@ -191,41 +191,42 @@ fn myfunc() -> int | Error<string> {
 }
 ```
 
-SAO does not initially support user-defined generic structs, functions, or
-interfaces. `Error<T>` is a compiler-known type constructor with dedicated
-type-checking and lowering rules, not an instance of a general source-language
-generic facility. The other initial compiler-known parameterized types are
-described in Section 17. They do not enable user-defined generics.
+`Error(T)` is a compiler-known type constructor with dedicated type-checking and
+lowering rules, not an application of a source type factory. Chapter 19 defines
+the restricted user-defined compile-time type and bounded-template facilities;
+general parameterized nominal declarations and generic interfaces remain
+deferred. The other compiler-known parameterized types are described in
+Section 17.
 
-Each `Error<T>` instantiation is distinct from its payload type, from every
-non-error member of a union, and from `Error<U>` when `T` and `U` differ.
-Both `Error::new(value)` and `Error<T>::new(value)` are construction syntax. In
+Each `Error(T)` instantiation is distinct from its payload type, from every
+non-error member of a union, and from `Error(U)` when `T` and `U` differ.
+Both `Error::new(value)` and `Error(T)::new(value)` are construction syntax. In
 the first form, without an expected type, the payload type is the exact type of
 `value`:
 
 ```text
-const error = Error::new("operation failed"); // Error<string>
+const error = Error::new("operation failed"); // Error(string)
 ```
 
 The explicit form supplies the payload type directly and requires the value to
 be assignable to it:
 
 ```text
-const error = Error<string>::new("operation failed");
+const error = Error(string)::new("operation failed");
 ```
 
-An expected `Error<T>` type may instead guide construction when the value is
+An expected `Error(T)` type may instead guide construction when the value is
 assignable to `T`. The compiler does not invent a payload union without such an
 expected type.
 
-The payload held by an `Error<T>` is immutable. If the payload is a reference,
+The payload held by an `Error(T)` is immutable. If the payload is a reference,
 accessing it cannot grant more than const access. This permits the built-in
-widening conversion `Error<A>` to `Error<B>` whenever `A` is assignable to `B`.
+widening conversion `Error(A)` to `Error(B)` whenever `A` is assignable to `B`.
 This covariance is a specific rule for `Error`, not a general variance feature:
 
 ```text
-const specific: Error<IoError> = Error::new(IoError { /* ... */ });
-const combined: Error<IoError | ParseError> = specific;
+const specific: Error(IoError) = Error::new(IoError { /* ... */ });
+const combined: Error(IoError | ParseError) = specific;
 ```
 
 The payload is available through the built-in const field `value`. Error unions
@@ -234,7 +235,7 @@ can therefore be handled with ordinary narrowing:
 ```text
 const result = myfunc();
 
-if result is Error<string> {
+if result is Error(string) {
     print(result.value);
 } else {
     print(f"{result}");
@@ -244,30 +245,30 @@ if result is Error<string> {
 The postfix Try operator, written `?`, propagates an error without exceptions:
 
 ```text
-fn caller() -> int | Error<string> {
+fn caller() -> int | Error(string) {
     const value = myfunc()?;
     value + 1
 }
 ```
 
-For an operand of type `S | Error<E>`, the Try operator evaluates the operand
+For an operand of type `S | Error(E)`, the Try operator evaluates the operand
 once. If it is an `S`, the expression produces that value with type `S`. If it
-is an `Error<E>`, the current function returns that error immediately. The
-enclosing function's declared return type must accept the propagated `Error<E>`,
+is an `Error(E)`, the current function returns that error immediately. The
+enclosing function's declared return type must accept the propagated `Error(E)`,
 including through the built-in payload-widening conversion. `S` may itself be a
 union of several non-error types.
 
 Error payloads can use ordinary SAO types and unions:
 
 ```text
-fn load() -> Config | Error<ParseError | IoError> {
+fn load() -> Config | Error(ParseError | IoError) {
     const text = read_file("config.sao")?;
     parse(text)
 }
 ```
 
 SAO has no exceptions, `throw`, `catch`, or exception unwinding. All recoverable
-failure paths are explicit in function return types. A future type-alias feature
+failure paths are explicit in function return types. Transparent type aliases
 may provide shorter names for commonly used success/error unions, but no special
 `Result` container is required.
 

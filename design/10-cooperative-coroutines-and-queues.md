@@ -16,7 +16,7 @@ the ready queue. The called function body does not begin executing as part of
 the `co` statement.
 
 The called function may have any return type. Its eventual return value,
-including an `Error<T>`, is discarded. The `co` statement itself produces `()`.
+including an `Error(T)`, is discarded. The `co` statement itself produces `()`.
 There are initially no coroutine handles, joins, cancellation operations, or
 parent-child lifetime relationships.
 
@@ -60,13 +60,13 @@ fn inner() -> () {
 
 ## 10.1 Queues
 
-Coroutines communicate through the compiler-known built-in type `Queue<T>`.
-Like `Error<T>`, this is a dedicated parameterized type and does not enable
-user-defined generics. It follows the uniform plain/explicit-GC rules; a fresh
+Coroutines communicate through the compiler-known built-in type `Queue(T)`.
+Like `Error(T)`, this is a dedicated parameterized type rather than a source
+type-factory application. It follows the uniform plain/explicit-GC rules; a fresh
 queue is constructed with:
 
 ```text
-mut messages = Queue<int>::new();
+mut messages = Queue(int)::new();
 ```
 
 Queues are unbounded and preserve first-in, first-out message order. Their
@@ -95,7 +95,7 @@ const message: int = loop {
 };
 ```
 
-The initial `Queue<T>` requires that `T` not contain `none`; otherwise an empty
+The initial `Queue(T)` requires that `T` not contain `none`; otherwise an empty
 queue could not be distinguished from a successfully received `none` value.
 A future explicitly tagged receive-result type may remove this restriction.
 

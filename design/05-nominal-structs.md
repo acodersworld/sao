@@ -130,12 +130,13 @@ an instance method from a value. An associated function has no implicit object,
 cannot use `self`, and cannot be called through a value. Conversely, an
 instance method cannot be selected through its type as an unbound function.
 
-Associated functions are initially available only on named structs. An
-anonymous struct's generated type cannot be named, and each of its functions
-must receive `self`. Associated functions do not participate in structural
-interface satisfaction. All fields and functions declared by one struct share
-one member-name namespace, so an associated function and an instance method
-cannot reuse the same name.
+Associated functions are available on named structs and on the generated
+struct types produced by Chapter 19 type factories. An ordinary anonymous
+struct expression's hidden type cannot be named, and each of its functions must
+receive `self`. Associated functions do not participate in structural interface
+satisfaction. All fields and functions declared by one struct share one
+member-name namespace, so an associated function and an instance method cannot
+reuse the same name.
 
 Anonymous structs use the same model. A `struct { ... }` expression declares a
 hidden nominal type and constructs a value of that type:

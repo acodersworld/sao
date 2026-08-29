@@ -117,8 +117,8 @@ impl StructSignature {
     }
 
     /// Materializes the field portion of a generated struct signature for one
-    /// runtime-template substitution. Method specialization is deliberately
-    /// left to Phase 7.4.5; member identities remain source identities here.
+    /// runtime-template substitution. Callable specialization is recorded
+    /// separately with its concrete owner and source member identity.
     pub(crate) fn substitute_template_parameters(
         &self,
         substitutions: &HashMap<NodeId, TypeId>,

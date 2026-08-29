@@ -465,7 +465,7 @@ byte exceeds 127:
 
 ```text
 ascii.encode(text) -> mut bytes
-ascii.decode(data) -> string | Error<string>
+ascii.decode(data) -> string | Error(string)
 ```
 
 Current inference boundary:
@@ -481,9 +481,10 @@ Current inference boundary:
 - Lambda parameter types are explicit. A lambda may omit its return annotation,
   which defaults to `()`; lambda return types are not inferred from the body.
 - Contextual lambda signature inference is deferred.
-- User-defined generic declarations and general-purpose generic inference are
-  not part of the initial language. The compiler-known `Queue<T>`, `Vector<T>`,
-  `Map<K, V>`, and `Error<T>` types have dedicated rules instead.
+- General user-defined parameterized nominal declarations and generic inference
+  are not part of the initial language. Chapter 19 defines explicit bounded
+  runtime templates and type factories; the compiler-known `Queue(T)`,
+  `Vector(T)`, `Map(K, V)`, and `Error(T)` types retain dedicated rules.
 
 For example:
 
@@ -516,7 +517,7 @@ user-defined equality.
 - `!=` is the logical negation of `==`.
 
 Equality is not defined for `bytes`, named or anonymous structs, interfaces,
-callable values, unions, intersections, or `Error<T>`. Attempting to compare
+callable values, unions, intersections, or `Error(T)`. Attempting to compare
 such values is a compile-time error. A union must first be narrowed to a
 primitive member before that member can be compared; a union does not become
 comparable merely because all of its members are primitive.

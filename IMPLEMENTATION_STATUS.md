@@ -8,7 +8,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-08-20
+Last reviewed: 2026-08-30
 
 ## Lexer status
 
@@ -29,8 +29,8 @@ The parser currently supports:
 
 - Single-expression, single-type, single-statement, and whole-program entry
   points.
-- File-level programs containing ordered top-level function, named struct, and
-  structural interface declarations.
+- File-level programs containing ordered top-level function, named struct,
+  structural interface, and transparent type-alias declarations.
 - Semicolon-terminated interface method requirements with receiver, parameter,
   and return-type syntax.
 - Primitive, named, parameterized, mutable, grouped, callable, union, and
@@ -44,10 +44,14 @@ The parser currently supports:
   with `?`.
 - Dedicated `int`, `float`, `bool`, `char`, and `string` conversion expressions
   with exactly one argument.
-- Fixed-arity `Queue<T>`, `Vector<T>`, `Map<K, V>`, and `Error<T>` types, plus
+- Fixed-arity `Queue(T)`, `Vector(T)`, `Map(K, V)`, and `Error(T)` types, plus
   associated access on those types. Their constructors use ordinary associated
-  calls such as `Queue<T>::new()`; both inferred `Error::new(value)` and explicit
-  `Error<T>::new(value)` forms are represented for later type checking.
+  calls such as `Queue(T)::new()`; both inferred `Error::new(value)` and explicit
+  `Error(T)::new(value)` forms are represented for later type checking.
+- File-level and receiverless associated type factories returning `type`,
+  generated nominal struct type expressions, `comptime` type parameters,
+  explicit runtime-template calls, and named, intersected, or anonymous
+  interface constraints in `where` clauses.
 - Named struct construction and unconstrained anonymous `struct { ... }`
   expressions, including initialized fields and methods.
 - Immutable and mutable bindings.
@@ -96,8 +100,9 @@ Name and scope resolution is implemented. The resolver:
 
 - Assigns stable symbol identities to top-level declarations, nested named
   functions, parameters, local bindings, and range induction bindings.
-- Maintains separate nested value and type namespaces, with compiler-known
-  values supplied through a shadowable prelude scope.
+- Maintains one nested lexical declaration namespace shared by named value and
+  type declarations, with context-sensitive value/type lookup and
+  compiler-known values supplied through a shadowable prelude scope.
 - Collects top-level declarations and immediate nested functions before
   resolving their uses, allowing documented forward references and recursion.
 - Resolves ordinary bindings only after their initializer, preserving
@@ -106,8 +111,12 @@ Name and scope resolution is implemented. The resolver:
   node identity against its resolved symbol identity. The type qualifier in an
   associated access resolves in the type namespace, while member names and
   `self` remain for later passes.
-- Diagnoses unknown names, invalid duplicate declarations, and missing or
-  non-unique top-level `main` functions.
+- Resolves leading explicit type arguments on top-level template calls and
+  provisionally on member calls whose final declaration requires receiver type
+  information.
+- Diagnoses unknown names, cross-kind duplicate declarations, duplicate or
+  invalid template constraints, and missing or non-unique top-level `main`
+  functions.
 
 Nested named-function references still use ordinary lexical resolution. The
 later capture-analysis pass will use those resolutions to distinguish legal
@@ -132,7 +141,7 @@ Context resolution is implemented as an AST-only pass. It:
 The semantic type foundation and source type resolution are implemented. They
 provide a program-local
 canonical type store for capability-qualified primitives, callables, nominal
-named and anonymous structs, interfaces, compiler-known parameterized types,
+named, anonymous, and factory-generated structs, interfaces, compiler-known parameterized types,
 unions, intersections, canonical explicit GC references, and internal recovery
 and divergence types. Union and
 intersection construction is associative, commutative, and idempotent, with an
@@ -142,14 +151,33 @@ lookup, inline/borrowed/GC storage semantics, compiler-defined copy semantics,
 and typed-expression value categories. Source type resolution predeclares named
 structs and interfaces, resolves all explicit annotations including mutable and
 GC-qualified forms, records canonical types by syntax and declaration identity,
-supports forward and recursive references, and diagnoses invalid named type
-arguments, compiler-known arity, queue element types, and non-interface
+supports forward and recursive references, transparent forward aliases,
+compile-time type factories, cached generated struct applications, symbolic
+bounded-template parameters, and owner-specialized generated syntax. It
+diagnoses invalid applications and constraints, alias cycles, expanding factory
+recursion, compiler-known arity, queue element types, and non-interface
 intersection members. Unknown type names are diagnosed earlier by name
 resolution.
 
-Declaration and signature collection, expression type checking and inference,
-assignability, finite-layout validation, capture and escape analysis, hidden-root
-calculation, and typed IR production are not yet implemented.
+Declaration and signature collection is implemented for source and generated
+struct fields and functions, callable headers, interface requirements,
+owner-independent structural method identities, compiler-known signatures,
+template constraints, and owner-specialized generated callables.
+
+Expression type checking and inference is implemented through the current
+frontend. It covers value categories and transfers, places and mutability,
+calls and receiver validation, structural interfaces, unions and narrowing,
+control flow and loop values, lambdas and capture/escape rules, explicit GC
+allocation, built-in sequences and conversions, formatted strings, finite
+inline-layout validation, type-factory-generated values, and bounded runtime
+templates. Top-level and method templates require explicit type arguments;
+method specialization identity includes the concrete named or generated owner.
+Specializations reuse exact recursion, reject expanding recursion, validate
+constraints before checking ordinary arguments, and retain per-specialization
+analysis metadata for later typed IR and lowering.
+
+Typed IR production, backend lowering, object emission, and runtime integration
+are not yet implemented.
 
 ## Runtime prototype status
 
@@ -180,7 +208,8 @@ scope changes:
 
 - Collection-based `for item in collection` loops.
 - General `match` expressions and pattern matching.
-- User-defined generics.
+- General user-defined parameterized nominal declarations and generic
+  interfaces, generic inference, and compile-time values other than types.
 - Vector and Map APIs and runtime representations.
 - Multi-error program parsing and partial-AST recovery. If declaration-level
   recovery is added, it should abandon the malformed braced declaration and

@@ -2,7 +2,7 @@
 
 Status: early design notes  
 Working name: SAO  
-Last updated: 2026-08-20
+Last updated: 2026-08-30
 
 This document records the current direction for SAO, a statically typed,
 expression-oriented toy language. It distinguishes agreed design decisions from
@@ -28,3 +28,4 @@ provisional syntax and ideas intentionally deferred until later.
 16. [16. Lexical grammar](design/16-lexical-grammar.md)
 17. [17. Parameterized built-ins](design/17-parameterized-built-ins.md)
 18. [18. Inline values and explicit GC references](design/18-inline-values-and-gc-references.md)
+19. [19. Compile-time types and bounded templates](design/19-compile-time-types-and-bounded-templates.md)

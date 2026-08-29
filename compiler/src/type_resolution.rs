@@ -35,6 +35,7 @@ pub struct TypeResolution {
     template_parameter_bounds: HashMap<NodeId, Option<TypeId>>,
     specialized_template_parameter_bounds: HashMap<(TypeId, NodeId), Option<TypeId>>,
     runtime_template_calls: HashMap<NodeId, RuntimeTemplateCall>,
+    runtime_member_template_calls: HashMap<NodeId, RuntimeMemberTemplateCall>,
 }
 
 /// Concrete type arguments attached to one explicit top-level runtime-template
@@ -42,6 +43,14 @@ pub struct TypeResolution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeTemplateCall {
     pub(crate) declaration: NodeId,
+    pub(crate) type_arguments: Vec<TypeId>,
+    pub(crate) comptime_argument_count: usize,
+}
+
+/// Canonical leading type arguments on a member call whose declaration is
+/// selected later, after expression analysis has typed the receiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeMemberTemplateCall {
     pub(crate) type_arguments: Vec<TypeId>,
     pub(crate) comptime_argument_count: usize,
 }
@@ -138,6 +147,14 @@ impl TypeResolution {
     #[must_use]
     pub(crate) fn runtime_template_call(&self, call: NodeId) -> Option<&RuntimeTemplateCall> {
         self.runtime_template_calls.get(&call)
+    }
+
+    #[must_use]
+    pub(crate) fn runtime_member_template_call(
+        &self,
+        call: NodeId,
+    ) -> Option<&RuntimeMemberTemplateCall> {
+        self.runtime_member_template_calls.get(&call)
     }
 }
 
@@ -323,6 +340,7 @@ struct Resolver<'source, 'names> {
     template_parameter_bounds: HashMap<NodeId, Option<TypeId>>,
     specialized_template_parameter_bounds: HashMap<(TypeId, NodeId), Option<TypeId>>,
     runtime_template_calls: HashMap<NodeId, RuntimeTemplateCall>,
+    runtime_member_template_calls: HashMap<NodeId, RuntimeMemberTemplateCall>,
     errors: Vec<TypeResolutionError>,
 }
 
@@ -352,6 +370,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
             template_parameter_bounds: HashMap::new(),
             specialized_template_parameter_bounds: HashMap::new(),
             runtime_template_calls: HashMap::new(),
+            runtime_member_template_calls: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -373,6 +392,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 template_parameter_bounds: self.template_parameter_bounds,
                 specialized_template_parameter_bounds: self.specialized_template_parameter_bounds,
                 runtime_template_calls: self.runtime_template_calls,
+                runtime_member_template_calls: self.runtime_member_template_calls,
             })
         } else {
             Err(self.errors)
@@ -917,6 +937,35 @@ impl<'source, 'names> Resolver<'source, 'names> {
                             comptime_argument_count,
                         },
                     );
+                } else if matches!(
+                    &callee.kind,
+                    ExpressionKind::MemberAccess { .. }
+                        | ExpressionKind::AssociatedAccess { .. }
+                ) {
+                    let mut type_arguments = Vec::new();
+                    let mut comptime_argument_count = 0;
+                    for argument in arguments {
+                        let Some(type_syntax) = expression_as_type_syntax(argument) else {
+                            break;
+                        };
+                        if !self.was_resolved_as_type(&type_syntax) {
+                            break;
+                        }
+                        type_arguments.push(self.resolve_type(&type_syntax));
+                        comptime_argument_count += 1;
+                    }
+                    for argument in arguments.iter().skip(comptime_argument_count) {
+                        self.visit_expression(argument);
+                    }
+                    if comptime_argument_count != 0 {
+                        self.runtime_member_template_calls.insert(
+                            expression.id,
+                            RuntimeMemberTemplateCall {
+                                type_arguments,
+                                comptime_argument_count,
+                            },
+                        );
+                    }
                 } else {
                     for argument in arguments {
                         self.visit_expression(argument);
@@ -971,6 +1020,37 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 self.visit_expression(left);
                 self.visit_expression(right);
             }
+        }
+    }
+
+    /// Name resolution provisionally places leading member-call arguments in
+    /// the type namespace. This recognizes those nodes without guessing from
+    /// spelling, allowing receiver typing to select the actual method later.
+    fn was_resolved_as_type(&self, type_syntax: &TypeSyntax) -> bool {
+        match &type_syntax.kind {
+            TypeKind::ComptimeType | TypeKind::Primitive(_) | TypeKind::Builtin { .. } => true,
+            TypeKind::Named { .. } => self
+                .names
+                .symbol_for_reference(type_syntax.id)
+                .and_then(|symbol| self.names.symbols().symbol(symbol))
+                .is_some_and(|symbol| {
+                    matches!(
+                        symbol.kind,
+                        SymbolKind::TypeFactory
+                            | SymbolKind::ComptimeParameter
+                            | SymbolKind::Struct
+                            | SymbolKind::Interface
+                            | SymbolKind::TypeAlias
+                    )
+                }),
+            TypeKind::Associated { owner, .. } => self.was_resolved_as_type(owner),
+            TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+                self.was_resolved_as_type(inner)
+            }
+            TypeKind::Callable { .. }
+            | TypeKind::Intersection { .. }
+            | TypeKind::Union { .. }
+            | TypeKind::GeneratedStruct { .. } => true,
         }
     }
 

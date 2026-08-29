@@ -605,12 +605,24 @@ impl<'source> Resolver<'source> {
                     .and_then(|symbol| self.runtime_template_arities.get(symbol))
                     .copied()
                     .unwrap_or(0);
+                let deferred_member_specialization = matches!(
+                    &callee.kind,
+                    ExpressionKind::MemberAccess { .. }
+                        | ExpressionKind::AssociatedAccess { .. }
+                );
+                let mut leading_member_types = deferred_member_specialization;
                 for (index, argument) in arguments.iter().enumerate() {
-                    if index < comptime_count
-                        && let Some(type_syntax) = expression_as_type_syntax(argument)
+                    let type_syntax = expression_as_type_syntax(argument);
+                    let is_deferred_member_type = leading_member_types
+                        && type_syntax
+                            .as_ref()
+                            .is_some_and(|syntax| self.type_syntax_is_in_scope(scope, syntax));
+                    if (index < comptime_count || is_deferred_member_type)
+                        && let Some(type_syntax) = type_syntax
                     {
                         self.resolve_type(scope, &type_syntax);
                     } else {
+                        leading_member_types = false;
                         self.resolve_expression(scope, argument);
                     }
                 }
@@ -698,6 +710,46 @@ impl<'source> Resolver<'source> {
                     self.resolve_type(scope, member);
                 }
             }
+        }
+    }
+
+    /// Tests whether expression-shaped syntax can enter the type namespace
+    /// without emitting a speculative diagnostic. Member-template arity is
+    /// selected only after receiver typing, so leading type arguments are
+    /// resolved provisionally here and validated by later semantic passes.
+    fn type_syntax_is_in_scope(&self, scope: ScopeId, type_syntax: &TypeSyntax) -> bool {
+        match &type_syntax.kind {
+            TypeKind::ComptimeType | TypeKind::Primitive(_) | TypeKind::Builtin { .. } => true,
+            TypeKind::Named { name, arguments } => {
+                self.symbols.lookup_type(scope, self.text(*name)).is_ok()
+                    && arguments
+                        .iter()
+                        .all(|argument| self.type_syntax_is_in_scope(scope, argument))
+            }
+            TypeKind::Associated {
+                owner, arguments, ..
+            } => {
+                self.type_syntax_is_in_scope(scope, owner)
+                    && arguments
+                        .iter()
+                        .all(|argument| self.type_syntax_is_in_scope(scope, argument))
+            }
+            TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+                self.type_syntax_is_in_scope(scope, inner)
+            }
+            TypeKind::Callable {
+                parameters,
+                return_type,
+            } => {
+                parameters
+                    .iter()
+                    .all(|parameter| self.type_syntax_is_in_scope(scope, parameter))
+                    && self.type_syntax_is_in_scope(scope, return_type)
+            }
+            TypeKind::Intersection { members } | TypeKind::Union { members } => members
+                .iter()
+                .all(|member| self.type_syntax_is_in_scope(scope, member)),
+            TypeKind::GeneratedStruct { .. } => true,
         }
     }
 

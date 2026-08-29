@@ -42,6 +42,10 @@ fn Box(comptime T: type) -> type {
         fn get(self) -> T {
             self.inner
         }
+
+        fn echo(self, comptime U: type, value: U) -> U {
+            value
+        }
     }
 }
 
@@ -218,6 +222,8 @@ fn main() {
     const inline_inspection = inspect_inline(BriefFormatter, BriefFormatter {});
     const named_inspection = inspect_named(DetailedFormatter, DetailedFormatter {});
     const private_inspection = inspect_private(BriefFormatter, BriefFormatter {});
+    const method_inspection = summary.format_with(BriefFormatter, BriefFormatter {});
+    const boxed_echo = boxed.echo(string, "boxed");
 
     summary.total = calculated;
     summary.total += recovered;
@@ -240,6 +246,8 @@ fn main() {
     println(inline_inspection);
     println(named_inspection);
     println(private_inspection);
+    println(method_inspection);
+    println(boxed_echo);
     announce(boxed.get());
     heap_formatter.format(text);
     heap_scale(initial);

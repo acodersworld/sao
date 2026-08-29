@@ -7,6 +7,12 @@ remain the language specification.
 
 Last reviewed: 2026-08-30
 
+Maintenance rule: update this file as part of completing every phase or
+independently reviewable change. Mark the completed item accurately, summarize
+what was actually implemented or deferred, identify the next active item, and
+refresh the review date when appropriate. Do not leave completion status to a
+later documentation-only pass.
+
 ## Current phase
 
 Frontend syntax work is complete for the currently designed language. The
@@ -360,24 +366,35 @@ reviewable phases:
         - Complete: permit exact recursive specialization and diagnose unbounded
           type-expanding specialization deterministically.
         - Stop for review and commit before implementing method specialization.
-      - Change 5, method specialization and completion (next):
-        - Support explicit specialization of templated methods on named and
-          generated structs. Combine the concrete owner identity with the
-          method's declared type arguments when forming the canonical callable
-          specialization identity.
-        - Reuse bounded-template checking, constraint satisfaction, substitution,
-          recursion handling, ordinary expression analysis, and lowering
-          metadata from top-level specialization.
+      - Change 5, method specialization and completion (implementation complete;
+        review pending):
+        - Complete: recognize leading type arguments on member calls without
+          treating ordinary value arguments as type syntax. Defer declaration
+          selection until expression analysis has resolved the receiver and
+          concrete member.
+        - Complete: support explicit specialization of templated methods on named
+          and generated structs. Combine the concrete owner identity with the
+          method declaration and declared type arguments when forming the
+          canonical callable specialization identity, and reuse identical
+          requests.
+        - Complete: reuse bounded-template checking, constraint satisfaction,
+          owner-aware substitution, exact-recursion reuse, expanding-recursion
+          diagnostics, and ordinary expression analysis from top-level
+          specialization. Record the resulting specialization identity for
+          later typed IR and lowering.
         - Defer local template declarations and local type aliases.
-        - Add focused coverage for namespace collisions, aliases, factory
+        - Complete: add focused coverage for namespace collisions, aliases, factory
           composition and identity, generated structs, recursion, constraints,
           explicit top-level and method specializations,
           specialization-dependent value semantics, diagnostics, recovery, and
           the migrated built-in syntax. Update the complex-program test to
           exercise the complete feature.
-        - Update the language design and implementation-status documents and
-          mark Phase 7.4 complete only after this fifth change has been reviewed.
-        Stop for review and commit before beginning Phase 7.5.
+        - Complete: update the language design and implementation-status
+          documents for compile-time types, generated structs, bounded runtime
+          templates, explicit top-level and method specialization, and the
+          migrated built-in syntax.
+        - Pending: review and commit Change 5, then mark Phase 7.4 complete.
+          Stop before beginning Phase 7.5.
      - Compile-time values other than types, arbitrary compile-time execution,
        generic inference, first-class template values, local templates, and
        compile-time duck typing remain deferred.
