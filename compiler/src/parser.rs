@@ -3,11 +3,12 @@ use std::iter::Peekable;
 use crate::ast::{
     AnonymousStructField, AnonymousStructMember, AssignmentOperator, BinaryOperator,
     BindingMutability, BindingQualifiers, Block, BuiltinType, ConditionalElse, Declaration,
-    Expression, ExpressionKind, FormattedStringPart, Function, FunctionParameter,
-    FunctionParameterKind, InterfaceDeclaration, InterfaceMethodRequirement, LiteralKind, NodeId,
-    PrimitiveType, Program, RangeInclusivity, ReceiverStorage, Statement, StatementKind,
-    StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
-    UnaryOperator, ValueCapability,
+    ComptimeParameterConstraint, Expression, ExpressionKind, FormattedStringPart, Function,
+    FunctionParameter, FunctionParameterKind, InterfaceConstraint, InterfaceDeclaration,
+    InterfaceMethodRequirement, LiteralKind, NodeId, PrimitiveType, Program, RangeInclusivity,
+    ReceiverStorage, Statement, StatementKind, StructDeclaration, StructField,
+    StructFieldInitializer, StructMember, TypeAliasDeclaration, TypeKind, TypeSyntax,
+    UnaryOperator, ValueCapability, WhereClause, WhereConstraint,
 };
 use crate::lexer::{LexError, Token, TokenKind};
 use crate::source::{ModuleId, Span};
@@ -68,6 +69,8 @@ pub enum ParseErrorKind {
     AggregateMemberCapabilityNotSupported,
     ChainedTypeAscription,
     InvalidFormattedStringExpression,
+    InvalidComptimeParameterOrder,
+    ComptimeParameterNotAllowed,
     ExpectedToken {
         expected: TokenKind,
         found: TokenKind,
@@ -307,12 +310,26 @@ where
             TokenKind::Fn => Ok(Declaration::Function(self.function()?)),
             TokenKind::Struct => Ok(Declaration::Struct(self.struct_declaration()?)),
             TokenKind::Interface => Ok(Declaration::Interface(self.interface_declaration()?)),
+            TokenKind::Type => Ok(Declaration::TypeAlias(self.type_alias_declaration()?)),
             _ => Err(ParseError {
                 kind: ParseErrorKind::ExpectedTopLevelDeclaration { found: token.kind },
                 span: token.span,
             }
             .into()),
         }
+    }
+
+    fn type_alias_declaration(&mut self) -> ParseResult<TypeAliasDeclaration> {
+        let keyword = self.expect(TokenKind::Type)?;
+        let name = self.expect(TokenKind::Identifier)?;
+        self.expect(TokenKind::Assign)?;
+        let target = self.type_expression()?;
+        let semicolon = self.expect(TokenKind::Semicolon)?;
+        Ok(TypeAliasDeclaration::new(
+            name.span,
+            target,
+            Span::new(self.module_id, keyword.span.start, semicolon.span.end),
+        ))
     }
 
     fn interface_declaration(&mut self) -> ParseResult<InterfaceDeclaration> {
@@ -347,7 +364,7 @@ where
     fn interface_method_requirement(&mut self) -> ParseResult<InterfaceMethodRequirement> {
         let keyword = self.expect(TokenKind::Fn)?;
         let name = self.expect(TokenKind::Identifier)?;
-        let parameters = self.function_parameters(true)?;
+        let parameters = self.function_parameters(true, false)?;
         let return_type = self.optional_return_type()?;
         let semicolon = self.expect(TokenKind::Semicolon)?;
 
@@ -424,8 +441,9 @@ where
     fn function(&mut self) -> ParseResult<Function> {
         let keyword = self.expect(TokenKind::Fn)?;
         let name = self.expect(TokenKind::Identifier)?;
-        let parameters = self.function_parameters(true)?;
+        let parameters = self.function_parameters(true, true)?;
         let return_type = self.optional_return_type()?;
+        let where_clause = self.optional_where_clause()?;
         let body = self.block()?;
         let span = Span::new(self.module_id, keyword.span.start, body.span.end);
 
@@ -433,18 +451,37 @@ where
             name.span,
             parameters,
             return_type,
+            where_clause,
             body,
             span,
         ))
     }
 
-    fn function_parameters(&mut self, allow_receiver: bool) -> ParseResult<Vec<FunctionParameter>> {
+    fn function_parameters(
+        &mut self,
+        allow_receiver: bool,
+        allow_comptime: bool,
+    ) -> ParseResult<Vec<FunctionParameter>> {
         self.expect(TokenKind::LeftParen)?;
         let mut parameters = Vec::new();
+        let mut saw_runtime = false;
 
         if self.current()?.kind != TokenKind::RightParen {
             loop {
-                parameters.push(self.function_parameter(allow_receiver)?);
+                let parameter = self.function_parameter(allow_receiver, allow_comptime)?;
+                match &parameter.kind {
+                    FunctionParameterKind::Comptime { .. } if saw_runtime => {
+                        return Err(ParseError {
+                            kind: ParseErrorKind::InvalidComptimeParameterOrder,
+                            span: parameter.span,
+                        }
+                        .into());
+                    }
+                    FunctionParameterKind::Comptime { .. } => {}
+                    FunctionParameterKind::Named { .. } => saw_runtime = true,
+                    FunctionParameterKind::Receiver { .. } => {}
+                }
+                parameters.push(parameter);
 
                 if self.current()?.kind != TokenKind::Comma {
                     break;
@@ -462,6 +499,82 @@ where
         Ok(parameters)
     }
 
+    fn optional_where_clause(&mut self) -> ParseResult<Option<WhereClause>> {
+        if self.current()?.kind != TokenKind::Where {
+            return Ok(None);
+        }
+
+        let keyword = self.advance()?;
+        let mut constraints = Vec::new();
+        if self.current()?.kind == TokenKind::LeftBrace {
+            let token = self.current()?;
+            return Err(ParseError {
+                kind: ParseErrorKind::ExpectedToken {
+                    expected: TokenKind::Identifier,
+                    found: token.kind,
+                },
+                span: token.span,
+            }
+            .into());
+        }
+        while self.current()?.kind != TokenKind::LeftBrace {
+            let parameter = self.expect(TokenKind::Identifier)?;
+            self.expect(TokenKind::Colon)?;
+            let start = parameter.span.start;
+            let interface = if self.current()?.kind == TokenKind::Interface {
+                let interface_keyword = self.advance()?;
+                self.expect(TokenKind::LeftBrace)?;
+                let mut requirements = Vec::new();
+                let close = loop {
+                    match self.current()?.kind {
+                        TokenKind::RightBrace => break self.advance()?,
+                        TokenKind::Fn => requirements.push(self.interface_method_requirement()?),
+                        found => {
+                            return Err(ParseError {
+                                kind: ParseErrorKind::ExpectedInterfaceMember { found },
+                                span: self.current()?.span,
+                            }
+                            .into());
+                        }
+                    }
+                };
+                InterfaceConstraint::Anonymous {
+                    requirements,
+                    span: Span::new(
+                        self.module_id,
+                        interface_keyword.span.start,
+                        close.span.end,
+                    ),
+                }
+            } else {
+                InterfaceConstraint::Named(self.named_type()?)
+            };
+            let end = match &interface {
+                InterfaceConstraint::Named(interface) => interface.span.end,
+                InterfaceConstraint::Anonymous { span, .. } => span.end,
+            };
+            constraints.push(WhereConstraint {
+                id: NodeId::UNASSIGNED,
+                parameter: parameter.span,
+                interface,
+                span: Span::new(self.module_id, start, end),
+            });
+
+            if self.current()?.kind != TokenKind::Comma {
+                break;
+            }
+            self.advance()?;
+        }
+
+        let end = constraints
+            .last()
+            .map_or(keyword.span.end, |constraint| constraint.span.end);
+        Ok(Some(WhereClause {
+            constraints,
+            span: Span::new(self.module_id, keyword.span.start, end),
+        }))
+    }
+
     fn optional_return_type(&mut self) -> ParseResult<Option<TypeSyntax>> {
         if self.current()?.kind == TokenKind::Arrow {
             self.advance()?;
@@ -471,8 +584,44 @@ where
         }
     }
 
-    fn function_parameter(&mut self, allow_receiver: bool) -> ParseResult<FunctionParameter> {
+    fn function_parameter(
+        &mut self,
+        allow_receiver: bool,
+        allow_comptime: bool,
+    ) -> ParseResult<FunctionParameter> {
         let first = self.current()?;
+        if first.kind == TokenKind::Comptime {
+            if !allow_comptime {
+                return Err(ParseError {
+                    kind: ParseErrorKind::ComptimeParameterNotAllowed,
+                    span: first.span,
+                }
+                .into());
+            }
+            let keyword = self.advance()?;
+            let name = self.expect(TokenKind::Identifier)?;
+            self.expect(TokenKind::Colon)?;
+            let constraint = if self.current()?.kind == TokenKind::Type {
+                let type_keyword = self.advance()?;
+                ComptimeParameterConstraint::Type {
+                    span: type_keyword.span,
+                }
+            } else {
+                ComptimeParameterConstraint::Interface(self.named_type()?)
+            };
+            let end = match &constraint {
+                ComptimeParameterConstraint::Type { span } => span.end,
+                ComptimeParameterConstraint::Interface(interface) => interface.span.end,
+            };
+            return Ok(FunctionParameter::new(
+                BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
+                FunctionParameterKind::Comptime {
+                    name: name.span,
+                    constraint,
+                },
+                Span::new(self.module_id, keyword.span.start, end),
+            ));
+        }
         if allow_receiver && first.kind == TokenKind::SelfValue {
             let receiver = self.advance()?;
             return Ok(FunctionParameter::new(
@@ -891,6 +1040,10 @@ where
             TokenKind::String => self.primitive_type(PrimitiveType::String),
             TokenKind::Bytes => self.primitive_type(PrimitiveType::Bytes),
             TokenKind::None => self.primitive_type(PrimitiveType::None),
+            TokenKind::Type => {
+                let keyword = self.advance()?;
+                Ok(TypeSyntax::new(TypeKind::Meta, keyword.span))
+            }
             TokenKind::Queue => self.builtin_type(BuiltinType::Queue),
             TokenKind::Vector => self.builtin_type(BuiltinType::Vector),
             TokenKind::Map => self.builtin_type(BuiltinType::Map),
@@ -942,6 +1095,9 @@ where
         let (arguments, end) = if self.current()?.kind == TokenKind::Less {
             let (arguments, close) = self.type_arguments()?;
             (arguments, close.span.end)
+        } else if self.current()?.kind == TokenKind::LeftParen {
+            let (arguments, close) = self.parenthesized_type_arguments()?;
+            (arguments, close.span.end)
         } else {
             (Vec::new(), name.span.end)
         };
@@ -953,6 +1109,25 @@ where
             },
             Span::new(self.module_id, name.span.start, end),
         ))
+    }
+
+    fn parenthesized_type_arguments(&mut self) -> ParseResult<(Vec<TypeSyntax>, Token)> {
+        self.expect(TokenKind::LeftParen)?;
+        let mut arguments = Vec::new();
+        if self.current()?.kind != TokenKind::RightParen {
+            loop {
+                arguments.push(self.type_expression()?);
+                if self.current()?.kind != TokenKind::Comma {
+                    break;
+                }
+                self.advance()?;
+                if self.current()?.kind == TokenKind::RightParen {
+                    break;
+                }
+            }
+        }
+        let close = self.expect(TokenKind::RightParen)?;
+        Ok((arguments, close))
     }
 
     fn builtin_type(&mut self, builtin: BuiltinType) -> ParseResult<TypeSyntax> {
@@ -1548,7 +1723,7 @@ where
     fn lambda_expression(&mut self) -> ParseResult {
         let keyword = self.expect(TokenKind::Lambda)?;
         let parameters = if self.current()?.kind == TokenKind::LeftParen {
-            self.function_parameters(false)?
+            self.function_parameters(false, false)?
         } else {
             Vec::new()
         };
@@ -2063,6 +2238,10 @@ fn assign_declaration_ids(declaration: &mut Declaration, context: &mut ParseCont
                 }
             }
         }
+        Declaration::TypeAlias(alias) => {
+            alias.id = context.next_node_id();
+            assign_type_ids(&mut alias.target, context);
+        }
     }
 }
 
@@ -2074,16 +2253,43 @@ fn assign_function_ids(function: &mut Function, context: &mut ParseContext) {
     if let Some(return_type) = &mut function.return_type {
         assign_type_ids(return_type, context);
     }
+    if let Some(where_clause) = &mut function.where_clause {
+        for constraint in &mut where_clause.constraints {
+            constraint.id = context.next_node_id();
+            match &mut constraint.interface {
+                InterfaceConstraint::Named(interface) => assign_type_ids(interface, context),
+                InterfaceConstraint::Anonymous { requirements, .. } => {
+                    for requirement in requirements {
+                        requirement.id = context.next_node_id();
+                        for parameter in &mut requirement.parameters {
+                            assign_parameter_ids(parameter, context);
+                        }
+                        if let Some(return_type) = &mut requirement.return_type {
+                            assign_type_ids(return_type, context);
+                        }
+                    }
+                }
+            }
+        }
+    }
     assign_block_ids(&mut function.body, context);
 }
 
 fn assign_parameter_ids(parameter: &mut FunctionParameter, context: &mut ParseContext) {
     parameter.id = context.next_node_id();
-    if let FunctionParameterKind::Named {
-        type_annotation, ..
-    } = &mut parameter.kind
-    {
-        assign_type_ids(type_annotation, context);
+    match &mut parameter.kind {
+        FunctionParameterKind::Named {
+            type_annotation, ..
+        } => assign_type_ids(type_annotation, context),
+        FunctionParameterKind::Comptime {
+            constraint: ComptimeParameterConstraint::Interface(interface),
+            ..
+        } => assign_type_ids(interface, context),
+        FunctionParameterKind::Comptime {
+            constraint: ComptimeParameterConstraint::Type { .. },
+            ..
+        }
+        | FunctionParameterKind::Receiver { .. } => {}
     }
 }
 
@@ -2255,7 +2461,7 @@ fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext
 fn assign_type_ids(type_syntax: &mut TypeSyntax, context: &mut ParseContext) {
     type_syntax.id = context.next_node_id();
     match &mut type_syntax.kind {
-        TypeKind::Primitive(_) => {}
+        TypeKind::Meta | TypeKind::Primitive(_) => {}
         TypeKind::Builtin { arguments, .. } | TypeKind::Named { arguments, .. } => {
             for argument in arguments {
                 assign_type_ids(argument, context);
@@ -7220,5 +7426,94 @@ mod tests {
         };
 
         let _ = parse_expression(&mut context, Lexer::new(&module));
+    }
+
+    #[test]
+    fn parses_aliases_comptime_parameters_and_where_constraints() {
+        let source = concat!(
+            "type IntBox = Box(int);\n",
+            "interface Reader { fn read(self) -> int; }\n",
+            "fn make(comptime T: type, comptime R: Reader, comptime U: type, input: T) -> type\n",
+            "where T: Reader, U: interface { fn read(self) -> int; }, {}\n",
+            "fn main() {}",
+        );
+        let program = parse_program_source(source).expect("template syntax should parse");
+
+        let Declaration::TypeAlias(alias) = &program.declarations[0] else {
+            panic!("expected a type alias");
+        };
+        assert!(matches!(
+            &alias.target.kind,
+            TypeKind::Named { arguments, .. } if arguments.len() == 1
+        ));
+
+        let Declaration::Function(function) = &program.declarations[2] else {
+            panic!("expected a function");
+        };
+        assert!(matches!(
+            &function.parameters[0].kind,
+            FunctionParameterKind::Comptime {
+                constraint: ComptimeParameterConstraint::Type { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &function.parameters[1].kind,
+            FunctionParameterKind::Comptime {
+                constraint: ComptimeParameterConstraint::Interface(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &function.parameters[2].kind,
+            FunctionParameterKind::Comptime {
+                constraint: ComptimeParameterConstraint::Type { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            function.return_type.as_ref().map(|syntax| &syntax.kind),
+            Some(TypeKind::Meta)
+        ));
+        let where_clause = function.where_clause.as_ref().expect("where clause");
+        assert_eq!(where_clause.constraints.len(), 2);
+        assert!(matches!(
+            &where_clause.constraints[0].interface,
+            InterfaceConstraint::Named(_)
+        ));
+        assert!(matches!(
+            &where_clause.constraints[1].interface,
+            InterfaceConstraint::Anonymous { requirements, .. } if requirements.len() == 1
+        ));
+    }
+
+    #[test]
+    fn enforces_receiver_comptime_runtime_parameter_order() {
+        let error = parse_program_source(
+            "fn invalid(value: int, comptime T: type) {} fn main() {}",
+        )
+        .expect_err("comptime parameters must precede runtime parameters");
+        assert!(matches!(
+            error,
+            FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::InvalidComptimeParameterOrder,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_comptime_interface_requirements() {
+        let error = parse_program_source(
+            "interface Invalid { fn run(self, comptime T: type); } fn main() {}",
+        )
+        .expect_err("interfaces cannot declare comptime parameters");
+        assert!(matches!(
+            error,
+            FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::ComptimeParameterNotAllowed,
+                ..
+            })
+        ));
     }
 }

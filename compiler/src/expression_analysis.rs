@@ -633,7 +633,7 @@ impl LexicalIndex {
                         }
                     }
                 }
-                Declaration::Interface(_) => {}
+                Declaration::Interface(_) | Declaration::TypeAlias(_) => {}
             }
         }
         index
@@ -1016,7 +1016,7 @@ impl<'semantic> Analyzer<'semantic> {
                     }
                 }
             }
-            Declaration::Interface(_) => {}
+            Declaration::Interface(_) | Declaration::TypeAlias(_) => {}
         }
     }
 

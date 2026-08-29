@@ -38,6 +38,31 @@ pub enum Declaration {
     Function(Function),
     Struct(StructDeclaration),
     Interface(InterfaceDeclaration),
+    TypeAlias(TypeAliasDeclaration),
+}
+
+/// A transparent file-level name for another type.
+///
+/// Aliases do not introduce nominal identity or runtime storage. Their target
+/// is resolved when type-factory semantics are implemented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeAliasDeclaration {
+    pub id: NodeId,
+    pub name: Span,
+    pub target: TypeSyntax,
+    pub span: Span,
+}
+
+impl TypeAliasDeclaration {
+    #[must_use]
+    pub const fn new(name: Span, target: TypeSyntax, span: Span) -> Self {
+        Self {
+            id: NodeId::UNASSIGNED,
+            name,
+            target,
+            span,
+        }
+    }
 }
 
 /// A named structural interface declaration.
@@ -290,6 +315,7 @@ pub struct Function {
     pub parameters: Vec<FunctionParameter>,
     /// An explicit return annotation. Its absence defaults to unit.
     pub return_type: Option<TypeSyntax>,
+    pub where_clause: Option<WhereClause>,
     pub body: Block,
     pub span: Span,
 }
@@ -300,6 +326,7 @@ impl Function {
         name: Span,
         parameters: Vec<FunctionParameter>,
         return_type: Option<TypeSyntax>,
+        where_clause: Option<WhereClause>,
         body: Block,
         span: Span,
     ) -> Self {
@@ -308,6 +335,7 @@ impl Function {
             name,
             parameters,
             return_type,
+            where_clause,
             body,
             span,
         }
@@ -348,6 +376,12 @@ pub enum FunctionParameterKind {
         name: Span,
         type_annotation: TypeSyntax,
     },
+    /// A compile-time type argument. It is either unconstrained (`T: type`) or
+    /// required to satisfy the named interface type used as its bound.
+    Comptime {
+        name: Span,
+        constraint: ComptimeParameterConstraint,
+    },
     /// A method receiver written as `self`, `mut self`, `&self`, or
     /// `&mut self`.
     Receiver {
@@ -355,6 +389,37 @@ pub enum FunctionParameterKind {
         /// Whether the receiver is a non-escaping view or requires
         /// independently GC-managed storage and may be retained.
         storage: ReceiverStorage,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComptimeParameterConstraint {
+    Type { span: Span },
+    Interface(TypeSyntax),
+}
+
+/// Interface bounds attached to a function declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhereClause {
+    pub constraints: Vec<WhereConstraint>,
+    pub span: Span,
+}
+
+/// One named or private structural interface bound in a `where` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhereConstraint {
+    pub id: NodeId,
+    pub parameter: Span,
+    pub interface: InterfaceConstraint,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterfaceConstraint {
+    Named(TypeSyntax),
+    Anonymous {
+        requirements: Vec<InterfaceMethodRequirement>,
+        span: Span,
     },
 }
 
@@ -433,15 +498,17 @@ pub enum RangeInclusivity {
 /// The syntax represented by a [`TypeSyntax`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
+    /// The compile-time type-of-types, spelled `type`.
+    Meta,
     Primitive(PrimitiveType),
     Builtin {
         builtin: BuiltinType,
         arguments: Vec<TypeSyntax>,
     },
-    /// A type referenced by its declared source name, such as a user-defined
-    /// struct or interface. Arguments are retained syntactically for future
-    /// generic declarations, but are rejected for named types in the initial
-    /// language.
+    /// A type referenced by its declared source name. Parenthesized arguments
+    /// represent a type-factory application; their semantics are added in the
+    /// next template increment. Legacy angle-bracket arguments remain in the
+    /// syntax tree until compiler-known built-ins migrate in that increment.
     Named {
         name: Span,
         arguments: Vec<TypeSyntax>,

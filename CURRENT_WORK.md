@@ -22,7 +22,7 @@ owner's behalf unless explicitly asked.
 ## Completed semantic analysis
 
 Name, scope, and context resolution are implemented. Together they provide
-semantic symbol identities, nested value and type scopes, forward declaration
+semantic symbol identities, one unified lexical declaration namespace, forward declaration
 collection, complete name resolution, sequential local-binding shadowing,
 callable classification, structural control targets, and diagnostics for
 invalid names, declarations, receivers, contextual control flow, `self`, and
@@ -259,26 +259,31 @@ reviewable phases:
        value types, escapes and braces, evaluation order, every supported
        format option, malformed specifications, result semantics, and lowering
        metadata. The complex-program test exercises formatted strings.
-   - Phase 7.4, compile-time type factories and bounded templates (next):
+   - Phase 7.4, compile-time type factories and bounded templates (in progress):
      - Implement this phase as three independently reviewable changes. Stop
        after each change so it can be reviewed and committed before beginning
        the next one.
-     - Change 1, syntax and a unified declaration namespace:
-       - Unify type and value declarations into one lexical namespace. Reject
-         same-scope collisions regardless of declaration kind, preserve lexical
-         shadowing, and make the nearest declaration authoritative in both type
-         and value contexts.
-       - Add `type`, `comptime`, and `where` syntax and the corresponding AST
-         representation. Require a receiver first when present, followed by all
-         compile-time parameters and then all runtime parameters.
-       - Add transparent file-level aliases such as
+     - Change 1, syntax and a unified declaration namespace (complete):
+       - Complete: unify type and value declarations into one lexical namespace.
+         Reject same-scope named-declaration collisions regardless of kind,
+         preserve sequential local-binding and nested lexical shadowing, and
+         make the nearest declaration authoritative in both type and value
+         contexts.
+       - Complete: add `type`, `comptime`, and `where` syntax and the
+         corresponding AST representation. Require a receiver first when
+         present, followed by all compile-time parameters and then all runtime
+         parameters.
+       - Complete: add transparent file-level aliases such as
          `type IntBox = Box(int);`. An alias introduces no nominal identity,
          runtime storage, binding mutability, or independent value capability.
-       - Parse named and anonymous interface constraints in `where` clauses and
-         update every frontend traversal, pretty-printer, diagnostic inventory,
-         and focused parser and name-resolution test.
-       - Stop for review and commit before implementing type-factory semantics.
-     - Change 2, type factories, generated structs, and built-in migration:
+       - Complete: parse named and anonymous interface constraints in `where`
+         clauses and update every frontend traversal, pretty-printer,
+         diagnostic inventory, and focused parser and name-resolution test. A
+         type parameter may be constrained either inline or in one `where`
+         entry, but not by both forms or by repeated `where` entries. Named
+         constraints must denote interfaces; concrete types are rejected.
+       - Review and commit this change before implementing type-factory semantics.
+     - Change 2, type factories, generated structs, and built-in migration (next):
        - Support type-producing functions at file level and as receiverless
          struct members. A function returning `type` has no receiver or runtime
          parameters and contains one final type expression or explicit

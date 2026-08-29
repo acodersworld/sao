@@ -1,10 +1,11 @@
 use std::fmt::{Arguments, Write};
 
 use crate::ast::{
-    AnonymousStructField, AnonymousStructMember, Block, ConditionalElse, Declaration, Expression,
-    ExpressionKind, FormattedStringPart, Function, FunctionParameter, FunctionParameterKind,
-    InterfaceDeclaration, InterfaceMethodRequirement, Program, Statement, StatementKind,
-    StructDeclaration, StructField, StructFieldInitializer, StructMember, TypeKind, TypeSyntax,
+    AnonymousStructField, AnonymousStructMember, Block, ComptimeParameterConstraint,
+    ConditionalElse, Declaration, Expression, ExpressionKind, FormattedStringPart, Function,
+    FunctionParameter, FunctionParameterKind, InterfaceConstraint, InterfaceDeclaration,
+    InterfaceMethodRequirement, Program, Statement, StatementKind, StructDeclaration, StructField,
+    StructFieldInitializer, StructMember, TypeAliasDeclaration, TypeKind, TypeSyntax, WhereClause,
 };
 use crate::source::{SourceModule, Span};
 
@@ -82,7 +83,26 @@ fn format_declaration_into(
         Declaration::Interface(interface) => {
             format_interface_declaration_into(output, source, interface, depth);
         }
+        Declaration::TypeAlias(alias) => format_type_alias_into(output, source, alias, depth),
     }
+}
+
+fn format_type_alias_into(
+    output: &mut String,
+    source: &SourceModule,
+    alias: &TypeAliasDeclaration,
+    depth: usize,
+) {
+    line(
+        output,
+        depth,
+        format_args!(
+            "TypeAlias {:?} {}",
+            text(source, alias.name),
+            location(alias.span)
+        ),
+    );
+    child_type(output, source, "target", &alias.target, depth);
 }
 
 fn format_interface_declaration_into(
@@ -266,7 +286,51 @@ fn format_function_into(
     );
     parameter_list(output, source, &function.parameters, depth);
     optional_return_type(output, source, function.return_type.as_ref(), depth);
+    if let Some(where_clause) = &function.where_clause {
+        format_where_clause_into(output, source, where_clause, depth);
+    }
     child_block(output, source, "body", &function.body, depth);
+}
+
+fn format_where_clause_into(
+    output: &mut String,
+    source: &SourceModule,
+    where_clause: &WhereClause,
+    depth: usize,
+) {
+    line(output, depth + 1, format_args!("where:"));
+    for (index, constraint) in where_clause.constraints.iter().enumerate() {
+        line(output, depth + 2, format_args!("[{index}]:"));
+        line(
+            output,
+            depth + 3,
+            format_args!(
+                "Constraint {:?} {}",
+                text(source, constraint.parameter),
+                location(constraint.span)
+            ),
+        );
+        match &constraint.interface {
+            InterfaceConstraint::Named(interface) => {
+                child_type(output, source, "interface", interface, depth + 3);
+            }
+            InterfaceConstraint::Anonymous { requirements, span } => {
+                line(
+                    output,
+                    depth + 4,
+                    format_args!("anonymous_interface: {}", location(*span)),
+                );
+                for requirement in requirements {
+                    format_interface_requirement_into(
+                        output,
+                        source,
+                        requirement,
+                        depth + 5,
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn parameter_list(
@@ -311,6 +375,25 @@ fn format_parameter_into(
                 ),
             );
             child_type(output, source, "type", type_annotation, depth);
+        }
+        FunctionParameterKind::Comptime { name, constraint } => {
+            line(
+                output,
+                depth,
+                format_args!(
+                    "ComptimeParameter {:?} {}",
+                    text(source, *name),
+                    location(parameter.span)
+                ),
+            );
+            match constraint {
+                ComptimeParameterConstraint::Type { span } => {
+                    line(output, depth + 1, format_args!("constraint: Type {}", location(*span)));
+                }
+                ComptimeParameterConstraint::Interface(interface) => {
+                    child_type(output, source, "constraint", interface, depth);
+                }
+            }
         }
         FunctionParameterKind::Receiver { storage, .. } => {
             line(
@@ -775,6 +858,7 @@ fn format_type_into(
     let span = type_syntax.span;
 
     match &type_syntax.kind {
+        TypeKind::Meta => line(output, depth, format_args!("Type {}", location(span))),
         TypeKind::Primitive(primitive) => line(
             output,
             depth,

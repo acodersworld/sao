@@ -20,7 +20,7 @@ use crate::{
     name_resolution::NameResolution,
     semantic_types::{AccessCapability, SemanticType, TypeId, TypeStore},
     source::{SourceModule, Span},
-    symbol_table::SymbolId,
+    symbol_table::{SymbolId, SymbolKind},
 };
 
 /// Canonical types produced from concrete source type syntax in a program.
@@ -196,7 +196,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
                     interface.id,
                     self.types.interface(interface.id, AccessCapability::Const),
                 ),
-                Declaration::Function(_) => continue,
+                Declaration::Function(_) | Declaration::TypeAlias(_) => continue,
             };
             let symbol = self
                 .names
@@ -225,6 +225,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
                     self.visit_interface_requirement(requirement);
                 }
             }
+            Declaration::TypeAlias(_) => {}
         }
     }
 
@@ -245,11 +246,14 @@ impl<'source, 'names> Resolver<'source, 'names> {
 
     fn visit_parameters(&mut self, parameters: &[FunctionParameter]) {
         for parameter in parameters {
-            if let FunctionParameterKind::Named {
-                type_annotation, ..
-            } = &parameter.kind
-            {
-                self.resolve_type(type_annotation);
+            match &parameter.kind {
+                FunctionParameterKind::Named {
+                    type_annotation, ..
+                } => {
+                    self.resolve_type(type_annotation);
+                }
+                FunctionParameterKind::Comptime { .. }
+                | FunctionParameterKind::Receiver { .. } => {}
             }
         }
     }
@@ -433,6 +437,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
 
     fn resolve_type(&mut self, syntax: &TypeSyntax) -> TypeId {
         let resolved = match &syntax.kind {
+            TypeKind::Meta => self.types.recovery(),
             TypeKind::Primitive(primitive) => {
                 self.types.primitive(*primitive, AccessCapability::Const)
             }
@@ -497,10 +502,20 @@ impl<'source, 'names> Resolver<'source, 'names> {
             .names
             .symbol_for_reference(syntax.id)
             .expect("named type syntax must have name-resolution metadata");
-        *self
-            .symbol_types
-            .get(&symbol)
-            .expect("resolved type symbol must identify a struct or interface declaration")
+        match self
+            .names
+            .symbols()
+            .symbol(symbol)
+            .expect("resolved type symbol must exist")
+            .kind
+        {
+            SymbolKind::TypeAlias | SymbolKind::ComptimeParameter => self.types.recovery(),
+            SymbolKind::Struct | SymbolKind::Interface => *self
+                .symbol_types
+                .get(&symbol)
+                .expect("nominal type declaration must have been predeclared"),
+            _ => unreachable!("name resolution only records type-context symbols here"),
+        }
     }
 
     fn resolve_builtin(

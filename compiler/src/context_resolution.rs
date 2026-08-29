@@ -274,6 +274,7 @@ impl ContextResolver {
                     self.visit_interface_requirement(requirement);
                 }
             }
+            Declaration::TypeAlias(_) => {}
         }
     }
 

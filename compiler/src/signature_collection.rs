@@ -809,6 +809,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                     },
                 );
             }
+            Declaration::TypeAlias(_) => {}
         }
     }
 
@@ -935,6 +936,7 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
                         .expect("resolved parameter type belongs to the program type store");
                     semantic_parameters.push(resolved);
                 }
+                FunctionParameterKind::Comptime { .. } => {}
             }
         }
         let return_type = match return_type {

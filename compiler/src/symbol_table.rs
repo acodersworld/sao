@@ -27,7 +27,9 @@ impl std::error::Error for ScopeCreationError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Namespace {
+    /// A value-context lookup in the unified lexical declaration namespace.
     Value,
+    /// A type-context lookup in the unified lexical declaration namespace.
     Type,
 }
 
@@ -87,9 +89,11 @@ pub enum SymbolKind {
     Function,
     Binding,
     Parameter,
+    ComptimeParameter,
     RangeBinding,
     Struct,
     Interface,
+    TypeAlias,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,8 +106,9 @@ pub struct Symbol {
 #[derive(Debug)]
 struct Scope {
     parent: Option<ScopeId>,
-    values: HashMap<String, SymbolId>,
-    types: HashMap<String, SymbolId>,
+    /// All declarations share this map. Lookup stops at the nearest name even
+    /// when that declaration cannot be used in the requested context.
+    symbols: HashMap<String, SymbolId>,
 }
 
 #[derive(Debug)]
@@ -128,8 +133,7 @@ impl SymbolTable {
                 ScopeId(0),
                 Scope {
                     parent: None,
-                    values: Default::default(),
-                    types: Default::default(),
+                    symbols: Default::default(),
                 },
             )]),
             next_scope_id: 1,
@@ -151,8 +155,7 @@ impl SymbolTable {
 
         let new_scope = Scope {
             parent: Some(parent),
-            values: Default::default(),
-            types: Default::default(),
+            symbols: Default::default(),
         };
 
         self.scopes.insert(scope_id, new_scope);
@@ -188,82 +191,83 @@ impl SymbolTable {
             return Err(DeclareError::ScopeNotFound { scope });
         };
 
-        let table = match kind {
-            SymbolKind::Struct | SymbolKind::Interface => {
-                if let Some(existing) = scope.types.get(name) {
-                    let original = self
-                        .symbols
-                        .get(existing)
-                        .expect("declared symbol must exist");
-                    return Err(DeclareError::DuplicateDeclaration {
-                        name: name.to_string(),
-                        original: original.span,
-                        duplicate: span,
-                    });
+        if let Some(id) = scope.symbols.get(name) {
+            let duplicate = match kind {
+                SymbolKind::Binding | SymbolKind::RangeBinding => {
+                    let existing = self.symbols.get(id).expect("declared symbol must exist");
+                    matches!(
+                        existing.kind,
+                        SymbolKind::BuiltinValue
+                            | SymbolKind::Function
+                            | SymbolKind::Struct
+                            | SymbolKind::Interface
+                            | SymbolKind::TypeAlias
+                    )
                 }
-
-                &mut scope.types
-            }
-            SymbolKind::Parameter => {
-                if let Some(id) = scope.values.get(name) {
+                SymbolKind::Parameter => {
                     let dup = self.symbols.get(id).unwrap();
-                    if matches!(
+                    matches!(
                         dup.kind,
-                        SymbolKind::Parameter | SymbolKind::Function | SymbolKind::BuiltinValue
-                    ) {
-                        return Err(DeclareError::DuplicateDeclaration {
-                            name: name.to_string(),
-                            original: dup.span,
-                            duplicate: span,
-                        });
-                    }
+                        SymbolKind::Parameter
+                            | SymbolKind::ComptimeParameter
+                            | SymbolKind::Function
+                            | SymbolKind::BuiltinValue
+                            | SymbolKind::Struct
+                            | SymbolKind::Interface
+                            | SymbolKind::TypeAlias
+                    )
                 }
-                &mut scope.values
+                _ => true,
+            };
+            if duplicate {
+                let original = self.symbols.get(id).expect("declared symbol must exist");
+                return Err(DeclareError::DuplicateDeclaration {
+                    name: name.to_string(),
+                    original: original.span,
+                    duplicate: span,
+                });
             }
-            SymbolKind::BuiltinValue | SymbolKind::Function => {
-                if let Some(existing) = scope.values.get(name) {
-                    let original = self
-                        .symbols
-                        .get(existing)
-                        .expect("declared symbol must exist");
-                    return Err(DeclareError::DuplicateDeclaration {
-                        name: name.to_string(),
-                        original: original.span,
-                        duplicate: span,
-                    });
-                }
-                &mut scope.values
-            }
-            SymbolKind::Binding | SymbolKind::RangeBinding => {
-                if let Some(id) = scope.values.get(name) {
-                    let dup = self.symbols.get(id).unwrap();
-                    if matches!(dup.kind, SymbolKind::Function | SymbolKind::BuiltinValue) {
-                        return Err(DeclareError::DuplicateDeclaration {
-                            name: name.to_string(),
-                            original: dup.span,
-                            duplicate: span,
-                        });
-                    }
-                }
-                &mut scope.values
-            }
-        };
+        }
 
-        table.insert(name.to_string(), symbol_id);
+        scope.symbols.insert(name.to_string(), symbol_id);
 
         self.new_symbol(symbol_id, name, kind, span);
         Ok(symbol_id)
     }
 
-    pub fn lookup_value(&self, scope: ScopeId, name: &str) -> Result<SymbolId, SymbolLookupError> {
+    fn lookup(
+        &self,
+        scope: ScopeId,
+        namespace: Namespace,
+        name: &str,
+    ) -> Result<SymbolId, SymbolLookupError> {
         let Some(scope) = self.scopes.get(&scope) else {
             return Err(SymbolLookupError::ScopeNotFound { scope });
         };
 
-        if let Some(symbol) = scope.values.get(name) {
+        if let Some(symbol) = scope.symbols.get(name) {
             Ok(*symbol)
         } else if let Some(parent) = scope.parent {
-            self.lookup_value(parent, name)
+            self.lookup(parent, namespace, name)
+        } else {
+            Err(SymbolLookupError::SymbolNotFound {
+                namespace,
+                name: name.to_string(),
+            })
+        }
+    }
+
+    pub fn lookup_value(&self, scope: ScopeId, name: &str) -> Result<SymbolId, SymbolLookupError> {
+        let symbol = self.lookup(scope, Namespace::Value, name)?;
+        if matches!(
+            self.symbols.get(&symbol).expect("looked-up symbol must exist").kind,
+            SymbolKind::BuiltinValue
+                | SymbolKind::Function
+                | SymbolKind::Binding
+                | SymbolKind::Parameter
+                | SymbolKind::RangeBinding
+        ) {
+            Ok(symbol)
         } else {
             Err(SymbolLookupError::SymbolNotFound {
                 namespace: Namespace::Value,
@@ -273,14 +277,15 @@ impl SymbolTable {
     }
 
     pub fn lookup_type(&self, scope: ScopeId, name: &str) -> Result<SymbolId, SymbolLookupError> {
-        let Some(scope) = self.scopes.get(&scope) else {
-            return Err(SymbolLookupError::ScopeNotFound { scope });
-        };
-
-        if let Some(symbol) = scope.types.get(name) {
-            Ok(*symbol)
-        } else if let Some(parent) = scope.parent {
-            self.lookup_type(parent, name)
+        let symbol = self.lookup(scope, Namespace::Type, name)?;
+        if matches!(
+            self.symbols.get(&symbol).expect("looked-up symbol must exist").kind,
+            SymbolKind::Struct
+                | SymbolKind::Interface
+                | SymbolKind::TypeAlias
+                | SymbolKind::ComptimeParameter
+        ) {
+            Ok(symbol)
         } else {
             Err(SymbolLookupError::SymbolNotFound {
                 namespace: Namespace::Type,
@@ -583,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn permits_the_same_name_in_value_and_type_namespaces() {
+    fn rejects_same_scope_collisions_between_type_and_value_declarations() {
         let mut symbols = SymbolTable::new();
         let root = symbols.root_scope();
         let value = expect_declared(symbols.declare(
@@ -592,14 +597,49 @@ mod tests {
             SymbolKind::Binding,
             Span::new(ModuleId::PRELUDE, 0, 4),
         ));
-        let ty = expect_declared(symbols.declare(
+        let ty = symbols.declare(
             root,
             "item",
             SymbolKind::Struct,
             Span::new(ModuleId::PRELUDE, 10, 14),
-        ));
+        );
 
         assert_eq!(expect_found(symbols.lookup_value(root, "item")), value);
-        assert_eq!(expect_found(symbols.lookup_type(root, "item")), ty);
+        assert!(matches!(ty, Err(DeclareError::DuplicateDeclaration { .. })));
+        assert!(matches!(
+            symbols.lookup_type(root, "item"),
+            Err(SymbolLookupError::SymbolNotFound {
+                namespace: Namespace::Type,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_nearer_wrong_kind_blocks_an_outer_declaration() {
+        let mut symbols = SymbolTable::new();
+        let root = symbols.root_scope();
+        expect_declared(symbols.declare(
+            root,
+            "Item",
+            SymbolKind::Struct,
+            Span::new(ModuleId::PRELUDE, 0, 4),
+        ));
+        let child = symbols.new_child_scope(root).expect("root scope exists");
+        let binding = expect_declared(symbols.declare(
+            child,
+            "Item",
+            SymbolKind::Binding,
+            Span::new(ModuleId::PRELUDE, 10, 14),
+        ));
+
+        assert_eq!(expect_found(symbols.lookup_value(child, "Item")), binding);
+        assert!(matches!(
+            symbols.lookup_type(child, "Item"),
+            Err(SymbolLookupError::SymbolNotFound {
+                namespace: Namespace::Type,
+                ..
+            })
+        ));
     }
 }

@@ -33,6 +33,15 @@ interface Accumulator {
     fn add(mut self, amount: int) -> int;
 }
 
+type SummaryAlias = Summary;
+
+fn inspect_inline(comptime T: Formatter) {}
+
+fn inspect_named(comptime T: type) where T: Formatter {}
+
+fn inspect_private(comptime T: type)
+where T: interface { fn format(self, prefix: string) -> string; }, {}
+
 struct Summary {
     name: string,
     total: int,

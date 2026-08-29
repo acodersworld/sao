@@ -10,10 +10,10 @@ use std::{collections::HashMap, fmt};
 
 use crate::{
     ast::{
-        AnonymousStructMember, Block, ConditionalElse, Declaration, Expression, ExpressionKind,
-        FormattedStringPart,
-        Function, FunctionParameter, FunctionParameterKind, InterfaceMethodRequirement, NodeId,
-        Program, Statement, StatementKind, StructMember, TypeKind, TypeSyntax,
+        AnonymousStructMember, Block, ComptimeParameterConstraint, ConditionalElse, Declaration,
+        Expression, ExpressionKind, FormattedStringPart, Function, FunctionParameter,
+        FunctionParameterKind, InterfaceConstraint, InterfaceMethodRequirement, NodeId, Program,
+        Statement, StatementKind, StructMember, TypeKind, TypeSyntax,
     },
     source::{ModuleId, SourceModule, Span},
     symbol_table::{
@@ -74,6 +74,8 @@ pub struct NameResolutionError {
 pub enum NameResolutionErrorKind {
     UnknownName { namespace: Namespace, name: String },
     DuplicateDeclaration { name: String, other: Span },
+    DuplicateTemplateConstraint { name: String, other: Span },
+    InvalidTemplateConstraint { found: SymbolKind },
     MissingMain,
 }
 
@@ -89,6 +91,16 @@ impl fmt::Display for NameResolutionError {
                 formatter,
                 "duplicate declaration of `{name}` at {}..{}; conflicting declaration at {}..{}",
                 self.span.start, self.span.end, other.start, other.end
+            ),
+            NameResolutionErrorKind::DuplicateTemplateConstraint { name, other } => write!(
+                formatter,
+                "duplicate template constraint for `{name}` at {}..{}; first constrained at {}..{}",
+                self.span.start, self.span.end, other.start, other.end
+            ),
+            NameResolutionErrorKind::InvalidTemplateConstraint { found } => write!(
+                formatter,
+                "template constraint at {}..{} must name an interface, found {found:?}",
+                self.span.start, self.span.end
             ),
             NameResolutionErrorKind::MissingMain => {
                 formatter.write_str("program does not declare a top-level `main` function")
@@ -213,6 +225,14 @@ impl<'source> Resolver<'source> {
                         SymbolKind::Interface,
                     );
                 }
+                Declaration::TypeAlias(alias) => {
+                    self.declare(
+                        self.program_scope,
+                        alias.id,
+                        alias.name,
+                        SymbolKind::TypeAlias,
+                    );
+                }
             }
         }
     }
@@ -239,6 +259,9 @@ impl<'source> Resolver<'source> {
                     self.resolve_interface_requirement(requirement, self.program_scope);
                 }
             }
+            Declaration::TypeAlias(alias) => {
+                self.resolve_type(self.program_scope, &alias.target);
+            }
         }
     }
 
@@ -257,23 +280,108 @@ impl<'source> Resolver<'source> {
     }
 
     fn resolve_function(&mut self, function: &Function, enclosing_scope: ScopeId) {
-        self.resolve_parameter_types(enclosing_scope, &function.parameters);
-        if let Some(return_type) = &function.return_type {
-            self.resolve_type(enclosing_scope, return_type);
+        let body_scope = self.new_child_scope(enclosing_scope);
+
+        for parameter in &function.parameters {
+            if let FunctionParameterKind::Comptime { name, .. } = &parameter.kind {
+                self.declare(
+                    body_scope,
+                    parameter.id,
+                    *name,
+                    SymbolKind::ComptimeParameter,
+                );
+            }
         }
 
-        let body_scope = self.new_child_scope(enclosing_scope);
+        self.resolve_parameter_types(body_scope, &function.parameters);
+        for parameter in &function.parameters {
+            if let FunctionParameterKind::Comptime {
+                constraint: ComptimeParameterConstraint::Interface(interface),
+                ..
+            } = &parameter.kind
+            {
+                self.validate_named_interface_constraint(interface);
+            }
+        }
+        if let Some(return_type) = &function.return_type {
+            self.resolve_type(body_scope, return_type);
+        }
+        if let Some(where_clause) = &function.where_clause {
+            let mut constrained = HashMap::new();
+            for parameter in &function.parameters {
+                if let FunctionParameterKind::Comptime {
+                    name,
+                    constraint: ComptimeParameterConstraint::Interface(_),
+                } = &parameter.kind
+                {
+                    constrained.insert(self.text(*name), parameter.span);
+                }
+            }
+            for constraint in &where_clause.constraints {
+                let name = self.text(constraint.parameter);
+                if let Some(other) = constrained.insert(name, constraint.span) {
+                    self.errors.push(NameResolutionError {
+                        kind: NameResolutionErrorKind::DuplicateTemplateConstraint {
+                            name: name.to_string(),
+                            other,
+                        },
+                        span: constraint.parameter,
+                    });
+                }
+                self.resolve_type_name(body_scope, constraint.id, constraint.parameter);
+                match &constraint.interface {
+                    InterfaceConstraint::Named(interface) => {
+                        self.resolve_type(body_scope, interface);
+                        self.validate_named_interface_constraint(interface);
+                    }
+                    InterfaceConstraint::Anonymous { requirements, .. } => {
+                        for requirement in requirements {
+                            self.resolve_interface_requirement(requirement, body_scope);
+                        }
+                    }
+                }
+            }
+        }
+
         self.declare_parameters(body_scope, &function.parameters);
         self.resolve_block_contents(body_scope, &function.body);
     }
 
+    /// Checks the declaration kind after ordinary type-name resolution. Type
+    /// aliases are accepted provisionally because their final target is
+    /// resolved by the following type-factory increment.
+    fn validate_named_interface_constraint(&mut self, interface: &TypeSyntax) {
+        let Some(symbol) = self.references.get(&interface.id).copied() else {
+            return;
+        };
+        let found = self
+            .symbols
+            .symbol(symbol)
+            .expect("resolved constraint symbol must exist")
+            .kind;
+        if !matches!(found, SymbolKind::Interface | SymbolKind::TypeAlias) {
+            self.errors.push(NameResolutionError {
+                kind: NameResolutionErrorKind::InvalidTemplateConstraint { found },
+                span: interface.span,
+            });
+        }
+    }
+
     fn resolve_parameter_types(&mut self, scope: ScopeId, parameters: &[FunctionParameter]) {
         for parameter in parameters {
-            if let FunctionParameterKind::Named {
-                type_annotation, ..
-            } = &parameter.kind
-            {
-                self.resolve_type(scope, type_annotation);
+            match &parameter.kind {
+                FunctionParameterKind::Named {
+                    type_annotation, ..
+                } => self.resolve_type(scope, type_annotation),
+                FunctionParameterKind::Comptime {
+                    constraint: ComptimeParameterConstraint::Interface(interface),
+                    ..
+                } => self.resolve_type(scope, interface),
+                FunctionParameterKind::Comptime {
+                    constraint: ComptimeParameterConstraint::Type { .. },
+                    ..
+                }
+                | FunctionParameterKind::Receiver { .. } => {}
             }
         }
     }
@@ -484,7 +592,7 @@ impl<'source> Resolver<'source> {
 
     fn resolve_type(&mut self, scope: ScopeId, type_syntax: &TypeSyntax) {
         match &type_syntax.kind {
-            TypeKind::Primitive(_) => {}
+            TypeKind::Meta | TypeKind::Primitive(_) => {}
             TypeKind::Builtin { arguments, .. } | TypeKind::Named { arguments, .. } => {
                 if let TypeKind::Named { name, .. } = &type_syntax.kind {
                     self.resolve_type_name(scope, type_syntax.id, *name);
@@ -982,6 +1090,121 @@ mod tests {
                 &error.kind,
                 NameResolutionErrorKind::DuplicateDeclaration { name, .. } if name == "main"
             ) && error.span == nth_span(&module, "main", 1)
+        }));
+    }
+
+    #[test]
+    fn resolves_forward_alias_targets_and_template_type_parameters() {
+        let source = concat!(
+            "type Alias = Later;\n",
+            "interface Reader { fn read(self) -> int; }\n",
+            "fn use_type(comptime T: type, value: T) where T: Reader {}\n",
+            "struct Later {}\n",
+            "fn main() {}",
+        );
+        let (_, program, resolution) = resolve(source);
+        let Declaration::TypeAlias(alias) = &program.declarations[0] else {
+            panic!("expected alias");
+        };
+        let alias_target = resolution
+            .symbol_for_reference(alias.target.id)
+            .expect("forward alias target should resolve");
+        let Declaration::Struct(later_declaration) = &program.declarations[3] else {
+            panic!("expected later struct");
+        };
+        let later = resolution
+            .symbol_for_declaration(later_declaration.id)
+            .expect("later struct should be declared");
+        assert_eq!(alias_target, later);
+
+        let Declaration::Function(function) = &program.declarations[2] else {
+            panic!("expected template function");
+        };
+        let type_parameter = resolution
+            .symbol_for_declaration(function.parameters[0].id)
+            .expect("type parameter should be declared");
+        let FunctionParameterKind::Named { type_annotation, .. } =
+            &function.parameters[1].kind
+        else {
+            panic!("expected runtime parameter");
+        };
+        assert_eq!(
+            resolution.symbol_for_reference(type_annotation.id),
+            Some(type_parameter)
+        );
+    }
+
+    #[test]
+    fn rejects_cross_kind_top_level_name_collisions() {
+        let source = "struct Item {} fn Item() {} fn main() {}";
+        let (module, program) = parse(source);
+        let errors = resolve_program(&module, &program).expect_err("names share one namespace");
+        assert!(errors.iter().any(|error| {
+            matches!(
+                &error.kind,
+                NameResolutionErrorKind::DuplicateDeclaration { name, .. } if name == "Item"
+            )
+        }));
+    }
+
+    #[test]
+    fn rejects_a_parameter_bound_both_inline_and_in_a_where_clause() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "fn invalid(comptime T: Reader) where T: interface { fn read(self) -> int; } {}\n",
+            "fn main() {}",
+        );
+        let (module, program) = parse(source);
+        let errors = resolve_program(&module, &program).expect_err("T has two constraints");
+        assert!(errors.iter().any(|error| {
+            matches!(
+                &error.kind,
+                NameResolutionErrorKind::DuplicateTemplateConstraint { name, .. }
+                    if name == "T"
+            ) && error.span == nth_span(&module, "T", 1)
+        }));
+    }
+
+    #[test]
+    fn rejects_a_concrete_type_as_a_template_constraint() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn invalid(comptime T: type) where T: Item {}\n",
+            "fn main() {}",
+        );
+        let (module, program) = parse(source);
+        let errors = resolve_program(&module, &program).expect_err("Item is not an interface");
+        assert!(errors.iter().any(|error| {
+            error
+                == &NameResolutionError {
+                    kind: NameResolutionErrorKind::InvalidTemplateConstraint {
+                        found: SymbolKind::Struct,
+                    },
+                    span: nth_span(&module, "Item", 1),
+                }
+        }));
+    }
+
+    #[test]
+    fn a_nearer_value_declaration_blocks_an_outer_type_name() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn main() {\n",
+            "    const Item = 1;\n",
+            "    const value: Item = 2;\n",
+            "}",
+        );
+        let (module, program) = parse(source);
+        let errors = resolve_program(&module, &program).expect_err("nearest declaration wins");
+        assert!(errors.iter().any(|error| {
+            error
+                == &NameResolutionError {
+                    kind: NameResolutionErrorKind::UnknownName {
+                        namespace: Namespace::Type,
+                        name: "Item".to_string(),
+                    },
+                    span: nth_span(&module, "Item", 2),
+                }
         }));
     }
 }

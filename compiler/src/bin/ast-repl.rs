@@ -216,6 +216,12 @@ fn syntax_error_message(error: ParseError) -> String {
             "formatted-string interpolations allow value expressions and value-only if/else"
                 .to_owned()
         }
+        ParseErrorKind::InvalidComptimeParameterOrder => {
+            "comptime parameters must precede runtime parameters".to_owned()
+        }
+        ParseErrorKind::ComptimeParameterNotAllowed => {
+            "comptime parameters are not permitted in this callable".to_owned()
+        }
         ParseErrorKind::ExpectedToken { expected, found } => {
             format!("expected {expected:?}, found {found:?}")
         }

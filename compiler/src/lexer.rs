@@ -130,6 +130,12 @@ define_token_kinds! {
     #[token("struct")] Struct,
     // Begins a named structural interface declaration.
     #[token("interface")] Interface,
+    // Declares a transparent alias or names the compile-time type-of-types.
+    #[token("type")] Type,
+    // Marks a function parameter which is supplied during specialization.
+    #[token("comptime")] Comptime,
+    // Introduces structural bounds on function type parameters.
+    #[token("where")] Where,
     // Declares a fixed binding with const value access by default.
     #[token("const")] Const,
     // Declares a reassignable binding with mutable value access by default.
@@ -1161,7 +1167,7 @@ mod tests {
     #[test]
     fn lexes_keywords_and_identifiers() {
         let source = concat!(
-            "fn lambda struct interface const mut vconst vmut self if else loop while for in break continue ",
+            "fn lambda struct interface type comptime where const mut vconst vmut self if else loop while for in break continue ",
             "return is co defer true false none int float bool char string bytes ",
             "Queue Vector Map Error ",
             "name _private fnord vconstant vmutable",
@@ -1174,6 +1180,9 @@ mod tests {
                 TokenKind::Lambda,
                 TokenKind::Struct,
                 TokenKind::Interface,
+                TokenKind::Type,
+                TokenKind::Comptime,
+                TokenKind::Where,
                 TokenKind::Const,
                 TokenKind::Mut,
                 TokenKind::VConst,
