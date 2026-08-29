@@ -264,7 +264,7 @@ reviewable phases:
        format option, malformed specifications, result semantics, and lowering
        metadata. The complex-program test exercises formatted strings.
    - Phase 7.4, compile-time type factories and bounded templates (in progress):
-     - Implement this phase as three independently reviewable changes. Stop
+     - Implement this phase as five independently reviewable changes. Stop
        after each change so it can be reviewed and committed before beginning
        the next one.
      - Change 1, syntax and a unified declaration namespace (complete):
@@ -321,11 +321,10 @@ reviewable phases:
        - Complete: keep built-in runtime representations compiler-known while routing
          their arity and type application through the shared factory machinery.
        - Stop for review and commit before implementing runtime templates.
-     - Change 3, bounded runtime templates and specialization (next):
-       - Support top-level templated runtime functions and templated struct
-         methods. Type arguments are explicit, appear in declared order, and
-         are never inferred; unspecialized templates are not first-class
-         callable values.
+     - Change 3, bounded template declarations (next):
+       - Support bounded compile-time type parameters on top-level runtime
+         functions and struct methods. Unspecialized templates are not
+         first-class callable values.
        - Support concise named constraints such as `comptime T: Reader` and
          private named, intersection, or anonymous interface constraints in a
          `where` clause.
@@ -337,21 +336,43 @@ reviewable phases:
          identities and existing receiver storage and capability rules.
        - Check template member use against declared constraints. Do not expose
          concrete-only fields, methods, constructors, `.copy()`, associated
-         functions, or primitive operators after specialization.
+         functions, or primitive operators, regardless of the concrete types
+         later used to specialize the template.
+       - Validate template signatures and bodies symbolically through their
+         declared constraints so an invalid template is diagnosed independently
+         of whether it is ever specialized.
+       - Stop for review and commit before implementing specialization.
+     - Change 4, top-level runtime specialization (pending):
+       - Support explicit specialization of top-level templated runtime
+         functions. Type arguments appear in declared order and are never
+         inferred.
+       - Verify every concrete type argument against its declared constraint
+         before analyzing the specialization, with deterministic diagnostics
+         and recovery for independently invalid arguments.
        - At each requested specialization, substitute concrete type identities
          and reuse ordinary expression analysis for exact capabilities, places,
          transfers, returns, layouts, and diagnostics. Cache callable
          specializations and record their identities for typed IR and lowering.
        - Permit exact recursive specialization and diagnose unbounded
-         type-expanding specialization deterministically. Defer local template
-         declarations and local type aliases.
+         type-expanding specialization deterministically.
+       - Stop for review and commit before implementing method specialization.
+     - Change 5, method specialization and completion (pending):
+       - Support explicit specialization of templated methods on named and
+         generated structs. Combine the concrete owner identity with the
+         method's declared type arguments when forming the canonical callable
+         specialization identity.
+       - Reuse bounded-template checking, constraint satisfaction, substitution,
+         recursion handling, ordinary expression analysis, and lowering
+         metadata from top-level specialization.
+       - Defer local template declarations and local type aliases.
        - Add focused coverage for namespace collisions, aliases, factory
          composition and identity, generated structs, recursion, constraints,
-         explicit specializations, specialization-dependent value semantics,
-         diagnostics, recovery, and the migrated built-in syntax. Update the
-         complex-program test to exercise the complete feature.
+         explicit top-level and method specializations,
+         specialization-dependent value semantics, diagnostics, recovery, and
+         the migrated built-in syntax. Update the complex-program test to
+         exercise the complete feature.
        - Update the language design and implementation-status documents and
-         mark Phase 7.4 complete only after this third change has been reviewed.
+         mark Phase 7.4 complete only after this fifth change has been reviewed.
        Stop for review and commit before beginning Phase 7.5.
      - Compile-time values other than types, arbitrary compile-time execution,
        generic inference, first-class template values, local templates, and
