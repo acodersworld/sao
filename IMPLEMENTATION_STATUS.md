@@ -36,8 +36,8 @@ The parser currently supports:
 - Semicolon-terminated interface method requirements with receiver, parameter,
   and return-type syntax.
 - Primitive, named, parameterized, mutable, grouped, callable, tuple, union,
-  and intersection type syntax, plus explicit `&T` and `&mut T` GC
-  qualification. Comma-bearing parentheses form tuples, singleton tuples
+  and intersection type syntax, plus explicit `&T`/`&mut T` GC qualification
+  and `*T`/`*mut T` tracked-reference qualification. Comma-bearing parentheses form tuples, singleton tuples
   require their comma, and `()` remains unit.
 - Literals, identifiers, `self`, grouping, tuple values, and expression-oriented
   blocks.
@@ -148,22 +148,25 @@ provide a program-local
 canonical type store for capability-qualified primitives, callables, ordered
 structural tuples, nominal
 named, anonymous, and factory-generated structs, interfaces, compiler-known parameterized types,
-unions, intersections, canonical explicit GC references, and internal recovery
+unions, intersections, canonical explicit GC references, canonical tracked
+non-GC references, and internal recovery
 and divergence types. Union and
 intersection construction is associative, commutative, and idempotent, with an
 outer capability distinct from member capabilities. The store exposes exact
 identity, equality that ignores only the outer capability, safe structural
-lookup, inline/borrowed/GC storage semantics, compiler-defined copy semantics,
+lookup, inline/borrowed/tracked/GC storage semantics, compiler-defined copy semantics,
 and typed-expression value categories. Source type resolution predeclares named
 structs and interfaces, resolves all explicit annotations including mutable and
-GC-qualified forms, records canonical types by syntax and declaration identity,
+GC- and tracked-qualified forms, records canonical types by syntax and declaration identity,
 supports forward and recursive references, transparent forward aliases,
 compile-time type factories, cached generated struct applications, symbolic
 bounded-template parameters, and owner-specialized generated syntax. It
 diagnoses invalid applications and constraints, alias cycles, expanding factory
 recursion, compiler-known arity, queue element types, and non-interface
 intersection members. Unknown type names are diagnosed earlier by name
-resolution.
+resolution. Tracked-reference borrow formation, automatic dereferencing, place
+provenance, lifetime links, and expression-level conversions are not yet
+implemented.
 
 Declaration and signature collection is implemented for source and generated
 struct fields and functions, callable headers, interface requirements,

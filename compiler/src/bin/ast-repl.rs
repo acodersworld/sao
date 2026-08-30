@@ -192,6 +192,12 @@ fn syntax_error_message(error: ParseError) -> String {
         ParseErrorKind::InvalidGcCapabilitySyntax => {
             "mutable GC access is written &mut T, not mut &T".to_owned()
         }
+        ParseErrorKind::InvalidTrackedCapabilitySyntax => {
+            "mutable tracked access is written *mut T, not mut *T".to_owned()
+        }
+        ParseErrorKind::RepeatedTrackedReferenceSyntax => {
+            "tracked references cannot be qualified with another *".to_owned()
+        }
         ParseErrorKind::BindingValueCapabilityMustPrecedeName => {
             "a binding's value capability must be written before its name".to_owned()
         }
@@ -397,6 +403,20 @@ mod tests {
                 span: Span::new(ModuleId::PRELUDE, 0, 3),
             }),
             "mutable GC access is written &mut T, not mut &T"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::InvalidTrackedCapabilitySyntax,
+                span: Span::new(ModuleId::PRELUDE, 0, 3),
+            }),
+            "mutable tracked access is written *mut T, not mut *T"
+        );
+        assert_eq!(
+            syntax_error_message(ParseError {
+                kind: ParseErrorKind::RepeatedTrackedReferenceSyntax,
+                span: Span::new(ModuleId::PRELUDE, 0, 2),
+            }),
+            "tracked references cannot be qualified with another *"
         );
         assert_eq!(
             syntax_error_message(ParseError {

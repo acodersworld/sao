@@ -923,6 +923,7 @@ impl LexicalIndex {
             }
             crate::ast::TypeKind::Mutable(inner)
             | crate::ast::TypeKind::Gc(inner)
+            | crate::ast::TypeKind::Tracked(inner)
             | crate::ast::TypeKind::Group(inner) => self.visit_type(inner, names),
             crate::ast::TypeKind::Tuple { elements } => {
                 for element in elements {
@@ -1664,6 +1665,7 @@ impl<'semantic> Analyzer<'semantic> {
                     Some(ValueTransfer::MoveTemporary)
                 }
                 Some(CopySemantics::NonEscapingErasedView) | None => None,
+                Some(CopySemantics::TrackedPayload) => None,
                 Some(CopySemantics::GcPayload) => {
                     unreachable!("GC return storage was handled above")
                 }
@@ -4395,7 +4397,11 @@ impl<'semantic> Analyzer<'semantic> {
         let member_semantic = self.types.types().get(member)?;
         if matches!(
             member_semantic.storage_semantics(),
-            Some(StorageSemantics::Gc | StorageSemantics::BorrowedView)
+            Some(
+                StorageSemantics::Gc
+                    | StorageSemantics::BorrowedView
+                    | StorageSemantics::TrackedReference
+            )
         ) {
             return None;
         }
@@ -6728,7 +6734,10 @@ impl<'semantic> Analyzer<'semantic> {
     fn type_contains_template_parameter(&self, type_id: TypeId) -> bool {
         match self.types.types().get(type_id) {
             Some(SemanticType::TemplateParameter { .. }) => true,
-            Some(SemanticType::Gc { target, .. }) => {
+            Some(
+                SemanticType::Gc { target, .. }
+                | SemanticType::Tracked { target, .. },
+            ) => {
                 self.type_contains_template_parameter(*target)
             }
             Some(SemanticType::Callable {
@@ -7962,6 +7971,7 @@ impl<'semantic> Analyzer<'semantic> {
             }
             Some(
                 SemanticType::Gc { .. }
+                | SemanticType::Tracked { .. }
                 | SemanticType::Primitive { .. }
                 | SemanticType::Callable { .. }
                 | SemanticType::Interface { .. }
@@ -8083,6 +8093,7 @@ impl<'semantic> Analyzer<'semantic> {
                 .iter()
                 .any(|element| self.contains_non_escaping_erased_view(*element)),
             Some(SemanticType::Gc { .. }
+            | SemanticType::Tracked { .. }
             | SemanticType::Primitive { .. }
             | SemanticType::NamedStruct { .. }
             | SemanticType::GeneratedStruct { .. }
@@ -8323,6 +8334,7 @@ fn index_runtime_templates_in_type(
         }
         crate::ast::TypeKind::Mutable(inner)
         | crate::ast::TypeKind::Gc(inner)
+        | crate::ast::TypeKind::Tracked(inner)
         | crate::ast::TypeKind::Group(inner) => {
             index_runtime_templates_in_type(inner, signatures, templates);
         }
@@ -8419,6 +8431,7 @@ fn find_nested_type(type_syntax: &TypeSyntax, target: NodeId) -> Option<&TypeSyn
         }),
         crate::ast::TypeKind::Mutable(inner)
         | crate::ast::TypeKind::Gc(inner)
+        | crate::ast::TypeKind::Tracked(inner)
         | crate::ast::TypeKind::Group(inner) => find_nested_type(inner, target),
         crate::ast::TypeKind::Tuple { elements } => elements
             .iter()

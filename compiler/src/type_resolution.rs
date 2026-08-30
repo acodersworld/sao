@@ -1049,7 +1049,10 @@ impl<'source, 'names> Resolver<'source, 'names> {
                     )
                 }),
             TypeKind::Associated { owner, .. } => self.was_resolved_as_type(owner),
-            TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+            TypeKind::Mutable(inner)
+            | TypeKind::Gc(inner)
+            | TypeKind::Tracked(inner)
+            | TypeKind::Group(inner) => {
                 self.was_resolved_as_type(inner)
             }
             TypeKind::Callable { .. }
@@ -1088,6 +1091,12 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 let inner = self.resolve_type(inner);
                 self.types
                     .gc(inner)
+                    .expect("resolved type belongs to this type store")
+            }
+            TypeKind::Tracked(inner) => {
+                let inner = self.resolve_type(inner);
+                self.types
+                    .tracked(inner)
                     .expect("resolved type belongs to this type store")
             }
             TypeKind::Group(inner) => self.resolve_type(inner),
@@ -1713,6 +1722,65 @@ mod tests {
                 arguments,
                 ..
             }) if arguments.len() == 2
+        ));
+    }
+
+    #[test]
+    fn resolves_tracked_reference_syntax_to_canonical_types() {
+        let (program, resolution) = resolve(concat!(
+            "struct User { name: string, }\n",
+            "fn project(user: *User, writable: *mut User) -> *string {}\n",
+            "fn main() {}\n",
+        ));
+        let project = top_level_function(&program, 1);
+        let user = resolution
+            .type_for_syntax(named_parameter_type(project, 0).id)
+            .expect("tracked user type should resolve");
+        let writable = resolution
+            .type_for_syntax(named_parameter_type(project, 1).id)
+            .expect("mutable tracked user type should resolve");
+
+        let Some(SemanticType::Tracked { target, capability }) =
+            resolution.types().get(user)
+        else {
+            panic!("expected a tracked-reference user type");
+        };
+        assert_eq!(*capability, AccessCapability::Const);
+        assert!(matches!(
+            resolution.types().get(*target),
+            Some(SemanticType::NamedStruct {
+                capability: AccessCapability::Const,
+                ..
+            })
+        ));
+
+        let Some(SemanticType::Tracked { target, capability }) =
+            resolution.types().get(writable)
+        else {
+            panic!("expected a mutable tracked-reference user type");
+        };
+        assert_eq!(*capability, AccessCapability::Mut);
+        assert!(matches!(
+            resolution.types().get(*target),
+            Some(SemanticType::NamedStruct {
+                capability: AccessCapability::Mut,
+                ..
+            })
+        ));
+
+        let return_type = project
+            .return_type
+            .as_ref()
+            .expect("project should have a return annotation");
+        let returned = resolution
+            .type_for_syntax(return_type.id)
+            .expect("tracked return type should resolve");
+        assert!(matches!(
+            resolution.types().get(returned),
+            Some(SemanticType::Tracked {
+                capability: AccessCapability::Const,
+                ..
+            })
         ));
     }
 

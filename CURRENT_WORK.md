@@ -455,18 +455,20 @@ reviewable phases:
          deferred.
        - Complete: reviewed Change 4; Phase 7.5 is complete. Stop before Phase
          7.6.
-   - Phase 7.6, tracked non-GC references and lifetime links (pending):
-     - Change 1, syntax and canonical types:
-       - Add `*T` as a first-class tracked borrowed-reference type. It describes
+   - Phase 7.6, tracked non-GC references and lifetime links (in progress):
+     - Change 1, syntax and canonical types (complete):
+       - Complete: add `*T` as a first-class tracked borrowed-reference type. It describes
          a lifetime relationship, not a raw pointer or a distinct argument-passing
          convention. Continue passing ordinary plain aggregate parameters by
          reference: `value: T` is a call-scoped borrow, while `value: *T` is a
          tracked borrow which may contribute to an escaping `*` result.
-       - Preserve the three distinct storage contracts: `T` is a plain value,
+       - Complete: preserve the three distinct storage contracts: `T` is a plain value,
          `&T` is a GC-owned reference, and `*T` is a non-owning reference to
          storage owned elsewhere.
-       - Stop for review and commit before implementing borrow formation and
-         place provenance.
+       - Complete: add focused syntax, formatting, canonicalization, capability,
+         storage-contract, and source-resolution tests for `*T` and `*mut T`.
+       - Complete: reviewed Change 1. Stop for commit before implementing borrow
+         formation and place provenance.
      - Change 2, borrow formation and place provenance:
        - Permit plain and GC-backed values to borrow as `*T`; never implicitly
          convert `*T` into `T` or `&T`, because those conversions would require

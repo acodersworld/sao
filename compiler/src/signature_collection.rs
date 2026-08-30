@@ -644,7 +644,10 @@ fn find_nested_type(type_syntax: &TypeSyntax, target: NodeId) -> Option<&TypeSyn
                 .iter()
                 .find_map(|argument| find_nested_type(argument, target))
         }),
-        TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+        TypeKind::Mutable(inner)
+        | TypeKind::Gc(inner)
+        | TypeKind::Tracked(inner)
+        | TypeKind::Group(inner) => {
             find_nested_type(inner, target)
         }
         TypeKind::Tuple { elements } => elements

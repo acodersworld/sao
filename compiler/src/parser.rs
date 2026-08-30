@@ -57,6 +57,8 @@ pub enum ParseErrorKind {
     },
     InvalidReceiverQualifiers,
     InvalidGcCapabilitySyntax,
+    InvalidTrackedCapabilitySyntax,
+    RepeatedTrackedReferenceSyntax,
     BindingValueCapabilityMustPrecedeName,
     AggregateMemberCapabilityNotSupported,
     ChainedTypeAscription,
@@ -935,12 +937,22 @@ where
         let token = self.current()?;
         if token.kind == TokenKind::Mut {
             self.advance()?;
-            if self.current()?.kind == TokenKind::Ampersand {
-                return Err(ParseError {
-                    kind: ParseErrorKind::InvalidGcCapabilitySyntax,
-                    span: token.span,
+            match self.current()?.kind {
+                TokenKind::Ampersand => {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::InvalidGcCapabilitySyntax,
+                        span: token.span,
+                    }
+                    .into());
                 }
-                .into());
+                TokenKind::Star => {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::InvalidTrackedCapabilitySyntax,
+                        span: token.span,
+                    }
+                    .into());
+                }
+                _ => {}
             }
             let inner = self.type_expression()?;
             let span = Span::new(self.module_id, token.span.start, inner.span.end);
@@ -1031,6 +1043,7 @@ where
         let token = self.current()?;
         let mut type_syntax = match token.kind {
             TokenKind::Ampersand => self.gc_type(),
+            TokenKind::Star => self.tracked_type(),
             TokenKind::Int => self.primitive_type(PrimitiveType::Int),
             TokenKind::Float => self.primitive_type(PrimitiveType::Float),
             TokenKind::Bool => self.primitive_type(PrimitiveType::Bool),
@@ -1097,6 +1110,36 @@ where
         Ok(TypeSyntax::new(
             TypeKind::Gc(Box::new(inner)),
             Span::new(self.module_id, ampersand.span.start, end),
+        ))
+    }
+
+    fn tracked_type(&mut self) -> ParseResult<TypeSyntax> {
+        let star = self.advance()?;
+        let mutable = if self.current()?.kind == TokenKind::Mut {
+            self.advance()?;
+            true
+        } else {
+            false
+        };
+        let inner = self.primary_type()?;
+        let end = inner.span.end;
+        if outer_tracked_type(&inner) {
+            return Err(ParseError {
+                kind: ParseErrorKind::RepeatedTrackedReferenceSyntax,
+                span: Span::new(self.module_id, star.span.start, end),
+            }
+            .into());
+        }
+        let mut inner = inner;
+
+        if mutable && !matches!(&inner.kind, TypeKind::Mutable(_)) {
+            let span = Span::new(self.module_id, star.span.start, inner.span.end);
+            inner = TypeSyntax::new(TypeKind::Mutable(Box::new(inner)), span);
+        }
+
+        Ok(TypeSyntax::new(
+            TypeKind::Tracked(Box::new(inner)),
+            Span::new(self.module_id, star.span.start, end),
         ))
     }
 
@@ -1574,6 +1617,11 @@ where
         let token = self.current()?;
 
         match token.kind {
+            TokenKind::Star => {
+                let type_syntax = self.tracked_type()?;
+                let span = type_syntax.span;
+                Ok(Expression::new(ExpressionKind::TypeValue(type_syntax), span))
+            }
             TokenKind::Ampersand => {
                 self.advance()?;
                 let operand =
@@ -2549,7 +2597,10 @@ fn assign_type_ids(type_syntax: &mut TypeSyntax, context: &mut ParseContext) {
                 assign_type_ids(argument, context);
             }
         }
-        TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+        TypeKind::Mutable(inner)
+        | TypeKind::Gc(inner)
+        | TypeKind::Tracked(inner)
+        | TypeKind::Group(inner) => {
             assign_type_ids(inner, context)
         }
         TypeKind::Tuple { elements } => {
@@ -2596,6 +2647,14 @@ fn outer_mutable_type(type_syntax: &TypeSyntax) -> bool {
     match &type_syntax.kind {
         TypeKind::Mutable(_) => true,
         TypeKind::Group(inner) => outer_mutable_type(inner),
+        _ => false,
+    }
+}
+
+fn outer_tracked_type(type_syntax: &TypeSyntax) -> bool {
+    match &type_syntax.kind {
+        TypeKind::Tracked(_) => true,
+        TypeKind::Group(inner) => outer_tracked_type(inner),
         _ => false,
     }
 }
@@ -7114,6 +7173,47 @@ mod tests {
                 kind: ParseErrorKind::InvalidGcCapabilitySyntax,
                 ..
             }))
+        ));
+    }
+
+    #[test]
+    fn parses_tracked_reference_types_and_their_target_capability() {
+        let type_syntax = parse_type_source("*mut (Reader & Writer)")
+            .expect("mutable tracked intersection should parse");
+        let TypeKind::Tracked(inner) = type_syntax.kind else {
+            panic!("expected a tracked-reference type");
+        };
+        let TypeKind::Mutable(inner) = inner.kind else {
+            panic!("expected mutable access inside tracked qualification");
+        };
+        assert!(matches!(inner.kind, TypeKind::Group(_)));
+        assert_eq!(type_syntax.span, span(0, 22));
+
+        for source in ["**User", "*(*User)"] {
+            assert!(matches!(
+                parse_type_source(source),
+                Err(FrontendError::Syntax(ParseError {
+                    kind: ParseErrorKind::RepeatedTrackedReferenceSyntax,
+                    ..
+                }))
+            ));
+        }
+
+        assert!(matches!(
+            parse_type_source("mut *User"),
+            Err(FrontendError::Syntax(ParseError {
+                kind: ParseErrorKind::InvalidTrackedCapabilitySyntax,
+                ..
+            }))
+        ));
+
+        let expression = parse("*User").expect("tracked type value should parse");
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::TypeValue(TypeSyntax {
+                kind: TypeKind::Tracked(_),
+                ..
+            })
         ));
     }
 

@@ -57,6 +57,12 @@ expressions, and prefix GC qualification in types. `&&` is exclusively the
 logical-and token and is never interpreted as repeated GC qualification.
 Mutable GC type access is written `&mut T`, not `mut &T`.
 
+`*` remains the multiplication token in infix expression position and begins a
+tracked non-GC reference type in type or compile-time type-value position.
+Mutable tracked target access is written `*mut T`, not `mut *T`. Consecutive
+stars are separate tokens, but the type grammar rejects repeated tracked
+qualification such as `**T`.
+
 Digit separators and binary, octal, or hexadecimal integer literals are not
 initially supported. Range checking and numeric conversion belong to semantic
 analysis rather than lexing.

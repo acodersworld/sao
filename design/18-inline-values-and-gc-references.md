@@ -94,7 +94,8 @@ compiler never implicitly promotes the original storage. Where appropriate,
 the diagnostic suggests copying and then allocating with `&`.
 
 All source locals remain alive for the complete function invocation, including
-across coroutine suspension, so lexical lifetime syntax is unnecessary. Frame
+across coroutine suspension. Tracked references use the `*T` type relationship
+described in Chapter 21 without introducing named lifetime parameters. Frame
 and object tracing metadata recursively visits inline fields containing GC
 references and follows live borrowed object views. The viewed object's universal
 attributes include a traversal epoch and storage kind. Every reached object is

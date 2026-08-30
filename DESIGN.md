@@ -30,3 +30,4 @@ provisional syntax and ideas intentionally deferred until later.
 18. [18. Inline values and explicit GC references](design/18-inline-values-and-gc-references.md)
 19. [19. Compile-time types and bounded templates](design/19-compile-time-types-and-bounded-templates.md)
 20. [20. Tuple types and values](design/20-tuple-types-and-values.md)
+21. [21. Tracked non-GC references](design/21-tracked-non-gc-references.md)

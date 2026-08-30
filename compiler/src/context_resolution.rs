@@ -629,7 +629,10 @@ impl ContextResolver {
                     self.visit_type(argument);
                 }
             }
-            TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+            TypeKind::Mutable(inner)
+            | TypeKind::Gc(inner)
+            | TypeKind::Tracked(inner)
+            | TypeKind::Group(inner) => {
                 self.visit_type(inner);
             }
             TypeKind::Tuple { elements } => {

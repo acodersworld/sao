@@ -700,6 +700,7 @@ impl<'source> Resolver<'source> {
             }
             TypeKind::Mutable(inner)
             | TypeKind::Gc(inner)
+            | TypeKind::Tracked(inner)
             | TypeKind::Group(inner) => self.resolve_type(scope, inner),
             TypeKind::Tuple { elements } => {
                 for element in elements {
@@ -744,7 +745,10 @@ impl<'source> Resolver<'source> {
                         .iter()
                         .all(|argument| self.type_syntax_is_in_scope(scope, argument))
             }
-            TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
+            TypeKind::Mutable(inner)
+            | TypeKind::Gc(inner)
+            | TypeKind::Tracked(inner)
+            | TypeKind::Group(inner) => {
                 self.type_syntax_is_in_scope(scope, inner)
             }
             TypeKind::Tuple { elements } => elements

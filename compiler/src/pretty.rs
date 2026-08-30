@@ -934,6 +934,14 @@ fn format_type_into(
             );
             child_type(output, source, "type", inner, depth);
         }
+        TypeKind::Tracked(inner) => {
+            line(
+                output,
+                depth,
+                format_args!("Tracked {}", location(span)),
+            );
+            child_type(output, source, "type", inner, depth);
+        }
         TypeKind::Group(inner) => {
             line(output, depth, format_args!("Group {}", location(span)));
             child_type(output, source, "type", inner, depth);
@@ -1254,6 +1262,17 @@ mod tests {
         assert!(output.contains("Intersection @ 0..15"));
         assert!(output.contains("Named \"Reader\" @ 0..6"));
         assert!(output.contains("Primitive None @ 18..22"));
+    }
+
+    #[test]
+    fn formats_tracked_reference_types() {
+        let source = "*mut User";
+        let type_syntax = parse_type_source(source);
+
+        assert_eq!(
+            format_type(&module(source), &type_syntax),
+            "Tracked @ 0..9\n  type:\n    Mutable @ 0..9\n      type:\n        Named \"User\" @ 5..9"
+        );
     }
 
     #[test]

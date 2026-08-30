@@ -529,6 +529,10 @@ pub enum TypeKind {
     /// An explicitly garbage-collected, escapable value. The contained type
     /// carries the access capability selected by `&T` or `&mut T`.
     Gc(Box<TypeSyntax>),
+    /// A tracked, non-owning reference to storage owned elsewhere. The
+    /// contained type carries the access capability selected by `*T` or
+    /// `*mut T`.
+    Tracked(Box<TypeSyntax>),
     Group(Box<TypeSyntax>),
     /// A fixed-length ordered structural product. The parser only forms this
     /// node when the parentheses contain a top-level comma.

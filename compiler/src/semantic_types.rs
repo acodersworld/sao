@@ -47,6 +47,8 @@ pub enum StorageSemantics {
     Inline,
     /// An erased, non-escaping view whose concrete storage is owned elsewhere.
     BorrowedView,
+    /// A tracked, non-owning reference to storage owned elsewhere.
+    TrackedReference,
     /// A stable reference to an independently traced GC allocation.
     Gc,
 }
@@ -63,6 +65,10 @@ pub enum CopySemantics {
     /// reference encountered as a nested field of another recursive copy is
     /// still copied trivially and remains shared.
     GcPayload,
+    /// Explicit `.copy()` materializes a plain copy of a tracked target. A
+    /// tracked reference nested in another recursive copy remains a reference
+    /// and retains its storage relationship.
+    TrackedPayload,
     /// The erased value cannot cross an owning boundary without GC storage.
     NonEscapingErasedView,
 }
@@ -104,6 +110,11 @@ pub enum EscapeDestination {
 /// A canonical semantic type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SemanticType {
+    /// A tracked, non-owning reference.
+    Tracked {
+        target: TypeId,
+        capability: AccessCapability,
+    },
     /// An escapable GC reference. Repeated qualification is normalized by
     /// [`TypeStore::gc`].
     Gc {
@@ -179,7 +190,8 @@ impl SemanticType {
     #[must_use]
     pub const fn capability(&self) -> Option<AccessCapability> {
         match self {
-            Self::Gc { capability, .. }
+            Self::Tracked { capability, .. }
+            | Self::Gc { capability, .. }
             | Self::Primitive { capability, .. }
             | Self::Callable { capability, .. }
             | Self::Tuple { capability, .. }
@@ -201,6 +213,7 @@ impl SemanticType {
     #[must_use]
     pub const fn storage_semantics(&self) -> Option<StorageSemantics> {
         match self {
+            Self::Tracked { .. } => Some(StorageSemantics::TrackedReference),
             Self::Gc { .. } => Some(StorageSemantics::Gc),
             Self::Callable { .. } | Self::Interface { .. } | Self::Intersection { .. } => {
                 Some(StorageSemantics::BorrowedView)
@@ -220,6 +233,7 @@ impl SemanticType {
     #[must_use]
     pub const fn copy_semantics(&self) -> Option<CopySemantics> {
         match self {
+            Self::Tracked { .. } => Some(CopySemantics::TrackedPayload),
             Self::Gc { .. } => Some(CopySemantics::GcPayload),
             Self::Primitive {
                 primitive:
@@ -248,6 +262,10 @@ impl SemanticType {
 
     fn has_same_shape(&self, other: &Self) -> bool {
         match (self, other) {
+            (
+                Self::Tracked { target: left, .. },
+                Self::Tracked { target: right, .. },
+            ) => left == right,
             (
                 Self::Gc { target: left, .. },
                 Self::Gc { target: right, .. },
@@ -409,6 +427,36 @@ impl TypeStore {
     pub fn gc_target(&self, id: TypeId) -> Option<TypeId> {
         match self.get(id)? {
             SemanticType::Gc { target, .. } => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// Returns the canonical tracked reference for `target`.
+    ///
+    /// Its access capability mirrors the target capability so `*T` and
+    /// `*mut T` remain distinct without making the reference binding itself
+    /// mutable. A tracked reference cannot itself be tracked.
+    pub fn tracked(&mut self, target: TypeId) -> Option<TypeId> {
+        let semantic_type = self.get(target)?.clone();
+        if matches!(
+            semantic_type,
+            SemanticType::Recovery | SemanticType::Divergence
+        ) {
+            return Some(target);
+        }
+        if matches!(semantic_type, SemanticType::Tracked { .. }) {
+            return None;
+        }
+        let capability = semantic_type.capability()?;
+        Some(self.intern(SemanticType::Tracked { target, capability }))
+    }
+
+    /// Returns the plain target of a tracked-reference type, or `None` when
+    /// `id` is valid but not tracked.
+    #[must_use]
+    pub fn tracked_target(&self, id: TypeId) -> Option<TypeId> {
+        match self.get(id)? {
+            SemanticType::Tracked { target, .. } => Some(*target),
             _ => None,
         }
     }
@@ -597,6 +645,16 @@ impl TypeStore {
     pub fn has_same_shape(&self, left: TypeId, right: TypeId) -> Option<bool> {
         match (self.get(left)?, self.get(right)?) {
             (
+                SemanticType::Tracked {
+                    target: left_target,
+                    ..
+                },
+                SemanticType::Tracked {
+                    target: right_target,
+                    ..
+                },
+            ) => self.has_same_shape(*left_target, *right_target),
+            (
                 SemanticType::Gc {
                     target: left_target,
                     ..
@@ -619,6 +677,10 @@ impl TypeStore {
     /// returned unchanged.
     pub fn with_capability(&mut self, id: TypeId, capability: AccessCapability) -> Option<TypeId> {
         match self.get(id)?.clone() {
+            SemanticType::Tracked { target, .. } => {
+                let target = self.with_capability(target, capability)?;
+                self.tracked(target)
+            }
             SemanticType::Gc { target, .. } => {
                 let target = self.with_capability(target, capability)?;
                 self.gc(target)
@@ -681,6 +743,10 @@ impl TypeStore {
             SemanticType::Gc { target, .. } => {
                 let target = self.substitute_template_parameters(target, substitutions)?;
                 self.gc(target)?
+            }
+            SemanticType::Tracked { target, .. } => {
+                let target = self.substitute_template_parameters(target, substitutions)?;
+                self.tracked(target)?
             }
             SemanticType::Callable {
                 parameters,
@@ -831,7 +897,7 @@ enum TypeSetKind {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
     use crate::source::ModuleId;
@@ -998,6 +1064,52 @@ mod tests {
             types.get(gc).and_then(SemanticType::copy_semantics),
             Some(CopySemantics::GcPayload)
         );
+    }
+
+    #[test]
+    fn tracked_references_are_distinct_non_nested_and_capability_qualified() {
+        let mut types = TypeStore::new();
+        let plain = types.named_struct(node(1), AccessCapability::Const);
+        let mutable_plain = types.named_struct(node(1), AccessCapability::Mut);
+        let tracked = types
+            .tracked(plain)
+            .expect("plain values can be tracked-reference targets");
+        let mutable_tracked = types
+            .tracked(mutable_plain)
+            .expect("mutable plain values can be tracked-reference targets");
+        let gc = types.gc(plain).expect("plain values can be GC qualified");
+
+        assert_eq!(types.tracked(tracked), None);
+        assert_eq!(types.tracked_target(tracked), Some(plain));
+        assert_eq!(types.tracked_target(plain), None);
+        assert_ne!(tracked, plain);
+        assert_ne!(tracked, gc);
+        assert_ne!(tracked, mutable_tracked);
+        assert_eq!(types.has_same_shape(tracked, mutable_tracked), Some(true));
+        assert_eq!(
+            types.with_capability(tracked, AccessCapability::Mut),
+            Some(mutable_tracked)
+        );
+        assert_eq!(
+            types.get(tracked).and_then(SemanticType::storage_semantics),
+            Some(StorageSemantics::TrackedReference)
+        );
+        assert_eq!(
+            types.get(tracked).and_then(SemanticType::copy_semantics),
+            Some(CopySemantics::TrackedPayload)
+        );
+
+        let parameter = types.template_parameter(node(2), AccessCapability::Const);
+        let tracked_parameter = types
+            .tracked(parameter)
+            .expect("template parameters can be tracked-reference targets");
+        let substituted = types
+            .substitute_template_parameters(
+                tracked_parameter,
+                &HashMap::from([(node(2), mutable_plain)]),
+            )
+            .expect("tracked template references should substitute");
+        assert_eq!(substituted, tracked);
     }
 
     #[test]
