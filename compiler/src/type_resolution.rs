@@ -1748,6 +1748,70 @@ mod tests {
     }
 
     #[test]
+    fn integrates_tuples_with_aliases_factories_signatures_and_builtins() {
+        let (program, resolution) = resolve(concat!(
+            "fn Pair(comptime T: type) -> type { (T, T) }\n",
+            "type Entry = (int, string);\n",
+            "type IntPair = Pair(int);\n",
+            "fn inspect(\n",
+            "    entry: Entry,\n",
+            "    pair: IntPair,\n",
+            "    callback: fn(Entry) -> IntPair,\n",
+            "    queue: Queue(Entry),\n",
+            "    vector: Vector((int,)),\n",
+            "    table: Map(Entry, (bool,)),\n",
+            "    failure: Error((Entry, IntPair)),\n",
+            ") {}\n",
+            "fn main() {}\n",
+        ));
+        let inspect = top_level_function(&program, 3);
+        let resolved = |index| {
+            resolution
+                .type_for_syntax(named_parameter_type(inspect, index).id)
+                .expect("integrated tuple type should resolve")
+        };
+
+        assert!(matches!(
+            resolution.types().get(resolved(0)),
+            Some(SemanticType::Tuple { elements, .. }) if elements.len() == 2
+        ));
+        assert!(matches!(
+            resolution.types().get(resolved(1)),
+            Some(SemanticType::Tuple { elements, .. })
+                if elements.len() == 2 && elements[0] == elements[1]
+        ));
+        assert!(matches!(
+            resolution.types().get(resolved(2)),
+            Some(SemanticType::Callable {
+                parameters,
+                return_type,
+                ..
+            }) if parameters.as_slice() == [resolved(0)] && *return_type == resolved(1)
+        ));
+        for (index, builtin, arity) in [
+            (3, BuiltinType::Queue, 1),
+            (4, BuiltinType::Vector, 1),
+            (5, BuiltinType::Map, 2),
+            (6, BuiltinType::Error, 1),
+        ] {
+            let Some(SemanticType::Builtin {
+                builtin: found,
+                arguments,
+                ..
+            }) = resolution.types().get(resolved(index))
+            else {
+                panic!("expected compiler-known type with tuple arguments")
+            };
+            assert_eq!(*found, builtin);
+            assert_eq!(arguments.len(), arity);
+            assert!(arguments.iter().all(|argument| matches!(
+                resolution.types().get(*argument),
+                Some(SemanticType::Tuple { .. })
+            )));
+        }
+    }
+
+    #[test]
     fn predeclares_forward_and_recursive_nominal_references() {
         let (program, resolution) = resolve(concat!(
             "struct First { second: Second, }\n",

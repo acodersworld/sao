@@ -3627,17 +3627,28 @@ impl<'semantic> Analyzer<'semantic> {
         }
         if let ExpressionKind::Tuple { elements } = &expression.kind
             && !self.checking.expressions.contains_key(&expression.id)
-            && let Some(SemanticType::Tuple {
-                elements: expected_elements,
-                ..
-            }) = self.types.types().get(expected).cloned()
-            && elements.len() == expected_elements.len()
         {
-            let found = self.synthesize_tuple_literal(elements, Some(&expected_elements))?;
-            let typed = self.check_typed(expression, expected, found, allow_recursive_copy)?;
-            self.checking.expressions.insert(expression.id, typed);
-            self.checking.explicit_values.insert(expression.id, true);
-            return Some(typed);
+            let expected_elements = match self.types.types().get(expected).cloned() {
+                Some(SemanticType::Tuple {
+                    elements: expected_elements,
+                    ..
+                }) if elements.len() == expected_elements.len() =>
+                {
+                    Some(expected_elements)
+                }
+                _ => self.contextual_tuple_union_member(elements, expected)?,
+            };
+            if let Some(expected_elements) = expected_elements
+                && elements.len() == expected_elements.len()
+            {
+                let found =
+                    self.synthesize_tuple_literal(elements, Some(&expected_elements))?;
+                let typed =
+                    self.check_typed(expression, expected, found, allow_recursive_copy)?;
+                self.checking.expressions.insert(expression.id, typed);
+                self.checking.explicit_values.insert(expression.id, true);
+                return Some(typed);
+            }
         }
         if let ExpressionKind::Group(inner) = &expression.kind
             && !self.checking.expressions.contains_key(&expression.id)
@@ -3653,6 +3664,60 @@ impl<'semantic> Analyzer<'semantic> {
 
         let found = self.synthesize(expression)?;
         self.check_typed(expression, expected, found, allow_recursive_copy)
+    }
+
+    /// Selects one tuple member of an expected union before constructing a
+    /// tuple literal. Elements are synthesized once, then compatibility is
+    /// probed without diagnostics or metadata changes. A unique candidate is
+    /// checked contextually by `synthesize_tuple_literal`; zero or multiple
+    /// candidates fall back to ordinary inferred-tuple union classification.
+    fn contextual_tuple_union_member(
+        &mut self,
+        elements: &[Expression],
+        expected: TypeId,
+    ) -> Option<Option<Vec<TypeId>>> {
+        let members = match self.types.types().get(expected) {
+            Some(SemanticType::Union { members, .. }) => members.clone(),
+            _ => return Some(None),
+        };
+        let mut found_elements = Vec::with_capacity(elements.len());
+        for element in elements {
+            found_elements.push(self.synthesize(element)?);
+        }
+        if found_elements
+            .iter()
+            .any(|found| self.is_recovery(found.type_id))
+        {
+            return Some(None);
+        }
+
+        let mut candidates = members.into_iter().filter_map(|member| {
+            let Some(SemanticType::Tuple {
+                elements: expected_elements,
+                ..
+            }) = self.types.types().get(member)
+            else {
+                return None;
+            };
+            if expected_elements.len() != found_elements.len()
+                || !found_elements
+                    .iter()
+                    .zip(expected_elements)
+                    .all(|(found, expected)| {
+                        self.classify_contextual_assignment(*found, *expected, false)
+                            .is_ok()
+                    })
+            {
+                return None;
+            }
+            Some(expected_elements.clone())
+        });
+        let candidate = candidates.next();
+        if candidates.next().is_some() {
+            Some(None)
+        } else {
+            Some(candidate)
+        }
     }
 
     /// Constructs one tuple while evaluating and storing its elements in
@@ -12972,6 +13037,58 @@ fn main() {
             })
         );
         assert_eq!(specialization.signature.parameters, specialization.type_arguments);
+    }
+
+    #[test]
+    fn integrates_tuples_with_templates_unions_and_narrowing() {
+        let source = concat!(
+            "type Entry = (int, string);\n",
+            "fn identity(comptime T: type, value: T) -> T { value }\n",
+            "fn take_entry(value: Entry) -> int { value.0 }\n",
+            "fn inspect(value: Entry | (string, int)) {\n",
+            "    if value is Entry { take_entry(value); }\n",
+            "}\n",
+            "fn main() {\n",
+            "    const injected: Entry | bool = (1, \"one\");\n",
+            "    const specialized = identity((int, string), (2, \"two\"));\n",
+            "    inspect(specialized);\n",
+            "    injected;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        assert_eq!(checking.runtime_specializations.len(), 1);
+
+        let specialization = &checking.runtime_specializations[0];
+        assert!(matches!(
+            types.types().get(specialization.type_arguments[0]),
+            Some(SemanticType::Tuple { elements, .. }) if elements.len() == 2
+        ));
+        assert_eq!(
+            specialization.signature.parameters,
+            specialization.type_arguments
+        );
+        assert_eq!(
+            specialization.signature.return_type,
+            specialization.type_arguments[0]
+        );
+
+        let inspect = function(&program.declarations[3]);
+        let conditional = body_value(inspect);
+        let ExpressionKind::If { then_branch, .. } = &conditional.kind else {
+            panic!("expected tuple-narrowing conditional")
+        };
+        let (_, arguments) = call(expression(&then_branch.statements[0]));
+        assert!(matches!(
+            types.types().get(checking.expressions[&arguments[0].id].type_id),
+            Some(SemanticType::Tuple { elements, .. }) if elements.len() == 2
+        ));
+
+        let main = function(&program.declarations[4]);
+        let injected = binding_initializer(&main.body.statements[0]);
+        assert!(checking.union_injections.contains_key(&injected.id));
+        assert_narrowing_locks_balance(&checking);
     }
 
     #[test]

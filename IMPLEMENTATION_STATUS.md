@@ -22,6 +22,8 @@ statement forms. The compiler-known names `Queue`, `Vector`, `Map`, and `Error`
 are also reserved and tokenized distinctly from identifiers. `..` and `..=` are
 tokenized for the implemented range-`for` grammar, and `..` also delimits
 exclusive `string` and `bytes` slices. Inclusive `..=` slices are rejected.
+After member-access `.`, consecutive non-negative integer tuple fields are
+tokenized separately without changing ordinary decimal float literals.
 
 ## Parser status
 
@@ -33,17 +35,20 @@ The parser currently supports:
   structural interface, and transparent type-alias declarations.
 - Semicolon-terminated interface method requirements with receiver, parameter,
   and return-type syntax.
-- Primitive, named, parameterized, mutable, grouped, callable, union, and
-  intersection type syntax, plus explicit `&T` and `&mut T` GC qualification.
-- Literals, identifiers, `self`, grouping, and expression-oriented blocks.
+- Primitive, named, parameterized, mutable, grouped, callable, tuple, union,
+  and intersection type syntax, plus explicit `&T` and `&mut T` GC
+  qualification. Comma-bearing parentheses form tuples, singleton tuples
+  require their comma, and `()` remains unit.
+- Literals, identifiers, `self`, grouping, tuple values, and expression-oriented
+  blocks.
 - Prefix, binary, assignment, type-test, and postfix operators.
 - Prefix GC allocation with `&expression`, while retaining infix bitwise-and
   and reserving `&&` exclusively for logical-and.
 - Calls, value-member access with `.`, type-associated access with `::`,
   indexing, exclusive open or bounded slicing, and postfix error propagation
   with `?`.
-- Dedicated `int`, `float`, `bool`, `char`, and `string` conversion expressions
-  with exactly one argument.
+- Explicit primitive conversion ascriptions for the supported numeric and
+  character conversions; primitive call syntax is not a conversion form.
 - Fixed-arity `Queue(T)`, `Vector(T)`, `Map(K, V)`, and `Error(T)` types, plus
   associated access on those types. Their constructors use ordinary associated
   calls such as `Queue(T)::new()`; both inferred `Error::new(value)` and explicit
@@ -140,7 +145,8 @@ Context resolution is implemented as an AST-only pass. It:
 
 The semantic type foundation and source type resolution are implemented. They
 provide a program-local
-canonical type store for capability-qualified primitives, callables, nominal
+canonical type store for capability-qualified primitives, callables, ordered
+structural tuples, nominal
 named, anonymous, and factory-generated structs, interfaces, compiler-known parameterized types,
 unions, intersections, canonical explicit GC references, and internal recovery
 and divergence types. Union and
@@ -175,6 +181,16 @@ method specialization identity includes the concrete named or generated owner.
 Specializations reuse exact recursion, reject expanding recursion, validate
 constraints before checking ordinary arguments, and retain per-specialization
 analysis metadata for later typed IR and lowering.
+
+Tuple checking includes contextual and inferred construction, ordered
+structural identity, numeric element places, transitive capability, owning
+transfers, recursive copying, explicit GC storage, non-escaping element
+propagation, and finite inline-layout traversal. Tuple types compose with
+aliases, type-factory results, explicit runtime-template specialization,
+callable signatures, exact union injection and narrowing, and legal
+compiler-known parameterized type arguments. Destructuring, iteration, spreads,
+variadics, named elements, tuple operators, and tuple-specific library
+operations remain deferred.
 
 Typed IR production, backend lowering, object emission, and runtime integration
 are not yet implemented.

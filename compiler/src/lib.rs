@@ -51,6 +51,22 @@ fn Box(comptime T: type) -> type {
 
 type IntBox = Box(int);
 
+type Metric = (int, string);
+
+fn Pair(comptime T: type) -> type {
+    (T, T)
+}
+
+type IntPair = Pair(int);
+
+fn tuple_identity(comptime T: type, value: T) -> T {
+    value
+}
+
+fn tuple_total(value: Metric) -> int {
+    value.0
+}
+
 fn inspect_inline(comptime T: Formatter, value: T) -> string {
     value.format("inline: ")
 }
@@ -224,6 +240,15 @@ fn main() {
     const private_inspection = inspect_private(BriefFormatter, BriefFormatter {});
     const method_inspection = summary.format_with(BriefFormatter, BriefFormatter {});
     const boxed_echo = boxed.echo(string, "boxed");
+    const boxed_tuple = boxed.echo((int, string), (calculated, "method"));
+    mut metric: Metric = (initial, "tuple");
+    metric.0 += 1;
+    const metric_copy = metric.copy();
+    const tuple_specialization = tuple_identity((int, string), (calculated, "specialized"));
+    const tuple_factory: IntPair = (initial, calculated);
+    const tuple_choice: Metric | (string, int) = (calculated, "choice");
+    const tuple_vector: Vector(Metric) = Vector(Metric)::new();
+    const heap_tuple = &(calculated, Summary::new("tuple heap"));
 
     summary.total = calculated;
     summary.total += recovered;
@@ -248,7 +273,16 @@ fn main() {
     println(private_inspection);
     println(method_inspection);
     println(boxed_echo);
+    announce(boxed_tuple.0);
     announce(boxed.get());
+    announce(tuple_total(metric_copy));
+    announce(tuple_specialization.0);
+    announce(tuple_factory.1);
+    if tuple_choice is Metric {
+        announce(tuple_choice.0);
+    };
+    tuple_vector.length();
+    announce(heap_tuple.0);
     heap_formatter.format(text);
     heap_scale(initial);
     notify();

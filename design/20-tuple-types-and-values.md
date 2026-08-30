@@ -158,6 +158,15 @@ compiler-known built-in type arguments. Template substitution recursively
 replaces element types. Tuples expose no method set for a bounded interface
 parameter. Union `is` tests and narrowing use the tuple's exact canonical type.
 
+```text
+type Entry = (int, string);
+fn Pair(comptime T: type) -> type { (T, T) }
+fn identity(comptime T: type, value: T) -> T { value }
+
+const pair = identity(Pair(int), (1, 2));
+const entries: Vector(Entry) = Vector(Entry)::new();
+```
+
 Tracked references introduced by Phase 7.6 may appear in tuple elements under
 the same rules as tracked-reference fields in other plain aggregates. The tuple
 transitively carries the intersection of their source lifetimes and is rejected

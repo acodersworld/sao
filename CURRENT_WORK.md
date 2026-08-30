@@ -396,7 +396,7 @@ reviewable phases:
      - Compile-time values other than types, arbitrary compile-time execution,
        generic inference, first-class template values, local templates, and
        compile-time duck typing remain deferred.
-   - Phase 7.5, tuple types and values (in progress):
+   - Phase 7.5, tuple types and values (complete):
      - Change 1, grammar, AST, and canonical structural types (complete):
        - Complete: parse comma-bearing parenthesized type and value forms as ordered tuples,
          while preserving `()` as unit and single non-comma expressions and types
@@ -439,20 +439,22 @@ reviewable phases:
          allocation, invalid members and arity, tuple operators, non-escaping
          elements, and recursive inline layouts.
        - Complete: reviewed Change 3. Stop before full type-system integration.
-     - Change 4, integration and completion:
-       - Integrate tuple types with aliases, type factories, explicit template
-         specialization, callable signatures, union injection and narrowing, and
-         legal compiler-known built-in arguments.
-       - Add deterministic diagnostics and focused tests for unit and grouping
-         distinctions, singleton and nested tuples, trailing commas, inference,
+     - Change 4, integration and completion (complete):
+       - Complete: integrate tuple types with aliases, type factories, explicit
+         template specialization, callable signatures, union injection and
+         narrowing, and legal compiler-known built-in arguments.
+       - Complete: add deterministic diagnostics and focused tests for unit and
+         grouping distinctions, singleton and nested tuples, trailing commas, inference,
          contextual elements, explicit reconstruction, evaluation order, numeric
          places, mutation, owning transfers, `.copy()`, GC storage, non-escaping
          elements, recursive layouts, unions, templates, and recovery. Update the
          complex-program test to exercise the complete feature.
-       - Update language design and implementation-status documentation, then mark
-         Phase 7.5 complete. Keep destructuring, iteration, spreads, variadics,
+       - Complete: update language design and implementation-status documentation. Keep
+         destructuring, iteration, spreads, variadics,
          named elements, tuple operators, and tuple-specific library operations
          deferred.
+       - Complete: reviewed Change 4; Phase 7.5 is complete. Stop before Phase
+         7.6.
    - Phase 7.6, tracked non-GC references and lifetime links (pending):
      - Change 1, syntax and canonical types:
        - Add `*T` as a first-class tracked borrowed-reference type. It describes
