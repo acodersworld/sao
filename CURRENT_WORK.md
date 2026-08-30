@@ -269,7 +269,7 @@ reviewable phases:
        value types, escapes and braces, evaluation order, every supported
        format option, malformed specifications, result semantics, and lowering
        metadata. The complex-program test exercises formatted strings.
-   - Phase 7.4, compile-time type factories and bounded templates (in progress):
+   - Phase 7.4, compile-time type factories and bounded templates (complete):
      - Implement this phase as five independently reviewable changes. Stop
        after each change so it can be reviewed and committed before beginning
        the next one.
@@ -366,8 +366,7 @@ reviewable phases:
         - Complete: permit exact recursive specialization and diagnose unbounded
           type-expanding specialization deterministically.
         - Stop for review and commit before implementing method specialization.
-      - Change 5, method specialization and completion (implementation complete;
-        review pending):
+      - Change 5, method specialization and completion (complete):
         - Complete: recognize leading type arguments on member calls without
           treating ordinary value arguments as type syntax. Defer declaration
           selection until expression analysis has resolved the receiver and
@@ -393,22 +392,21 @@ reviewable phases:
           documents for compile-time types, generated structs, bounded runtime
           templates, explicit top-level and method specialization, and the
           migrated built-in syntax.
-        - Pending: review and commit Change 5, then mark Phase 7.4 complete.
-          Stop before beginning Phase 7.5.
+        - Complete: reviewed Change 5; Phase 7.4 is complete.
      - Compile-time values other than types, arbitrary compile-time execution,
        generic inference, first-class template values, local templates, and
        compile-time duck typing remain deferred.
-   - Phase 7.5, tuple types and values (pending):
-     - Change 1, grammar, AST, and canonical structural types:
-       - Parse comma-bearing parenthesized type and value forms as ordered tuples,
+   - Phase 7.5, tuple types and values (in progress):
+     - Change 1, grammar, AST, and canonical structural types (complete):
+       - Complete: parse comma-bearing parenthesized type and value forms as ordered tuples,
          while preserving `()` as unit and single non-comma expressions and types
          as grouping. Require the comma in singleton tuples and permit a trailing
          comma at larger arities.
-       - Add tuple syntax and expression nodes plus canonical semantic tuple
+       - Complete: add tuple syntax and expression nodes plus canonical semantic tuple
          identities defined by ordered element types. Treat tuples as compiler-
          native structural aggregates rather than reserved parameterized
          built-ins.
-       - Stop for review and commit before implementing tuple construction.
+       - Complete: reviewed Change 1. Stop before implementing tuple construction.
      - Change 2, literal checking and owning transfers:
        - Infer tuple literal elements independently when no tuple type is expected.
          Under an expected tuple type, require matching arity and check each

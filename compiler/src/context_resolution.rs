@@ -467,6 +467,11 @@ impl ContextResolver {
                 }
             }
             ExpressionKind::Group(inner) => self.visit_expression(inner),
+            ExpressionKind::Tuple { elements } => {
+                for element in elements {
+                    self.visit_expression(element);
+                }
+            }
             ExpressionKind::Block(block) => self.visit_block(block),
             ExpressionKind::If {
                 condition,
@@ -626,6 +631,11 @@ impl ContextResolver {
             }
             TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
                 self.visit_type(inner);
+            }
+            TypeKind::Tuple { elements } => {
+                for element in elements {
+                    self.visit_type(element);
+                }
             }
             TypeKind::Callable {
                 parameters,

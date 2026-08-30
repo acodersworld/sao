@@ -508,6 +508,11 @@ impl<'source> Resolver<'source> {
                 }
             }
             ExpressionKind::Group(inner) => self.resolve_expression(scope, inner),
+            ExpressionKind::Tuple { elements } => {
+                for element in elements {
+                    self.resolve_expression(scope, element);
+                }
+            }
             ExpressionKind::Block(block) => self.resolve_block(scope, block),
             ExpressionKind::If {
                 condition,
@@ -696,6 +701,11 @@ impl<'source> Resolver<'source> {
             TypeKind::Mutable(inner)
             | TypeKind::Gc(inner)
             | TypeKind::Group(inner) => self.resolve_type(scope, inner),
+            TypeKind::Tuple { elements } => {
+                for element in elements {
+                    self.resolve_type(scope, element);
+                }
+            }
             TypeKind::Callable {
                 parameters,
                 return_type,
@@ -737,6 +747,9 @@ impl<'source> Resolver<'source> {
             TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
                 self.type_syntax_is_in_scope(scope, inner)
             }
+            TypeKind::Tuple { elements } => elements
+                .iter()
+                .all(|element| self.type_syntax_is_in_scope(scope, element)),
             TypeKind::Callable {
                 parameters,
                 return_type,

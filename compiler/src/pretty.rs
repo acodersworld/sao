@@ -485,6 +485,10 @@ fn format_expression_into(
             line(output, depth, format_args!("Group {}", location(span)));
             child_expression(output, source, "expression", inner, depth);
         }
+        ExpressionKind::Tuple { elements } => {
+            line(output, depth, format_args!("Tuple {}", location(span)));
+            expression_list(output, source, "elements", elements, depth);
+        }
         ExpressionKind::Block(block) => format_block_into(output, source, block, depth),
         ExpressionKind::If {
             condition,
@@ -933,6 +937,10 @@ fn format_type_into(
         TypeKind::Group(inner) => {
             line(output, depth, format_args!("Group {}", location(span)));
             child_type(output, source, "type", inner, depth);
+        }
+        TypeKind::Tuple { elements } => {
+            line(output, depth, format_args!("Tuple {}", location(span)));
+            type_list(output, source, "elements", elements, depth);
         }
         TypeKind::Callable {
             parameters,

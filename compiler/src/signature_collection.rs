@@ -647,6 +647,9 @@ fn find_nested_type(type_syntax: &TypeSyntax, target: NodeId) -> Option<&TypeSyn
         TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
             find_nested_type(inner, target)
         }
+        TypeKind::Tuple { elements } => elements
+            .iter()
+            .find_map(|element| find_nested_type(element, target)),
         TypeKind::Callable {
             parameters,
             return_type,
@@ -1434,6 +1437,11 @@ impl<'source, 'semantic> Collector<'source, 'semantic> {
             | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::Unary { operand: inner, .. } => self.visit_expression(inner),
+            ExpressionKind::Tuple { elements } => {
+                for element in elements {
+                    self.visit_expression(element);
+                }
+            }
             ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
                 self.visit_block(block);
             }

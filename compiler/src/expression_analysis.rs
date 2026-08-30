@@ -776,6 +776,11 @@ impl LexicalIndex {
             | ExpressionKind::Unary { operand: inner, .. } => {
                 self.visit_expression(inner, callable, names);
             }
+            ExpressionKind::Tuple { elements } => {
+                for element in elements {
+                    self.visit_expression(element, callable, names);
+                }
+            }
             ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
                 self.visit_block(block, callable, names);
             }
@@ -910,6 +915,11 @@ impl LexicalIndex {
             crate::ast::TypeKind::Mutable(inner)
             | crate::ast::TypeKind::Gc(inner)
             | crate::ast::TypeKind::Group(inner) => self.visit_type(inner, names),
+            crate::ast::TypeKind::Tuple { elements } => {
+                for element in elements {
+                    self.visit_type(element, names);
+                }
+            }
             crate::ast::TypeKind::Callable {
                 parameters,
                 return_type,
@@ -3047,6 +3057,9 @@ impl<'semantic> Analyzer<'semantic> {
                     .insert(expression.id, explicitly_produces_value);
                 typed
             }
+            ExpressionKind::Tuple { .. } => {
+                unreachable!("tuple construction begins in Phase 7.5 Change 2")
+            }
             ExpressionKind::Block(block) => {
                 let outcome = self.analyze_block(block, None, ConditionalUse::Value, false)?;
                 self.checking
@@ -3428,6 +3441,11 @@ impl<'semantic> Analyzer<'semantic> {
             | ExpressionKind::TypeAscription { value: inner, .. }
             | ExpressionKind::Unary { operand: inner, .. } => {
                 self.collect_captures_from_expression(lambda, inner, captures, seen);
+            }
+            ExpressionKind::Tuple { elements } => {
+                for element in elements {
+                    self.collect_captures_from_expression(lambda, element, captures, seen);
+                }
             }
             ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
                 self.collect_captures_from_block(lambda, block, captures, seen);
@@ -6455,6 +6473,10 @@ impl<'semantic> Analyzer<'semantic> {
                 .copied()
                 .any(|parameter| self.type_contains_template_parameter(parameter))
                 || self.type_contains_template_parameter(*return_type),
+            Some(SemanticType::Tuple { elements, .. }) => elements
+                .iter()
+                .copied()
+                .any(|element| self.type_contains_template_parameter(element)),
             Some(
                 SemanticType::GeneratedStruct { arguments, .. }
                 | SemanticType::Builtin { arguments, .. },
@@ -7617,6 +7639,7 @@ impl<'semantic> Analyzer<'semantic> {
             Some(
                 SemanticType::Gc { .. }
                 | SemanticType::Primitive { .. }
+                | SemanticType::Tuple { .. }
                 | SemanticType::Callable { .. }
                 | SemanticType::Interface { .. }
                 | SemanticType::TemplateParameter { .. }
@@ -7735,6 +7758,7 @@ impl<'semantic> Analyzer<'semantic> {
                 .any(|member| self.contains_non_escaping_erased_view(*member)),
             Some(SemanticType::Gc { .. }
             | SemanticType::Primitive { .. }
+            | SemanticType::Tuple { .. }
             | SemanticType::NamedStruct { .. }
             | SemanticType::GeneratedStruct { .. }
             | SemanticType::AnonymousStruct { .. }
@@ -7977,6 +8001,11 @@ fn index_runtime_templates_in_type(
         | crate::ast::TypeKind::Group(inner) => {
             index_runtime_templates_in_type(inner, signatures, templates);
         }
+        crate::ast::TypeKind::Tuple { elements } => {
+            for element in elements {
+                index_runtime_templates_in_type(element, signatures, templates);
+            }
+        }
         crate::ast::TypeKind::Callable {
             parameters,
             return_type,
@@ -8066,6 +8095,9 @@ fn find_nested_type(type_syntax: &TypeSyntax, target: NodeId) -> Option<&TypeSyn
         crate::ast::TypeKind::Mutable(inner)
         | crate::ast::TypeKind::Gc(inner)
         | crate::ast::TypeKind::Group(inner) => find_nested_type(inner, target),
+        crate::ast::TypeKind::Tuple { elements } => elements
+            .iter()
+            .find_map(|element| find_nested_type(element, target)),
         crate::ast::TypeKind::Callable {
             parameters,
             return_type,

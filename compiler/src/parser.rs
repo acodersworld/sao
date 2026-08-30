@@ -1214,10 +1214,30 @@ where
             ));
         }
 
-        let inner = self.type_expression()?;
+        let first = self.type_expression()?;
+        if self.current()?.kind != TokenKind::Comma {
+            let right_parenthesis = self.expect(TokenKind::RightParen)?;
+            return Ok(TypeSyntax::new(
+                TypeKind::Group(Box::new(first)),
+                Span::new(
+                    self.module_id,
+                    left_parenthesis.span.start,
+                    right_parenthesis.span.end,
+                ),
+            ));
+        }
+
+        let mut elements = vec![first];
+        while self.current()?.kind == TokenKind::Comma {
+            self.advance()?;
+            if self.current()?.kind == TokenKind::RightParen {
+                break;
+            }
+            elements.push(self.type_expression()?);
+        }
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
         Ok(TypeSyntax::new(
-            TypeKind::Group(Box::new(inner)),
+            TypeKind::Tuple { elements },
             Span::new(
                 self.module_id,
                 left_parenthesis.span.start,
@@ -1839,11 +1859,31 @@ where
         // Parentheses provide an unambiguous boundary, so construction syntax
         // is available even when the surrounding condition or range head
         // disables it to reserve the following brace for a body.
-        let expression = self.expression(LOWEST_BINDING_POWER, true)?;
+        let first = self.expression(LOWEST_BINDING_POWER, true)?;
+        if self.current()?.kind != TokenKind::Comma {
+            let right_parenthesis = self.expect(TokenKind::RightParen)?;
+            return Ok(Expression::new(
+                ExpressionKind::Group(Box::new(first)),
+                Span::new(
+                    self.module_id,
+                    left_parenthesis.span.start,
+                    right_parenthesis.span.end,
+                ),
+            ));
+        }
+
+        let mut elements = vec![first];
+        while self.current()?.kind == TokenKind::Comma {
+            self.advance()?;
+            if self.current()?.kind == TokenKind::RightParen {
+                break;
+            }
+            elements.push(self.expression(LOWEST_BINDING_POWER, true)?);
+        }
         let right_parenthesis = self.expect(TokenKind::RightParen)?;
 
         Ok(Expression::new(
-            ExpressionKind::Group(Box::new(expression)),
+            ExpressionKind::Tuple { elements },
             Span::new(
                 self.module_id,
                 left_parenthesis.span.start,
@@ -2347,6 +2387,11 @@ fn assign_expression_ids(expression: &mut Expression, context: &mut ParseContext
         }
         ExpressionKind::GcAllocate(inner) => assign_expression_ids(inner, context),
         ExpressionKind::Group(inner) => assign_expression_ids(inner, context),
+        ExpressionKind::Tuple { elements } => {
+            for element in elements {
+                assign_expression_ids(element, context);
+            }
+        }
         ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
             assign_block_ids(block, context);
         }
@@ -2495,6 +2540,11 @@ fn assign_type_ids(type_syntax: &mut TypeSyntax, context: &mut ParseContext) {
         TypeKind::Mutable(inner) | TypeKind::Gc(inner) | TypeKind::Group(inner) => {
             assign_type_ids(inner, context)
         }
+        TypeKind::Tuple { elements } => {
+            for element in elements {
+                assign_type_ids(element, context);
+            }
+        }
         TypeKind::Callable {
             parameters,
             return_type,
@@ -2568,6 +2618,12 @@ fn validate_formatted_string_expression(expression: &Expression) -> ParseResult<
                 if let FormattedStringPart::Interpolation { value, .. } = part {
                     validate_formatted_string_expression(value)?;
                 }
+            }
+            Ok(())
+        }
+        ExpressionKind::Tuple { elements } => {
+            for element in elements {
+                validate_formatted_string_expression(element)?;
             }
             Ok(())
         }
@@ -2685,7 +2741,8 @@ fn range_bound_is_simple(expression: &Expression) -> bool {
         ExpressionKind::Identifier
         | ExpressionKind::SelfValue
         | ExpressionKind::Literal(_)
-        | ExpressionKind::Group(_) => true,
+        | ExpressionKind::Group(_)
+        | ExpressionKind::Tuple { .. } => true,
         ExpressionKind::Call { callee, .. } => range_bound_is_simple(callee),
         ExpressionKind::MemberAccess { object, .. }
         | ExpressionKind::Index { object, .. }
@@ -7064,6 +7121,73 @@ mod tests {
         };
         assert!(matches!(inner.kind, TypeKind::Union { .. }));
         assert_eq!(type_syntax.span, span(0, 12));
+    }
+
+    #[test]
+    fn parses_tuple_types_without_changing_unit_or_grouping() {
+        for (source, arity) in [
+            ("(int,)", 1),
+            ("(int, float)", 2),
+            ("(int, float,)", 2),
+            ("((int,), (float, string))", 2),
+        ] {
+            let type_syntax = parse_type_source(source).expect("tuple type should parse");
+            let TypeKind::Tuple { elements } = type_syntax.kind else {
+                panic!("expected a tuple type for {source}");
+            };
+            assert_eq!(elements.len(), arity, "incorrect arity for {source}");
+            assert_eq!(type_syntax.span, span(0, source.len()));
+        }
+
+        assert!(matches!(
+            parse_type_source("()").expect("unit should parse").kind,
+            TypeKind::Primitive(PrimitiveType::Unit)
+        ));
+        assert!(matches!(
+            parse_type_source("(int)")
+                .expect("grouped type should parse")
+                .kind,
+            TypeKind::Group(_)
+        ));
+    }
+
+    #[test]
+    fn parses_tuple_values_only_for_parenthesized_top_level_commas() {
+        for (source, arity) in [
+            ("(value,)", 1),
+            ("(first, second)", 2),
+            ("(first, second,)", 2),
+            ("((first,), (second, third))", 2),
+        ] {
+            let expression = parse(source).expect("tuple value should parse");
+            let ExpressionKind::Tuple { elements } = expression.kind else {
+                panic!("expected a tuple value for {source}");
+            };
+            assert_eq!(elements.len(), arity, "incorrect arity for {source}");
+            assert_eq!(expression.span, span(0, source.len()));
+        }
+
+        assert!(matches!(
+            parse("()").expect("unit should parse").kind,
+            ExpressionKind::Literal(LiteralKind::Unit)
+        ));
+        assert!(matches!(
+            parse("(value)").expect("group should parse").kind,
+            ExpressionKind::Group(_)
+        ));
+
+        let call = parse("consume(value,)").expect("trailing call comma should parse");
+        let ExpressionKind::Call { arguments, .. } = call.kind else {
+            panic!("expected a call");
+        };
+        assert_eq!(arguments.len(), 1);
+        assert!(!matches!(arguments[0].kind, ExpressionKind::Tuple { .. }));
+
+        let call = parse("consume((value,))").expect("tuple argument should parse");
+        let ExpressionKind::Call { arguments, .. } = call.kind else {
+            panic!("expected a call");
+        };
+        assert!(matches!(arguments[0].kind, ExpressionKind::Tuple { .. }));
     }
 
     #[test]

@@ -530,6 +530,11 @@ pub enum TypeKind {
     /// carries the access capability selected by `&T` or `&mut T`.
     Gc(Box<TypeSyntax>),
     Group(Box<TypeSyntax>),
+    /// A fixed-length ordered structural product. The parser only forms this
+    /// node when the parentheses contain a top-level comma.
+    Tuple {
+        elements: Vec<TypeSyntax>,
+    },
     Callable {
         parameters: Vec<TypeSyntax>,
         return_type: Box<TypeSyntax>,
@@ -583,6 +588,11 @@ pub enum ExpressionKind {
         parts: Vec<FormattedStringPart>,
     },
     Group(Box<Expression>),
+    /// A fixed-length ordered tuple literal. Singleton tuples retain their
+    /// required comma in the source but store one element here.
+    Tuple {
+        elements: Vec<Expression>,
+    },
     Block(Block),
     If {
         condition: Box<Expression>,
@@ -695,6 +705,12 @@ pub fn expression_as_type_syntax(expression: &Expression) -> Option<TypeSyntax> 
         ExpressionKind::Group(inner) => {
             TypeKind::Group(Box::new(expression_as_type_syntax(inner)?))
         }
+        ExpressionKind::Tuple { elements } => TypeKind::Tuple {
+            elements: elements
+                .iter()
+                .map(expression_as_type_syntax)
+                .collect::<Option<Vec<_>>>()?,
+        },
         ExpressionKind::Call { callee, arguments }
             if matches!(&callee.kind, ExpressionKind::Identifier) =>
         {

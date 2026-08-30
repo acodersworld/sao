@@ -817,6 +817,11 @@ impl<'source, 'names> Resolver<'source, 'names> {
             | ExpressionKind::GcAllocate(inner)
             | ExpressionKind::Try { expression: inner }
             | ExpressionKind::Unary { operand: inner, .. } => self.visit_expression(inner),
+            ExpressionKind::Tuple { elements } => {
+                for element in elements {
+                    self.visit_expression(element);
+                }
+            }
             ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
                 self.visit_block(block);
             }
@@ -1048,6 +1053,7 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 self.was_resolved_as_type(inner)
             }
             TypeKind::Callable { .. }
+            | TypeKind::Tuple { .. }
             | TypeKind::Intersection { .. }
             | TypeKind::Union { .. }
             | TypeKind::GeneratedStruct { .. } => true,
@@ -1085,6 +1091,13 @@ impl<'source, 'names> Resolver<'source, 'names> {
                     .expect("resolved type belongs to this type store")
             }
             TypeKind::Group(inner) => self.resolve_type(inner),
+            TypeKind::Tuple { elements } => {
+                let elements = elements
+                    .iter()
+                    .map(|element| self.resolve_type(element))
+                    .collect();
+                self.types.tuple(elements, AccessCapability::Const)
+            }
             TypeKind::Callable {
                 parameters,
                 return_type,
@@ -1700,6 +1713,37 @@ mod tests {
                 arguments,
                 ..
             }) if arguments.len() == 2
+        ));
+    }
+
+    #[test]
+    fn resolves_tuple_types_by_ordered_structural_identity() {
+        let (program, resolution) = resolve(concat!(
+            "fn inspect(",
+            "    first: (int, string),",
+            "    second: (int, string,),",
+            "    reversed: (string, int),",
+            "    singleton: (int,),",
+            ") {}",
+            "fn main() {}",
+        ));
+        let inspect = top_level_function(&program, 0);
+        let resolved = |index| {
+            resolution
+                .type_for_syntax(named_parameter_type(inspect, index).id)
+                .expect("tuple parameter type should resolve")
+        };
+
+        assert_eq!(resolved(0), resolved(1));
+        assert_ne!(resolved(0), resolved(2));
+        assert_ne!(resolved(0), resolved(3));
+        assert!(matches!(
+            resolution.types().get(resolved(0)),
+            Some(SemanticType::Tuple { elements, .. }) if elements.len() == 2
+        ));
+        assert!(matches!(
+            resolution.types().get(resolved(3)),
+            Some(SemanticType::Tuple { elements, .. }) if elements.len() == 1
         ));
     }
 

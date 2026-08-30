@@ -119,6 +119,12 @@ pub enum SemanticType {
         return_type: TypeId,
         capability: AccessCapability,
     },
+    /// A fixed-length ordered structural product. Element order and exact
+    /// canonical identities are part of the tuple's canonical identity.
+    Tuple {
+        elements: Vec<TypeId>,
+        capability: AccessCapability,
+    },
     NamedStruct {
         declaration: NodeId,
         capability: AccessCapability,
@@ -176,6 +182,7 @@ impl SemanticType {
             Self::Gc { capability, .. }
             | Self::Primitive { capability, .. }
             | Self::Callable { capability, .. }
+            | Self::Tuple { capability, .. }
             | Self::NamedStruct { capability, .. }
             | Self::GeneratedStruct { capability, .. }
             | Self::AnonymousStruct { capability, .. }
@@ -199,6 +206,7 @@ impl SemanticType {
                 Some(StorageSemantics::BorrowedView)
             }
             Self::Primitive { .. }
+            | Self::Tuple { .. }
             | Self::NamedStruct { .. }
             | Self::GeneratedStruct { .. }
             | Self::AnonymousStruct { .. }
@@ -227,6 +235,7 @@ impl SemanticType {
                 Some(CopySemantics::NonEscapingErasedView)
             }
             Self::Primitive { .. }
+            | Self::Tuple { .. }
             | Self::NamedStruct { .. }
             | Self::GeneratedStruct { .. }
             | Self::AnonymousStruct { .. }
@@ -263,6 +272,12 @@ impl SemanticType {
                     ..
                 },
             ) => left_parameters == right_parameters && left_return == right_return,
+            (
+                Self::Tuple { elements: left, .. },
+                Self::Tuple {
+                    elements: right, ..
+                },
+            ) => left == right,
             (
                 Self::NamedStruct {
                     declaration: left, ..
@@ -420,6 +435,19 @@ impl TypeStore {
         self.intern(SemanticType::Callable {
             parameters,
             return_type,
+            capability,
+        })
+    }
+
+    /// Returns the canonical identity for an ordered tuple shape.
+    pub fn tuple(
+        &mut self,
+        elements: Vec<TypeId>,
+        capability: AccessCapability,
+    ) -> TypeId {
+        assert!(!elements.is_empty(), "the empty product is the unit type");
+        self.intern(SemanticType::Tuple {
+            elements,
             capability,
         })
     }
@@ -603,6 +631,7 @@ impl TypeStore {
                 return_type,
                 ..
             } => Some(self.callable(parameters, return_type, capability)),
+            SemanticType::Tuple { elements, .. } => Some(self.tuple(elements, capability)),
             SemanticType::NamedStruct { declaration, .. } => {
                 Some(self.named_struct(declaration, capability))
             }
@@ -665,6 +694,16 @@ impl TypeStore {
                 let return_type =
                     self.substitute_template_parameters(return_type, substitutions)?;
                 self.callable(parameters, return_type, capability)
+            }
+            SemanticType::Tuple {
+                elements,
+                capability,
+            } => {
+                let elements = elements
+                    .into_iter()
+                    .map(|element| self.substitute_template_parameters(element, substitutions))
+                    .collect::<Option<Vec<_>>>()?;
+                self.tuple(elements, capability)
             }
             SemanticType::GeneratedStruct {
                 template,
@@ -976,6 +1015,34 @@ mod tests {
         assert_ne!(original, mutable);
         assert_ne!(original, reversed);
         assert_ne!(original, different_return);
+    }
+
+    #[test]
+    fn tuple_identity_preserves_arity_order_elements_and_outer_capability() {
+        let mut types = TypeStore::new();
+        let int = types.primitive(PrimitiveType::Int, AccessCapability::Const);
+        let string = types.primitive(PrimitiveType::String, AccessCapability::Const);
+
+        let pair = types.tuple(vec![int, string], AccessCapability::Const);
+        assert_eq!(
+            types.tuple(vec![int, string], AccessCapability::Const),
+            pair
+        );
+
+        let singleton = types.tuple(vec![int], AccessCapability::Const);
+        let reversed = types.tuple(vec![string, int], AccessCapability::Const);
+        let mutable = types.tuple(vec![int, string], AccessCapability::Mut);
+        assert_ne!(pair, singleton);
+        assert_ne!(pair, reversed);
+        assert_ne!(pair, mutable);
+        assert_eq!(types.has_same_shape(pair, mutable), Some(true));
+        assert_eq!(
+            types.get(pair),
+            Some(&SemanticType::Tuple {
+                elements: vec![int, string],
+                capability: AccessCapability::Const,
+            })
+        );
     }
 
     #[test]
