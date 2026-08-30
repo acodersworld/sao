@@ -399,79 +399,95 @@ reviewable phases:
        generic inference, first-class template values, local templates, and
        compile-time duck typing remain deferred.
    - Phase 7.5, tracked non-GC references and lifetime links (pending):
-     - Add `*T` as a first-class tracked borrowed-reference type. It describes
-       a lifetime relationship, not a raw pointer or a distinct argument-passing
-       convention. Continue passing ordinary plain aggregate parameters by
-       reference: `value: T` is a call-scoped borrow, while `value: *T` is a
-       tracked borrow which may contribute to an escaping `*` result.
-     - Preserve the three distinct storage contracts: `T` is a plain value,
-       `&T` is a GC-owned reference, and `*T` is a non-owning reference to
-       storage owned elsewhere. Permit plain and GC-backed values to borrow as
-       `*T`; never implicitly convert `*T` into `T` or `&T`, because those
-       conversions would require copying or allocation. Continue using `.` for
-       member access with automatic dereferencing rather than adding `->`.
-     - Link a returned `*T` to every `*` parameter of the callable. At a call,
-       the result receives the intersection (shortest remaining lifetime) of
-       all tracked arguments. Non-`*` parameters do not contribute, even though
-       plain aggregate parameters are passed by reference. This deliberately
-       conservative rule avoids named lifetime parameters; a later feature may
-       permit declaring a smaller contributing set if necessary.
-     - Support `*self` as the tracked receiver form. It participates in the
-       returned lifetime exactly like a named `*T` parameter, allowing methods
-       to return references derived from stable inline receiver fields. An
-       ordinary `self` receiver remains call-scoped and cannot supply an
-       escaping tracked result.
-     - Require every returned tracked reference to derive from at least one
-       tracked parameter, through any number of stable inline fields. Reject
-       references derived from ordinary parameters, GC parameters declared as
-       `&T`, locals, fresh temporaries, or other callable-owned storage. For
-       example, `fn inner(input: &Input) -> *Inner { input.inner }` is invalid,
-       while `fn inner(input: *Input, other: Input) -> *Inner { input.inner }`
-       is valid and links the result only to `input`.
-     - Allow a caller's `T` or `&T` value to satisfy a `*T` parameter. Propagate
-       the caller-side storage lifetime through the result, and keep a GC owner
-       rooted while a tracked reference into its payload remains live. Do not
-       treat an `&T` parameter as an implicit return-lifetime source merely
-       because its value can be borrowed locally as `*T`.
-     - Do not extend temporary lifetimes to make an escaping tracked reference
-       valid. A temporary may be borrowed for the duration of a call, but a
-       tracked result derived from it cannot escape the complete expression;
-       therefore `const inner = project(Item {});` is invalid when `project`
-       returns a reference into its argument. Apply the same rule to temporary
-       GC allocations rather than creating hidden lifetime-extending storage.
-     - Preserve or reduce target access capability through a tracked borrow but
-       never increase it. Track the physical source storage and field path so
-       rebinding a reference slot does not invalidate existing references to
-       the old backing storage, while replacement or movement which could make
-       an interior address invalid is rejected for the reference's live range.
-       Do not implement Rust-style exclusive mutable borrowing: multiple
-       tracked references may alias the same stable storage, and `*mut T`
-       controls mutation through that particular view rather than proving that
-       no other views exist. SAO remains single-threaded, and this phase tracks
-       storage validity rather than data-race freedom.
-     - Permit plain, stack-resident structs to contain `*T` fields. Such a value
-       transitively carries the intersection of the lifetimes of all tracked
-       references stored within it. A type containing a tracked reference,
-       directly or through another inline aggregate or union, cannot be heap
-       allocated: reject GC allocation, GC fields, and storage in external-
-       buffer collections. Returning or otherwise propagating a borrow-
-       containing plain value must preserve its tracked origins just as
-       returning `*T` does.
-     - Integrate tracked references with control-flow joins, returns, calls,
-       assignments, conditionals, loops, union tag locks, and interface views.
-       Record private origin, lifetime-intersection, GC-owner-root, and borrow-
-       validity metadata for post-type escape analysis, typed IR, and lowering.
-       Reject capturing `*T` or a transitively borrow-containing value in a
-       lambda until authoritative capture and escape analysis can prove that
-       the callable cannot outlive every source. Keep references into
-       relocatable collection buffers deferred until their invalidation rules
-       are defined with the corresponding built-ins.
-     - Add focused tests for ordinary versus tracked parameters, field-derived
-       references, multiple-input lifetime intersections, capability direction,
-       plain and GC coercions, GC rooting, invalid local and temporary returns,
-       flow joins, shadowing, mutation and rebinding, recovery, and callable
-       composition. Update the complex-program test with direct, receiver-
-       derived, multi-input, and GC-backed tracked references.
+     - Change 1, syntax and canonical types:
+       - Add `*T` as a first-class tracked borrowed-reference type. It describes
+         a lifetime relationship, not a raw pointer or a distinct argument-passing
+         convention. Continue passing ordinary plain aggregate parameters by
+         reference: `value: T` is a call-scoped borrow, while `value: *T` is a
+         tracked borrow which may contribute to an escaping `*` result.
+       - Preserve the three distinct storage contracts: `T` is a plain value,
+         `&T` is a GC-owned reference, and `*T` is a non-owning reference to
+         storage owned elsewhere.
+       - Stop for review and commit before implementing borrow formation and
+         place provenance.
+     - Change 2, borrow formation and place provenance:
+       - Permit plain and GC-backed values to borrow as `*T`; never implicitly
+         convert `*T` into `T` or `&T`, because those conversions would require
+         copying or allocation. Continue using `.` for member access with
+         automatic dereferencing rather than adding `->`.
+       - Preserve or reduce target access capability through a tracked borrow but
+         never increase it. Track the physical source storage and field path.
+       - Stop for review and commit before implementing callable lifetime links.
+     - Change 3, callable lifetime links:
+       - Link a returned `*T` to every `*` parameter of the callable. At a call,
+         the result receives the intersection (shortest remaining lifetime) of
+         all tracked arguments. Non-`*` parameters do not contribute, even though
+         plain aggregate parameters are passed by reference. This deliberately
+         conservative rule avoids named lifetime parameters; a later feature may
+         permit declaring a smaller contributing set if necessary.
+       - Support `*self` as the tracked receiver form. It participates in the
+         returned lifetime exactly like a named `*T` parameter, allowing methods
+         to return references derived from stable inline receiver fields. An
+         ordinary `self` receiver remains call-scoped and cannot supply an
+         escaping tracked result.
+       - Require every returned tracked reference to derive from at least one
+         tracked parameter, through any number of stable inline fields. Reject
+         references derived from ordinary parameters, GC parameters declared as
+         `&T`, locals, fresh temporaries, or other callable-owned storage. For
+         example, `fn inner(input: &Input) -> *Inner { input.inner }` is invalid,
+         while `fn inner(input: *Input, other: Input) -> *Inner { input.inner }`
+         is valid and links the result only to `input`.
+       - Allow a caller's `T` or `&T` value to satisfy a `*T` parameter. Propagate
+         the caller-side storage lifetime through the result. Do not treat an
+         `&T` parameter as an implicit return-lifetime source merely because its
+         value can be borrowed locally as `*T`.
+       - Do not extend temporary lifetimes to make an escaping tracked reference
+         valid. A temporary may be borrowed for the duration of a call, but a
+         tracked result derived from it cannot escape the complete expression;
+         therefore `const inner = project(Item {});` is invalid when `project`
+         returns a reference into its argument. Apply the same rule to temporary
+         GC allocations rather than creating hidden lifetime-extending storage.
+       - Stop for review and commit before implementing borrow-containing
+         aggregates.
+     - Change 4, borrow-containing aggregates:
+       - Permit plain, stack-resident structs to contain `*T` fields. Such a value
+         transitively carries the intersection of the lifetimes of all tracked
+         references stored within it. A type containing a tracked reference,
+         directly or through another inline aggregate or union, cannot be heap
+         allocated: reject GC allocation, GC fields, and storage in external-
+         buffer collections. Returning or otherwise propagating a borrow-
+         containing plain value must preserve its tracked origins just as
+         returning `*T` does.
+       - Stop for review and commit before implementing flow-sensitive validity
+         and GC rooting.
+     - Change 5, flow-sensitive validity and GC rooting:
+       - Rebinding a reference slot does not invalidate existing references to
+         the old backing storage, while replacement or movement which could make
+         an interior address invalid is rejected for the reference's live range.
+         Do not implement Rust-style exclusive mutable borrowing: multiple
+         tracked references may alias the same stable storage, and `*mut T`
+         controls mutation through that particular view rather than proving that
+         no other views exist. SAO remains single-threaded, and this phase tracks
+         storage validity rather than data-race freedom.
+       - Keep a GC owner rooted while a tracked reference into its payload remains
+         live.
+       - Integrate tracked references with control-flow joins, returns, calls,
+         assignments, conditionals, loops, union tag locks, and interface views.
+       - Stop for review and commit before integration and completion.
+     - Change 6, integration and completion:
+       - Record private origin, lifetime-intersection, GC-owner-root, and borrow-
+         validity metadata for post-type escape analysis, typed IR, and lowering.
+       - Reject capturing `*T` or a transitively borrow-containing value in a
+         lambda until authoritative capture and escape analysis can prove that
+         the callable cannot outlive every source. Keep references into
+         relocatable collection buffers deferred until their invalidation rules
+         are defined with the corresponding built-ins.
+       - Add focused tests for ordinary versus tracked parameters, field-derived
+         references, multiple-input lifetime intersections, capability direction,
+         plain and GC coercions, GC rooting, invalid local and temporary returns,
+         flow joins, shadowing, mutation and rebinding, recovery, and callable
+         composition. Update the complex-program test with direct, receiver-
+         derived, multi-input, and GC-backed tracked references.
    - Phase 7.6, remaining built-ins and completion (pending):
      - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
        `yield`, `co`, and `defer`.
