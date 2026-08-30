@@ -3057,8 +3057,8 @@ impl<'semantic> Analyzer<'semantic> {
                     .insert(expression.id, explicitly_produces_value);
                 typed
             }
-            ExpressionKind::Tuple { .. } => {
-                unreachable!("tuple construction begins in Phase 7.5 Change 2")
+            ExpressionKind::Tuple { elements } => {
+                self.synthesize_tuple_literal(elements, None)?
             }
             ExpressionKind::Block(block) => {
                 let outcome = self.analyze_block(block, None, ConditionalUse::Value, false)?;
@@ -3616,6 +3616,20 @@ impl<'semantic> Analyzer<'semantic> {
         {
             return self.analyze_loop_expression(expression, Some(expected));
         }
+        if let ExpressionKind::Tuple { elements } = &expression.kind
+            && !self.checking.expressions.contains_key(&expression.id)
+            && let Some(SemanticType::Tuple {
+                elements: expected_elements,
+                ..
+            }) = self.types.types().get(expected).cloned()
+            && elements.len() == expected_elements.len()
+        {
+            let found = self.synthesize_tuple_literal(elements, Some(&expected_elements))?;
+            let typed = self.check_typed(expression, expected, found, allow_recursive_copy)?;
+            self.checking.expressions.insert(expression.id, typed);
+            self.checking.explicit_values.insert(expression.id, true);
+            return Some(typed);
+        }
         if let ExpressionKind::Group(inner) = &expression.kind
             && !self.checking.expressions.contains_key(&expression.id)
         {
@@ -3630,6 +3644,60 @@ impl<'semantic> Analyzer<'semantic> {
 
         let found = self.synthesize(expression)?;
         self.check_typed(expression, expected, found, allow_recursive_copy)
+    }
+
+    /// Constructs one tuple while evaluating and storing its elements in
+    /// source order. Without an expected tuple, every element contributes its
+    /// synthesized type. A matching expected tuple checks each position
+    /// contextually, but this path applies only to literal construction: an
+    /// existing tuple still crosses expected-type boundaries as one exact
+    /// structural value and is never converted element by element.
+    fn synthesize_tuple_literal(
+        &mut self,
+        elements: &[Expression],
+        expected_elements: Option<&[TypeId]>,
+    ) -> Option<TypedExpression> {
+        debug_assert!(
+            expected_elements.is_none_or(|expected| expected.len() == elements.len()),
+            "contextual tuple construction requires matching arity"
+        );
+        let mut element_types = Vec::with_capacity(elements.len());
+        let mut valid = true;
+        let mut all_supported = true;
+
+        for (index, element) in elements.iter().enumerate() {
+            let checked = match expected_elements {
+                Some(expected) => self.check(element, expected[index]),
+                None => self.synthesize(element),
+            };
+            let Some(checked) = checked else {
+                all_supported = false;
+                continue;
+            };
+            let element_type =
+                expected_elements.map_or(checked.type_id, |expected| expected[index]);
+            element_types.push(element_type);
+            if self.is_recovery(checked.type_id) {
+                valid = false;
+                continue;
+            }
+            valid &= self.validate_owning_transfer(element, checked, true);
+        }
+
+        if !all_supported {
+            return None;
+        }
+        if !valid {
+            return Some(self.recovery_temporary());
+        }
+        let type_id = self
+            .types
+            .types_mut()
+            .tuple(element_types, AccessCapability::Mut);
+        Some(TypedExpression {
+            type_id,
+            category: ValueCategory::FreshTemporary,
+        })
     }
 
     fn check_typed(
@@ -8315,6 +8383,13 @@ mod tests {
         initializer
     }
 
+    fn tuple_elements(expression: &Expression) -> &[Expression] {
+        let ExpressionKind::Tuple { elements } = &expression.kind else {
+            panic!("expected tuple expression")
+        };
+        elements
+    }
+
     fn conditional_branches(expression: &Expression) -> (&Block, &Block) {
         let ExpressionKind::If {
             then_branch,
@@ -9341,6 +9416,123 @@ mod tests {
             assert_eq!(checking.transfers.get(&initializer.id), Some(&transfer));
         }
         assert!(checking.errors.is_empty());
+    }
+
+    #[test]
+    fn checks_tuple_literals_contextually_and_records_aggregate_transfers() {
+        let source = concat!(
+            "fn return_named(value: (int, string)) -> (int, string) { value }\n",
+            "fn inspect() {\n",
+            "    const inferred = (1, \"one\",);\n",
+            "    const contextual: (int | string, string) = (2, \"two\");\n",
+            "    const alias = inferred;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let returned = body_value(function(&program.declarations[0]));
+        assert_eq!(
+            checking.transfers[&returned.id],
+            ValueTransfer::RecursiveCopy
+        );
+
+        let inspect = function(&program.declarations[1]);
+        let inferred = binding_initializer(&inspect.body.statements[0]);
+        let inferred_elements = tuple_elements(inferred);
+        let inferred_type = checking.expressions[&inferred.id].type_id;
+        assert!(matches!(
+            types.types().get(inferred_type),
+            Some(SemanticType::Tuple {
+                elements,
+                capability: AccessCapability::Mut,
+            }) if elements.len() == 2
+        ));
+        assert_eq!(
+            checking.transfers[&inferred_elements[0].id],
+            ValueTransfer::TrivialCopy
+        );
+        assert_eq!(
+            checking.transfers[&inferred_elements[1].id],
+            ValueTransfer::MoveTemporary
+        );
+        assert_eq!(
+            checking.transfers[&inferred.id],
+            ValueTransfer::MoveTemporary
+        );
+
+        let contextual = binding_initializer(&inspect.body.statements[1]);
+        let contextual_elements = tuple_elements(contextual);
+        assert!(checking
+            .union_injections
+            .contains_key(&contextual_elements[0].id));
+        assert_eq!(
+            checking.transfers[&contextual_elements[0].id],
+            ValueTransfer::MoveTemporary
+        );
+        assert_eq!(
+            checking.transfers[&contextual_elements[1].id],
+            ValueTransfer::MoveTemporary
+        );
+
+        let alias = binding_initializer(&inspect.body.statements[2]);
+        assert_eq!(checking.transfers[&alias.id], ValueTransfer::Borrow);
+    }
+
+    #[test]
+    fn requires_tuple_reconstruction_and_owned_element_sources() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "fn reconstructed(number: int) -> (int | string,) { (number,) }\n",
+            "fn wrong_shape(value: (int,)) -> (int | string,) { value }\n",
+            "fn wrong_arity() -> (int, int) { (1,) }\n",
+            "fn bad_owner(value: Leaf) { const invalid = (value,); }\n",
+            "fn good_owner() { const valid = (Leaf {},); }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+
+        assert_eq!(checking.errors.len(), 3, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::InvalidOwningSource {
+                category: ValueCategory::BorrowedPlace,
+                ..
+            }
+        ));
+
+        let reconstructed = body_value(function(&program.declarations[1]));
+        let reconstructed_element = &tuple_elements(reconstructed)[0];
+        assert!(checking
+            .union_injections
+            .contains_key(&reconstructed_element.id));
+        assert_eq!(
+            checking.transfers[&reconstructed_element.id],
+            ValueTransfer::MoveTemporary
+        );
+        assert_eq!(
+            checking.transfers[&reconstructed.id],
+            ValueTransfer::MoveTemporary
+        );
+
+        let good_owner = function(&program.declarations[5]);
+        let valid = binding_initializer(&good_owner.body.statements[0]);
+        let fresh_leaf = &tuple_elements(valid)[0];
+        assert_eq!(
+            checking.transfers[&fresh_leaf.id],
+            ValueTransfer::MoveTemporary
+        );
     }
 
     #[test]

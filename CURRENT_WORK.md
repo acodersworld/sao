@@ -407,19 +407,20 @@ reviewable phases:
          native structural aggregates rather than reserved parameterized
          built-ins.
        - Complete: reviewed Change 1. Stop before implementing tuple construction.
-     - Change 2, literal checking and owning transfers:
-       - Infer tuple literal elements independently when no tuple type is expected.
+     - Change 2, literal checking and owning transfers (complete):
+       - Complete: infer tuple literal elements independently when no tuple type
+         is expected.
          Under an expected tuple type, require matching arity and check each
          element contextually from left to right.
-       - Do not convert existing tuples element by element. Require exact ordered
-         element-type shape apart from outer capability reduction, and require
-         explicit tuple reconstruction when an element type changes.
-       - Give tuple elements the owning-transfer rules of inline struct fields and
-         give whole tuples object-like aggregate behavior: fresh tuples move,
-         named tuples borrow, named returns copy recursively, and independent
-         storage uses `.copy()`.
-       - Stop for review and commit before implementing tuple places and storage
-         integration.
+       - Complete: do not convert existing tuples element by element. Require
+         exact ordered element-type shape apart from outer capability reduction,
+         and require explicit tuple reconstruction when an element type changes.
+       - Complete: give tuple elements the owning-transfer rules of inline struct
+         fields and give whole tuples object-like aggregate behavior: fresh
+         tuples move, named tuples borrow, named returns copy recursively, and
+         independent storage uses `.copy()`.
+       - Complete: reviewed Change 2. Stop before implementing tuple places and
+         storage integration.
      - Change 3, numeric places, capability, copying, GC, escape, and layout:
        - Resolve `.0`, `.1`, and later numeric fields as compile-time tuple element
          places. Diagnose non-tuple owners and out-of-range fields; do not add
