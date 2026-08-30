@@ -1444,7 +1444,19 @@ where
 
     fn member_access(&mut self, object: Expression) -> ParseResult {
         self.expect(TokenKind::Dot)?;
-        let member = self.expect(TokenKind::Identifier)?;
+        let member = match self.current()?.kind {
+            TokenKind::Identifier | TokenKind::IntegerLiteral => self.advance()?,
+            found => {
+                return Err(ParseError {
+                    kind: ParseErrorKind::ExpectedToken {
+                        expected: TokenKind::Identifier,
+                        found,
+                    },
+                    span: self.current()?.span,
+                }
+                .into());
+            }
+        };
         let span = Span::new(self.module_id, object.span.start, member.span.end);
 
         Ok(Expression::new(
@@ -7188,6 +7200,19 @@ mod tests {
             panic!("expected a call");
         };
         assert!(matches!(arguments[0].kind, ExpressionKind::Tuple { .. }));
+    }
+
+    #[test]
+    fn parses_numeric_tuple_fields_as_member_access() {
+        let expression = parse("value.0.12").expect("numeric tuple fields should parse");
+        let ExpressionKind::MemberAccess { object, member } = expression.kind else {
+            panic!("expected outer tuple member access")
+        };
+        assert_eq!(member, span(8, 10));
+        let ExpressionKind::MemberAccess { member, .. } = object.kind else {
+            panic!("expected inner tuple member access")
+        };
+        assert_eq!(member, span(6, 7));
     }
 
     #[test]

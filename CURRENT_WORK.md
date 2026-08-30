@@ -421,17 +421,24 @@ reviewable phases:
          independent storage uses `.copy()`.
        - Complete: reviewed Change 2. Stop before implementing tuple places and
          storage integration.
-     - Change 3, numeric places, capability, copying, GC, escape, and layout:
-       - Resolve `.0`, `.1`, and later numeric fields as compile-time tuple element
-         places. Diagnose non-tuple owners and out-of-range fields; do not add
-         dynamic indexing or slicing.
-       - Apply transitive outer capability to inline elements, support ordinary
-         element assignment rules, and provide only the compiler-defined `.copy()`
-         named member. Do not add tuple equality, ordering, or interface methods.
-       - Integrate tuples with recursive copy and return metadata, explicit GC
-         allocation, tracing and cleanup, finite inline-layout validation, and
-         propagation of non-escaping interface or capturing-callable elements.
-       - Stop for review and commit before full type-system integration.
+     - Change 3, numeric places, capability, copying, GC, escape, and layout
+       (complete):
+       - Complete: resolve `.0`, `.1`, and later numeric fields as compile-time
+         tuple element places. Diagnose non-tuple owners and out-of-range fields;
+         do not add dynamic indexing or slicing.
+       - Complete: apply transitive outer capability to inline elements, support
+         ordinary element assignment rules, and provide only the compiler-defined
+         `.copy()` named member. Tuple equality, ordering, and interface methods
+         remain unavailable.
+       - Complete: integrate tuples with recursive copy and return transfers,
+         explicit GC allocation, recursive tracing/cleanup type traversal,
+         finite inline-layout validation, and propagation of non-escaping erased
+         elements through tuple and union types.
+       - Complete: add focused parser and semantic tests for numeric selection,
+         mutable and const places, nested GC access, recursive copying, GC
+         allocation, invalid members and arity, tuple operators, non-escaping
+         elements, and recursive inline layouts.
+       - Complete: reviewed Change 3. Stop before full type-system integration.
      - Change 4, integration and completion:
        - Integrate tuple types with aliases, type factories, explicit template
          specialization, callable signatures, union injection and narrowing, and

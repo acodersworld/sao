@@ -362,6 +362,7 @@ pub struct Lexer<'source> {
     module_id: ModuleId,
     source_len: usize,
     pending: VecDeque<Result<Token, LexError>>,
+    last_token_kind: Option<TokenKind>,
     emitted_eof: bool,
 }
 
@@ -373,6 +374,7 @@ impl<'source> Lexer<'source> {
             module_id: module.module_id(),
             source_len: module.source().len(),
             pending: VecDeque::new(),
+            last_token_kind: None,
             emitted_eof: false,
         }
     }
@@ -383,6 +385,9 @@ impl Iterator for Lexer<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(item) = self.pending.pop_front() {
+            if let Ok(token) = item {
+                self.last_token_kind = Some(token.kind);
+            }
             return Some(item);
         }
         if let Some((result, logos_span)) = self.inner.next() {
@@ -395,10 +400,39 @@ impl Iterator for Lexer<'_> {
                     logos_span.start,
                     logos_span.end,
                 ));
-                return self.pending.pop_front();
+                let item = self.pending.pop_front();
+                if let Some(Ok(token)) = item {
+                    self.last_token_kind = Some(token.kind);
+                }
+                return item;
             }
 
-            return Some(match result {
+            if matches!(result, Ok(RawTokenKind::FloatLiteral))
+                && self.last_token_kind == Some(TokenKind::Dot)
+            {
+                let text = &self.source[logos_span.clone()];
+                if !text.bytes().any(|byte| matches!(byte, b'e' | b'E'))
+                    && let Some(relative_dot) = text.find('.')
+                {
+                    let dot = logos_span.start + relative_dot;
+                    let first = Token::new(
+                        TokenKind::IntegerLiteral,
+                        Span::new(self.module_id, logos_span.start, dot),
+                    );
+                    self.pending.push_back(Ok(Token::new(
+                        TokenKind::Dot,
+                        Span::new(self.module_id, dot, dot + 1),
+                    )));
+                    self.pending.push_back(Ok(Token::new(
+                        TokenKind::IntegerLiteral,
+                        Span::new(self.module_id, dot + 1, logos_span.end),
+                    )));
+                    self.last_token_kind = Some(first.kind);
+                    return Some(Ok(first));
+                }
+            }
+
+            let item = match result {
                 Ok(kind) => Ok(Token::new(kind.into(), token_span)),
                 Err(error) => {
                     let error_span = error.relative_span.map_or(token_span, |relative| {
@@ -414,7 +448,11 @@ impl Iterator for Lexer<'_> {
                         span: error_span,
                     })
                 }
-            });
+            };
+            if let Ok(token) = item {
+                self.last_token_kind = Some(token.kind);
+            }
+            return Some(item);
         }
 
         if self.emitted_eof {
@@ -422,10 +460,12 @@ impl Iterator for Lexer<'_> {
         }
 
         self.emitted_eof = true;
-        Some(Ok(Token::new(
+        let token = Token::new(
             TokenKind::Eof,
             Span::new(self.module_id, self.source_len, self.source_len),
-        )))
+        );
+        self.last_token_kind = Some(token.kind);
+        Some(Ok(token))
     }
 }
 
@@ -1325,6 +1365,35 @@ mod tests {
                 TokenKind::Dot,
                 TokenKind::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn distinguishes_consecutive_numeric_members_from_decimal_numbers() {
+        let source = "value.0.12 0.12 value.0.12e3";
+        let module = module(source);
+        let tokens = lex(&module).expect("numeric members should lex successfully");
+        assert_eq!(
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Dot,
+                TokenKind::IntegerLiteral,
+                TokenKind::Dot,
+                TokenKind::IntegerLiteral,
+                TokenKind::FloatLiteral,
+                TokenKind::Identifier,
+                TokenKind::Dot,
+                TokenKind::FloatLiteral,
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            tokens[..5]
+                .iter()
+                .map(|token| token.text(&module))
+                .collect::<Vec<_>>(),
+            vec!["value", ".", "0", ".", "12"]
         );
     }
 

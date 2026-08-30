@@ -353,6 +353,8 @@ struct Place {
 enum ResolvedMember {
     /// A source or construction field mapped to its declared field identity.
     Field { declaration: NodeId },
+    /// A zero-based tuple element selected by a numeric field designator.
+    TupleElement { index: usize },
     /// A receiverless function selected through `Type::function`.
     AssociatedFunction { declaration: NodeId },
     /// A method invoked directly through a value. Methods are never emitted as
@@ -544,6 +546,13 @@ enum ExpressionCheckingErrorKind {
     UnknownMember,
     InvalidMemberOwner {
         found: TypeId,
+    },
+    InvalidTupleElementOwner {
+        found: TypeId,
+    },
+    TupleElementOutOfRange {
+        index: usize,
+        arity: usize,
     },
     FieldRequiresValue,
     AssociatedFunctionRequiresType,
@@ -4620,6 +4629,18 @@ impl<'semantic> Analyzer<'semantic> {
                 category: ValueCategory::GcReference,
             });
         }
+        if matches!(semantic, SemanticType::Tuple { .. })
+            && self.contains_non_escaping_erased_view(source.type_id)
+        {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidGcAllocationSource {
+                    found: source.type_id,
+                    category: source.category,
+                },
+                span: value.span,
+            });
+            return Some(self.recovery_temporary());
+        }
         if source.category != ValueCategory::FreshTemporary {
             self.checking.errors.push(ExpressionCheckingError {
                 kind: ExpressionCheckingErrorKind::InvalidGcAllocationSource {
@@ -5026,11 +5047,32 @@ impl<'semantic> Analyzer<'semantic> {
         if self.is_recovery(typed_object.type_id) {
             return Some(self.recovery_temporary());
         }
+        let member_text = self
+            .module
+            .text(member)
+            .expect("member name belongs to the source module")
+            .to_string();
+        if member_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Some(self.synthesize_tuple_element_access(
+                expression,
+                typed_object,
+                member,
+                &member_text,
+            ));
+        }
+        if self.tuple_parts(typed_object.type_id).is_some() {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: if member_text == "copy" {
+                    ExpressionCheckingErrorKind::CopyRequiresCall
+                } else {
+                    ExpressionCheckingErrorKind::UnknownMember
+                },
+                span: member,
+            });
+            return Some(self.recovery_temporary());
+        }
         if let Some((sequence, _, _)) = self.sequence_parts(typed_object.type_id) {
-            let name = self
-                .module
-                .text(member)
-                .expect("sequence member name belongs to the source module");
+            let name = &member_text;
             let primitive = match sequence {
                 SequenceKind::String => PrimitiveType::String,
                 SequenceKind::Bytes => PrimitiveType::Bytes,
@@ -5181,6 +5223,76 @@ impl<'semantic> Analyzer<'semantic> {
                 });
                 Some(self.recovery_temporary())
             }
+        }
+    }
+
+    /// Selects one statically known tuple element and records it as an
+    /// ordinary place. Tuple fields are numeric syntax rather than dynamic
+    /// indices, so no runtime bounds check or common element type is needed.
+    fn synthesize_tuple_element_access(
+        &mut self,
+        expression: &Expression,
+        typed_object: TypedExpression,
+        member: Span,
+        member_text: &str,
+    ) -> TypedExpression {
+        let Some((elements, object_capability, is_gc)) =
+            self.tuple_parts(typed_object.type_id)
+        else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidTupleElementOwner {
+                    found: typed_object.type_id,
+                },
+                span: member,
+            });
+            return self.recovery_temporary();
+        };
+        let index = member_text.parse::<usize>().unwrap_or(usize::MAX);
+        let Some(declared) = elements.get(index).copied() else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::TupleElementOutOfRange {
+                    index,
+                    arity: elements.len(),
+                },
+                span: member,
+            });
+            return self.recovery_temporary();
+        };
+        let object_capability =
+            if !is_gc && typed_object.category == ValueCategory::FreshTemporary {
+                AccessCapability::Mut
+            } else {
+                object_capability
+            };
+        let declared_type_id = self.field_access_type(declared, object_capability);
+        let category = self.field_category(typed_object, declared_type_id);
+        let capability = self
+            .types
+            .types()
+            .get(declared_type_id)
+            .and_then(SemanticType::capability)
+            .expect("tuple element type has a value capability");
+        self.checking.places.insert(
+            expression.id,
+            Place {
+                symbol: None,
+                declared_type_id,
+                type_id: declared_type_id,
+                category,
+                binding_mutability: None,
+                value_capability: match capability {
+                    AccessCapability::Const => ValueCapability::Const,
+                    AccessCapability::Mut => ValueCapability::Mut,
+                },
+            },
+        );
+        self.checking.resolved_members.insert(
+            expression.id,
+            ResolvedMember::TupleElement { index },
+        );
+        TypedExpression {
+            type_id: declared_type_id,
+            category,
         }
     }
 
@@ -5412,6 +5524,28 @@ impl<'semantic> Analyzer<'semantic> {
                     })
                     .map(|signature| signature.type_id)
             })
+    }
+
+    /// Peels a plain or GC-qualified tuple. Elements retain their declared
+    /// canonical identities; the returned capability is the effective access
+    /// to the tuple payload, and the flag distinguishes GC-backed storage.
+    fn tuple_parts(
+        &self,
+        type_id: TypeId,
+    ) -> Option<(Vec<TypeId>, AccessCapability, bool)> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Tuple {
+                elements,
+                capability,
+            } => Some((elements.clone(), *capability, false)),
+            SemanticType::Gc { target, capability } => {
+                let SemanticType::Tuple { elements, .. } = self.types.types().get(*target)? else {
+                    return None;
+                };
+                Some((elements.clone(), *capability, true))
+            }
+            _ => None,
+        }
     }
 
     /// Peels a plain or GC-qualified string/byte sequence. The capability is
@@ -6650,6 +6784,58 @@ impl<'semantic> Analyzer<'semantic> {
                 arguments,
             ));
         }
+        if let Some((elements, _, _)) = self.tuple_parts(typed_object.type_id) {
+            if name.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            if name != "copy" {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::UnknownMember,
+                    span: *member,
+                });
+                for argument in arguments {
+                    let _ = self.synthesize(argument);
+                }
+                return Some(Some(self.recovery_temporary()));
+            }
+            let valid_arity = arguments.is_empty();
+            if !valid_arity {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                        expected: 0,
+                        found: arguments.len(),
+                    },
+                    span: call.span,
+                });
+            }
+            let mut all_supported = true;
+            for argument in arguments {
+                all_supported &= self.synthesize(argument).is_some();
+            }
+            if !all_supported {
+                return Some(None);
+            }
+            self.checking.resolved_members.insert(
+                callee.id,
+                ResolvedMember::Copy {
+                    source_type: typed_object.type_id,
+                },
+            );
+            if !valid_arity {
+                return Some(Some(self.recovery_temporary()));
+            }
+            self.checking
+                .transfers
+                .insert(object.id, ValueTransfer::RecursiveCopy);
+            let type_id = self
+                .types
+                .types_mut()
+                .tuple(elements, AccessCapability::Mut);
+            return Some(Some(TypedExpression {
+                type_id,
+                category: ValueCategory::FreshTemporary,
+            }));
+        }
         let aggregate = self.aggregate_parts(typed_object.type_id);
         if aggregate.is_none() {
             if self.interface_destination(typed_object.type_id).is_some() {
@@ -7695,6 +7881,11 @@ impl<'semantic> Analyzer<'semantic> {
                     self.inline_aggregate_dependencies(*member, dependencies, visited);
                 }
             }
+            Some(SemanticType::Tuple { elements, .. }) => {
+                for element in elements {
+                    self.inline_aggregate_dependencies(*element, dependencies, visited);
+                }
+            }
             Some(SemanticType::Builtin {
                 builtin: BuiltinType::Error,
                 arguments,
@@ -7707,7 +7898,6 @@ impl<'semantic> Analyzer<'semantic> {
             Some(
                 SemanticType::Gc { .. }
                 | SemanticType::Primitive { .. }
-                | SemanticType::Tuple { .. }
                 | SemanticType::Callable { .. }
                 | SemanticType::Interface { .. }
                 | SemanticType::TemplateParameter { .. }
@@ -7824,9 +8014,11 @@ impl<'semantic> Analyzer<'semantic> {
             Some(SemanticType::Union { members, .. }) => members
                 .iter()
                 .any(|member| self.contains_non_escaping_erased_view(*member)),
+            Some(SemanticType::Tuple { elements, .. }) => elements
+                .iter()
+                .any(|element| self.contains_non_escaping_erased_view(*element)),
             Some(SemanticType::Gc { .. }
             | SemanticType::Primitive { .. }
-            | SemanticType::Tuple { .. }
             | SemanticType::NamedStruct { .. }
             | SemanticType::GeneratedStruct { .. }
             | SemanticType::AnonymousStruct { .. }
@@ -9533,6 +9725,167 @@ mod tests {
             checking.transfers[&fresh_leaf.id],
             ValueTransfer::MoveTemporary
         );
+    }
+
+    #[test]
+    fn resolves_tuple_elements_as_capability_checked_places() {
+        let source = concat!(
+            "struct Leaf { value: int, }\n",
+            "fn inspect(const vmut pair: (int, Leaf), readonly: (int, Leaf), const vmut heap: &mut (int, Leaf)) {\n",
+            "    pair.0 = 2;\n",
+            "    pair.0 += 3;\n",
+            "    pair.1 = Leaf { value: 4 };\n",
+            "    heap.0 = 5;\n",
+            "    const first = pair.0;\n",
+            "    readonly.0 = 6;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ImmutableValue
+        );
+
+        let inspect = function(&program.declarations[1]);
+        for statement in &inspect.body.statements[..4] {
+            let assignment = expression(statement);
+            let ExpressionKind::Assignment { target, .. } = &assignment.kind else {
+                panic!("expected tuple element assignment")
+            };
+            assert!(matches!(
+                checking.resolved_members[&target.id],
+                ResolvedMember::TupleElement { .. }
+            ));
+            assert_eq!(
+                checking.places[&target.id].value_capability,
+                ValueCapability::Mut
+            );
+        }
+        let first = binding_initializer(&inspect.body.statements[4]);
+        assert!(matches!(
+            checking.resolved_members[&first.id],
+            ResolvedMember::TupleElement { index: 0 }
+        ));
+        assert_eq!(checking.places[&first.id].category, ValueCategory::BorrowedPlace);
+        let invalid = expression(&inspect.body.statements[5]);
+        let ExpressionKind::Assignment { target, .. } = &invalid.kind else {
+            panic!("expected rejected tuple element assignment")
+        };
+        assert_eq!(
+            checking.places[&target.id].value_capability,
+            ValueCapability::Const
+        );
+    }
+
+    #[test]
+    fn copies_and_gc_allocates_tuples_with_recursive_storage_semantics() {
+        let source = concat!(
+            "struct Leaf { value: int, }\n",
+            "fn duplicate(value: (int, Leaf)) -> (int, Leaf) { value.copy() }\n",
+            "fn inspect(value: (int, Leaf)) {\n",
+            "    const copied = value.copy();\n",
+            "    const managed = &(1, Leaf { value: 2 });\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let duplicate = body_value(function(&program.declarations[1]));
+        let (duplicate_callee, _) = call(duplicate);
+        let ExpressionKind::MemberAccess {
+            object: duplicate_source,
+            ..
+        } = &duplicate_callee.kind
+        else {
+            panic!("expected tuple copy member")
+        };
+        assert!(matches!(
+            checking.resolved_members[&duplicate_callee.id],
+            ResolvedMember::Copy { .. }
+        ));
+        assert_eq!(
+            checking.transfers[&duplicate_source.id],
+            ValueTransfer::RecursiveCopy
+        );
+        assert_eq!(checking.transfers[&duplicate.id], ValueTransfer::MoveTemporary);
+
+        let inspect = function(&program.declarations[2]);
+        let copied = binding_initializer(&inspect.body.statements[0]);
+        let (copy_callee, _) = call(copied);
+        let ExpressionKind::MemberAccess {
+            object: copy_source,
+            ..
+        } = &copy_callee.kind
+        else {
+            panic!("expected tuple copy member")
+        };
+        assert_eq!(checking.transfers[&copy_source.id], ValueTransfer::RecursiveCopy);
+        let managed = binding_initializer(&inspect.body.statements[1]);
+        let allocated = gc(managed);
+        assert_eq!(checking.transfers[&allocated.id], ValueTransfer::AllocateGc);
+        assert!(matches!(
+            types.types().get(checking.expressions[&managed.id].type_id),
+            Some(SemanticType::Gc { target, .. })
+                if matches!(types.types().get(*target), Some(SemanticType::Tuple { .. }))
+        ));
+    }
+
+    #[test]
+    fn diagnoses_invalid_tuple_fields_members_escapes_and_recursive_layouts() {
+        let source = concat!(
+            "struct Recursive { nested: (Recursive,), }\n",
+            "fn invalid_return(value: (fn() -> int,)) -> (fn() -> int,) { value }\n",
+            "fn inspect(number: int, pair: (int, int)) {\n",
+            "    number.0;\n",
+            "    pair.2;\n",
+            "    pair.missing;\n",
+            "    pair.copy(1);\n",
+            "    (1, 2) == (1, 2);\n",
+            "    const invalid_gc = &(lambda() { number; },);\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.iter().any(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::InfiniteInlineLayout { .. }
+        )));
+        assert!(checking.errors.iter().any(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::InvalidTupleElementOwner { .. }
+        )));
+        assert!(checking.errors.iter().any(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::TupleElementOutOfRange { index: 2, arity: 2 }
+        )));
+        assert!(checking.errors.iter().any(|error| {
+            error.kind == ExpressionCheckingErrorKind::UnknownMember
+        }));
+        assert!(checking.errors.iter().any(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 0,
+                found: 1,
+            }
+        )));
+        assert!(checking.errors.iter().any(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::InvalidBinaryOperand { .. }
+        )));
+        assert!(checking.errors.iter().any(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::InvalidGcAllocationSource { .. }
+        )));
+        assert!(checking.errors.iter().any(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::InvalidReturnSource { .. }
+        )));
     }
 
     #[test]
