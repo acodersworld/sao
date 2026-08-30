@@ -398,7 +398,56 @@ reviewable phases:
      - Compile-time values other than types, arbitrary compile-time execution,
        generic inference, first-class template values, local templates, and
        compile-time duck typing remain deferred.
-   - Phase 7.5, tracked non-GC references and lifetime links (pending):
+   - Phase 7.5, tuple types and values (pending):
+     - Change 1, grammar, AST, and canonical structural types:
+       - Parse comma-bearing parenthesized type and value forms as ordered tuples,
+         while preserving `()` as unit and single non-comma expressions and types
+         as grouping. Require the comma in singleton tuples and permit a trailing
+         comma at larger arities.
+       - Add tuple syntax and expression nodes plus canonical semantic tuple
+         identities defined by ordered element types. Treat tuples as compiler-
+         native structural aggregates rather than reserved parameterized
+         built-ins.
+       - Stop for review and commit before implementing tuple construction.
+     - Change 2, literal checking and owning transfers:
+       - Infer tuple literal elements independently when no tuple type is expected.
+         Under an expected tuple type, require matching arity and check each
+         element contextually from left to right.
+       - Do not convert existing tuples element by element. Require exact ordered
+         element-type shape apart from outer capability reduction, and require
+         explicit tuple reconstruction when an element type changes.
+       - Give tuple elements the owning-transfer rules of inline struct fields and
+         give whole tuples object-like aggregate behavior: fresh tuples move,
+         named tuples borrow, named returns copy recursively, and independent
+         storage uses `.copy()`.
+       - Stop for review and commit before implementing tuple places and storage
+         integration.
+     - Change 3, numeric places, capability, copying, GC, escape, and layout:
+       - Resolve `.0`, `.1`, and later numeric fields as compile-time tuple element
+         places. Diagnose non-tuple owners and out-of-range fields; do not add
+         dynamic indexing or slicing.
+       - Apply transitive outer capability to inline elements, support ordinary
+         element assignment rules, and provide only the compiler-defined `.copy()`
+         named member. Do not add tuple equality, ordering, or interface methods.
+       - Integrate tuples with recursive copy and return metadata, explicit GC
+         allocation, tracing and cleanup, finite inline-layout validation, and
+         propagation of non-escaping interface or capturing-callable elements.
+       - Stop for review and commit before full type-system integration.
+     - Change 4, integration and completion:
+       - Integrate tuple types with aliases, type factories, explicit template
+         specialization, callable signatures, union injection and narrowing, and
+         legal compiler-known built-in arguments.
+       - Add deterministic diagnostics and focused tests for unit and grouping
+         distinctions, singleton and nested tuples, trailing commas, inference,
+         contextual elements, explicit reconstruction, evaluation order, numeric
+         places, mutation, owning transfers, `.copy()`, GC storage, non-escaping
+         elements, recursive layouts, unions, templates, and recovery. Update the
+         complex-program test to exercise the complete feature.
+       - Update language design and implementation-status documentation, then mark
+         Phase 7.5 complete. Keep destructuring, iteration, spreads, variadics,
+         named elements, tuple operators, and tuple-specific library operations
+         deferred.
+   - Phase 7.6, tracked non-GC references and lifetime links (pending):
      - Change 1, syntax and canonical types:
        - Add `*T` as a first-class tracked borrowed-reference type. It describes
          a lifetime relationship, not a raw pointer or a distinct argument-passing
@@ -450,8 +499,9 @@ reviewable phases:
        - Stop for review and commit before implementing borrow-containing
          aggregates.
      - Change 4, borrow-containing aggregates:
-       - Permit plain, stack-resident structs to contain `*T` fields. Such a value
-         transitively carries the intersection of the lifetimes of all tracked
+       - Permit plain, stack-resident structs and tuples to contain `*T` fields or
+         elements. Such a value transitively carries the intersection of the
+         lifetimes of all tracked
          references stored within it. A type containing a tracked reference,
          directly or through another inline aggregate or union, cannot be heap
          allocated: reject GC allocation, GC fields, and storage in external-
@@ -487,8 +537,8 @@ reviewable phases:
          plain and GC coercions, GC rooting, invalid local and temporary returns,
          flow joins, shadowing, mutation and rebinding, recovery, and callable
          composition. Update the complex-program test with direct, receiver-
-         derived, multi-input, and GC-backed tracked references.
-   - Phase 7.6, remaining built-ins and completion (pending):
+         derived, multi-input, tuple-contained, and GC-backed tracked references.
+   - Phase 7.7, remaining built-ins and completion (pending):
      - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
        `yield`, `co`, and `defer`.
    - Aggregate deterministic diagnostics and expose successful semantic
