@@ -101,10 +101,10 @@ Functions are declared directly in the struct body alongside its fields. SAO
 has no separate `impl` block and does not attach functions to a struct after its
 definition. This keeps a type's complete function set local to its declaration.
 
-A struct function whose first parameter is `self` or `mut self` is an instance
-method. A receiverless struct function is instead associated with the named
-type. When present, the receiver must occur exactly once and must be the first
-parameter:
+A struct function whose first parameter is one of the receiver forms `self`,
+`mut self`, `&self`, `&mut self`, `*self`, or `*mut self` is an instance method.
+A receiverless struct function is instead associated with the named type. When
+present, the receiver must occur exactly once and must be the first parameter:
 
 ```text
 struct Position {
@@ -185,3 +185,8 @@ signature and participates in interface matching.
 An `&self` or `&mut self` receiver additionally requires independently
 GC-managed storage and permits the method to retain the receiver. GC
 escapability is part of method signatures and interface matching.
+
+A `*self` or `*mut self` receiver is a tracked non-owning view. It can
+contribute its caller-side storage lifetime to a tracked result as specified in
+Chapter 21. Tracked receiver storage is also part of method signatures and
+interface matching.

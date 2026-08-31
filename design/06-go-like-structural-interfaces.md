@@ -13,11 +13,12 @@ interface when it has the required method set with compatible signatures. No
 explicit `implements` declaration is required.
 
 Every interface function requirement must declare `self`, `mut self`, `&self`,
-or `&mut self` as its first parameter. The GC-qualified receiver forms permit
-retention and are distinct signature requirements. Interfaces describe
-behaviour of values and cannot require or expose receiverless associated
-functions. A named struct's associated functions therefore do not participate
-in interface satisfaction.
+`&mut self`, `*self`, or `*mut self` as its first parameter. The GC-qualified
+receiver forms permit retention, while tracked receiver forms participate in
+tracked result lifetime links. Each storage form is a distinct signature
+requirement. Interfaces describe behaviour of values and cannot require or
+expose receiverless associated functions. A named struct's associated
+functions therefore do not participate in interface satisfaction.
 
 When an expression is expected to have an interface or interface-intersection
 type, a satisfying named or anonymous struct value is implicitly exposed
@@ -74,6 +75,7 @@ Each method has a canonical method identity derived from:
 
 - Its name.
 - Whether its receiver is const or `mut`.
+- Whether its receiver storage is plain, GC-owned, or tracked.
 - Its ordered parameter types and access capabilities.
 - Its return type and access capability.
 

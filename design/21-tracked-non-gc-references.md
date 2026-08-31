@@ -61,7 +61,33 @@ not receive this exception, and `*T` never supplies an `&T` parameter.
 Borrow-containing unions and aggregates remain deferred until their transitive
 origin rules are implemented.
 
-## 21.4 Current implementation boundary
+## 21.4 Callable lifetime links
+
+A callable which returns `*T` links that result to every tracked parameter in
+its signature. At each call site, the result carries the intersection of the
+physical lifetimes supplied for those parameters. Plain and GC-backed values
+may form the tracked arguments locally, but ordinary plain aggregate parameters
+and declared `&T` parameters never contribute merely because their values are
+borrowable inside the callable.
+
+`*self` and `*mut self` are the tracked receiver forms. They contribute to a
+tracked method result exactly like a named tracked parameter. Plain `self`
+remains a call-scoped receiver and `&self` remains GC-owned; neither can be the
+origin of an escaping tracked result.
+
+Every tracked return expression must derive exclusively from tracked parameters
+or a tracked receiver, possibly through stable inline field and tuple paths or
+through another linked call. Locals, ordinary parameters, GC parameters, and
+fresh plain or GC temporaries are invalid return origins. The signature-level
+link is deliberately conservative: all tracked inputs contribute even when the
+implementation's returned path uses only one of them.
+
+A linked result cannot escape a complete expression when any contributing
+caller-side input is temporary. Calls may still borrow such an input when their
+tracked result is consumed without escaping. No hidden storage or temporary
+lifetime extension is introduced.
+
+## 21.5 Current implementation boundary
 
 The frontend currently parses, names, formats, resolves, interns, compares,
 capability-qualifies, and template-substitutes tracked-reference types. Its
@@ -70,8 +96,7 @@ erased borrowed-view, and GC storage. Expression checking forms tracked borrows,
 automatically dereferences them for member access, and records physical place
 provenance.
 
-Callable lifetime links, borrow-containing aggregates and unions,
-flow-sensitive validity, and GC-owner rooting remain later Phase 7.6 work.
-Tracked results therefore cannot yet be returned successfully. Direct tracked
-bindings and reference-slot assignments reject temporary sources now; escape
-through returned call results is checked with callable lifetime links next.
+Callable lifetime links, tracked receivers, tracked-return origin validation,
+and caller-side temporary escape checks are implemented. Borrow-containing
+aggregates and unions, flow-sensitive validity, and GC-owner rooting remain
+later Phase 7.6 work.

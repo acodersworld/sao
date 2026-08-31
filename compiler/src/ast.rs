@@ -383,12 +383,12 @@ pub enum FunctionParameterKind {
         name: Span,
         constraint: ComptimeParameterConstraint,
     },
-    /// A method receiver written as `self`, `mut self`, `&self`, or
-    /// `&mut self`.
+    /// A method receiver written as `self`, `mut self`, `&self`, `&mut self`,
+    /// `*self`, or `*mut self`.
     Receiver {
         name: Span,
-        /// Whether the receiver is a non-escaping view or requires
-        /// independently GC-managed storage and may be retained.
+        /// Whether the receiver is a call-scoped view, requires independently
+        /// GC-managed storage, or carries a tracked caller-owned lifetime.
         storage: ReceiverStorage,
     },
 }
@@ -428,6 +428,7 @@ pub enum InterfaceConstraint {
 pub enum ReceiverStorage {
     Plain,
     Gc,
+    Tracked,
 }
 
 /// The syntax accepted after an `else` keyword.

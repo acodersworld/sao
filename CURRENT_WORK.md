@@ -508,35 +508,45 @@ reviewable phases:
          never increase it. Track the physical source storage and field path.
        - Stop for review and commit before implementing callable lifetime links.
      - Change 3, callable lifetime links:
-       - Link a returned `*T` to every `*` parameter of the callable. At a call,
+       - Complete: link a returned `*T` to every `*` parameter of the callable.
+         At a call,
          the result receives the intersection (shortest remaining lifetime) of
          all tracked arguments. Non-`*` parameters do not contribute, even though
          plain aggregate parameters are passed by reference. This deliberately
          conservative rule avoids named lifetime parameters; a later feature may
          permit declaring a smaller contributing set if necessary.
-       - Support `*self` as the tracked receiver form. It participates in the
+       - Complete: support `*self` and `*mut self` as tracked receiver forms.
+         They participate in the
          returned lifetime exactly like a named `*T` parameter, allowing methods
          to return references derived from stable inline receiver fields. An
          ordinary `self` receiver remains call-scoped and cannot supply an
          escaping tracked result.
-       - Require every returned tracked reference to derive from at least one
+       - Complete: require every returned tracked reference to derive from at
+         least one
          tracked parameter, through any number of stable inline fields. Reject
          references derived from ordinary parameters, GC parameters declared as
          `&T`, locals, fresh temporaries, or other callable-owned storage. For
          example, `fn inner(input: &Input) -> *Inner { input.inner }` is invalid,
          while `fn inner(input: *Input, other: Input) -> *Inner { input.inner }`
          is valid and links the result only to `input`.
-       - Allow a caller's `T` or `&T` value to satisfy a `*T` parameter. Propagate
+       - Complete: allow a caller's `T` or `&T` value to satisfy a `*T`
+         parameter. Propagate
          the caller-side storage lifetime through the result. Do not treat an
          `&T` parameter as an implicit return-lifetime source merely because its
          value can be borrowed locally as `*T`.
-       - Do not extend temporary lifetimes to make an escaping tracked reference
+       - Complete: do not extend temporary lifetimes to make an escaping tracked
+         reference
          valid. A temporary may be borrowed for the duration of a call, but a
          tracked result derived from it cannot escape the complete expression;
          therefore `const inner = project(Item {});` is invalid when `project`
          returns a reference into its argument. Apply the same rule to temporary
          GC allocations rather than creating hidden lifetime-extending storage.
-       - Stop for review and commit before implementing borrow-containing
+       - Complete: add focused parser and expression-analysis coverage for
+         tracked receivers, conservative multi-parameter links, valid stable
+         returns, invalid callable-owned origins, and caller-side plain/GC
+         temporary escapes.
+       - Implementation and documentation ready for review. Stop for review
+         and commit before implementing borrow-containing
          aggregates.
      - Change 4, borrow-containing aggregates:
        - Permit plain, stack-resident structs and tuples to contain `*T` fields or

@@ -172,9 +172,13 @@ field/tuple paths. Direct tracked bindings and reference-slot assignments reject
 plain and GC temporary sources, while a non-escaping call may borrow one.
 There is no general `*T` into `T` or `&T` conversion; a `*T` argument may supply
 the existing address for a plain by-reference aggregate parameter `T`, but not
-for a binding, field, return, or GC parameter.
-Callable lifetime links, borrow-containing aggregates and unions,
-flow-sensitive validity, and GC-owner rooting are not yet implemented.
+for a binding, field, return, or GC parameter. Callables returning a tracked
+reference link it conservatively to every tracked parameter and tracked
+`*self`/`*mut self` receiver. Returned paths must originate exclusively from
+those tracked inputs, and caller-side bindings or reference assignments reject
+linked results whose lifetime intersection includes a plain or GC temporary.
+Borrow-containing aggregates and unions, flow-sensitive validity, and
+GC-owner rooting are not yet implemented.
 
 Declaration and signature collection is implemented for source and generated
 struct fields and functions, callable headers, interface requirements,

@@ -692,6 +692,32 @@ where
             ));
         }
 
+        if allow_receiver && first.kind == TokenKind::Star {
+            let star = self.advance()?;
+            let mutable = if self.current()?.kind == TokenKind::Mut {
+                self.advance()?;
+                true
+            } else {
+                false
+            };
+            let receiver = self.expect(TokenKind::SelfValue)?;
+            return Ok(FunctionParameter::new(
+                BindingQualifiers::new(
+                    BindingMutability::Const,
+                    if mutable {
+                        ValueCapability::Mut
+                    } else {
+                        ValueCapability::Const
+                    },
+                ),
+                FunctionParameterKind::Receiver {
+                    name: receiver.span,
+                    storage: ReceiverStorage::Tracked,
+                },
+                Span::new(self.module_id, star.span.start, receiver.span.end),
+            ));
+        }
+
         let qualifiers = parsed_qualifiers.map_or(
             BindingQualifiers::new(BindingMutability::Const, ValueCapability::Const),
             |parsed| parsed.qualifiers,
@@ -3829,6 +3855,33 @@ mod tests {
                 panic!("expected a receiver");
             };
             assert_eq!(*storage, ReceiverStorage::Gc);
+            assert_eq!(
+                function.parameters[0].qualifiers.value,
+                if mutable {
+                    ValueCapability::Mut
+                } else {
+                    ValueCapability::Const
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parses_tracked_method_receivers() {
+        for (source, mutable) in [
+            ("fn project(*self) {}", false),
+            ("fn project(*mut self) {}", true),
+        ] {
+            let statement =
+                parse_statement_source(source).expect("tracked receiver should parse");
+            let StatementKind::Function(function) = statement.kind else {
+                panic!("expected a function declaration");
+            };
+            let FunctionParameterKind::Receiver { storage, .. } = &function.parameters[0].kind
+            else {
+                panic!("expected a receiver");
+            };
+            assert_eq!(*storage, ReceiverStorage::Tracked);
             assert_eq!(
                 function.parameters[0].qualifiers.value,
                 if mutable {

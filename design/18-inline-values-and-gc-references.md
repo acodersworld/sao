@@ -58,7 +58,8 @@ must cross a GC reference, for example `next: &Node | none`.
 A parameter of plain type `T` is a non-escapable borrowed view. A parameter of
 type `&T` may be retained. A plain `self` or `mut self` receiver follows the
 same non-escaping rule. `&self` and `&mut self` require a GC receiver and allow
-the method to retain it.
+the method to retain it. The tracked `*self` and `*mut self` forms carry a
+caller-owned lifetime into tracked results as specified in Chapter 21.
 
 A plain interface is a borrowed pair of object address and dispatch/type
 metadata. It allows inline values to satisfy interface locals and parameters
