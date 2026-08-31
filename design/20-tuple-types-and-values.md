@@ -170,8 +170,9 @@ const entries: Vector(Entry) = Vector(Entry)::new();
 Tracked references introduced by Phase 7.6 may appear in tuple elements under
 the same rules as tracked-reference fields in other plain aggregates. The tuple
 transitively carries the intersection of their source lifetimes and is rejected
-from GC or external-buffer storage. Mutation, movement, returns, control-flow
-joins, and GC-owner rooting preserve the tracked origins of every element.
+from GC or external-buffer storage. Construction, copying, binding, projection,
+calls, conditionals, and returns preserve the tracked origins of every element.
+Flow-sensitive mutation validity and GC-owner rooting are later Phase 7.6 work.
 
 ## 20.5 Deferred tuple features
 

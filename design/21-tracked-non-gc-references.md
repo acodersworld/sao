@@ -58,8 +58,8 @@ call-only rule is distinct from conversion: because a plain aggregate parameter
 `value: T` is passed by reference, a `*T` argument may supply its existing
 address as that parameter's call-scoped borrow. Bindings, fields, and returns do
 not receive this exception, and `*T` never supplies an `&T` parameter.
-Borrow-containing unions and aggregates remain deferred until their transitive
-origin rules are implemented.
+Plain unions and aggregates may contain tracked references under the transitive
+origin rules in Section 21.5.
 
 ## 21.4 Callable lifetime links
 
@@ -87,7 +87,28 @@ caller-side input is temporary. Calls may still borrow such an input when their
 tracked result is consumed without escaping. No hidden storage or temporary
 lifetime extension is introduced.
 
-## 21.5 Current implementation boundary
+## 21.5 Borrow-containing inline values
+
+A plain struct, tuple, union, or other inline aggregate may contain tracked
+references. The complete value carries the intersection of every origin stored
+within it, including origins nested through other inline aggregates. Constructing,
+copying, binding, projecting, injecting or widening a union, returning, and
+passing such a value preserves that intersection. Projecting one tracked-bearing
+part currently retains the complete aggregate intersection conservatively.
+
+A callable returning a borrow-containing inline value links the result to its
+tracked parameters and to parameters which themselves contain tracked references.
+The latter do not become valid origins for a direct `*T` return: the stricter
+tracked-return rule in Section 21.4 still applies. An inline tracked-bearing
+receiver contributes in the same way when a method propagates an inline value.
+
+Tracked-bearing values cannot cross storage boundaries which could outlive or
+relocate their backing storage. They cannot be GC allocated, nested beneath a GC
+field, or used as an element, key, or value in `Queue`, `Vector`, or `Map`
+external-buffer storage. `Error(T)`, tuples, unions, and plain structs remain
+inline and therefore propagate tracked origins transitively.
+
+## 21.6 Current implementation boundary
 
 The frontend currently parses, names, formats, resolves, interns, compares,
 capability-qualifies, and template-substitutes tracked-reference types. Its
@@ -97,6 +118,6 @@ automatically dereferences them for member access, and records physical place
 provenance.
 
 Callable lifetime links, tracked receivers, tracked-return origin validation,
-and caller-side temporary escape checks are implemented. Borrow-containing
-aggregates and unions, flow-sensitive validity, and GC-owner rooting remain
+caller-side temporary escape checks, and borrow-containing inline aggregates
+and unions are implemented. Flow-sensitive validity and GC-owner rooting remain
 later Phase 7.6 work.

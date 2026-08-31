@@ -177,7 +177,13 @@ reference link it conservatively to every tracked parameter and tracked
 `*self`/`*mut self` receiver. Returned paths must originate exclusively from
 those tracked inputs, and caller-side bindings or reference assignments reject
 linked results whose lifetime intersection includes a plain or GC temporary.
-Borrow-containing aggregates and unions, flow-sensitive validity, and
+Plain structs, tuples, unions, and nested inline values may contain tracked
+references and preserve the full origin intersection through construction,
+bindings, copying, projection, union conversion, calls, and returns. Direct
+tracked returns retain their stricter tracked-parameter rule, while aggregate
+returns may also propagate origins already carried by borrow-containing inputs.
+GC allocation, GC fields, and `Queue`/`Vector`/`Map` external-buffer storage of
+transitively borrow-containing types are rejected. Flow-sensitive validity and
 GC-owner rooting are not yet implemented.
 
 Declaration and signature collection is implemented for source and generated

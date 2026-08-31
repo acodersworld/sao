@@ -66,6 +66,12 @@ an earlier initializer merely by using its field name. Each initializer must be
 assignable to the declared field type and must obey the reference-capability
 rules.
 
+A plain struct field may have tracked-reference type or another inline type
+which transitively contains tracked references. The containing value carries
+the intersection of those origins as described in Chapter 21. Such a type
+cannot be placed behind `&`, used as a GC-valued field payload, or stored in an
+external-buffer collection.
+
 Named struct declarations may refer to themselves and to structs declared later
 in the same program. Recursive and mutually recursive layouts must cross an
 explicit GC reference so that every inline layout is finite:

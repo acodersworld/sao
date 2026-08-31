@@ -194,9 +194,9 @@ struct TrackedParameterBorrow {
     parameter_type: TypeId,
 }
 
-/// The complete set of caller-owned physical places which bound a tracked
-/// call result. Multiple places represent the conservative intersection of
-/// every tracked parameter and tracked receiver accepted by the callable.
+/// The complete set of physical places which bound a tracked reference or an
+/// inline value containing one. Multiple places represent the conservative
+/// intersection carried through aggregates, unions, and callable boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrackedLifetimeLink {
     sources: Vec<PhysicalPlace>,
@@ -331,6 +331,7 @@ enum ContextualAssignment {
     UnionInjection {
         member_type: TypeId,
         interface_view: Option<InterfaceView>,
+        tracked_borrow: Option<(TypeId, TypeId)>,
     },
     /// An existing union needs active-tag remapping into a strict superset.
     UnionWidening(UnionWidening),
@@ -431,6 +432,12 @@ enum ResolvedMember {
 enum SequenceKind {
     String,
     Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BorrowStorageViolation {
+    Gc(TypeId),
+    ExternalBuffer(TypeId),
 }
 
 /// Identifies a compiler-provided sequence operation after type checking has
@@ -570,6 +577,12 @@ enum ExpressionCheckingErrorKind {
     },
     TemporaryTrackedBorrowEscapes,
     InvalidTrackedReturnSource,
+    BorrowContainingGcStorage {
+        found: TypeId,
+    },
+    BorrowContainingExternalBuffer {
+        found: TypeId,
+    },
     NotCallable {
         found: TypeId,
     },
@@ -658,7 +671,12 @@ struct ExpressionChecking {
     tracked_borrows: HashMap<NodeId, TrackedBorrow>,
     tracked_parameter_borrows: HashMap<NodeId, TrackedParameterBorrow>,
     tracked_lifetime_links: HashMap<NodeId, TrackedLifetimeLink>,
+    /// Origins retained by a local reference slot or inline aggregate value.
+    /// Reading the binding restores these rather than treating the slot itself
+    /// as ownership of the referenced storage.
+    tracked_binding_lifetimes: HashMap<SymbolId, TrackedLifetimeLink>,
     tracked_call_inputs: HashMap<NodeId, Vec<PhysicalPlace>>,
+    borrow_containing_call_inputs: HashMap<NodeId, Vec<PhysicalPlace>>,
     /// Stable storage routes for place expressions. Keeping this separate from
     /// `Place` avoids conflating assignment rules with borrow provenance.
     physical_places: HashMap<NodeId, PhysicalPlace>,
@@ -710,6 +728,7 @@ struct GeneratedMethodChecking {
     tracked_borrows: HashMap<NodeId, TrackedBorrow>,
     tracked_parameter_borrows: HashMap<NodeId, TrackedParameterBorrow>,
     tracked_lifetime_links: HashMap<NodeId, TrackedLifetimeLink>,
+    tracked_binding_lifetimes: HashMap<SymbolId, TrackedLifetimeLink>,
     physical_places: HashMap<NodeId, PhysicalPlace>,
     resolved_members: HashMap<NodeId, ResolvedMember>,
     runtime_specialization_calls: HashMap<NodeId, RuntimeCallableSpecializationId>,
@@ -1068,6 +1087,9 @@ struct Analyzer<'semantic> {
     /// Roots permitted to contribute to an escaping tracked result from the
     /// callable currently being checked.
     current_tracked_return_roots: HashSet<PhysicalPlaceRoot>,
+    /// Plain parameters and receivers whose inline values themselves contain
+    /// tracked references may contribute only to an aggregate tracked return.
+    current_borrow_containing_return_roots: HashSet<PhysicalPlaceRoot>,
     current_specialized_owner: Option<TypeId>,
     /// Concrete `T` identities while rechecking one runtime-template body. The
     /// source AST and collected symbolic signature stay immutable.
@@ -1225,6 +1247,7 @@ impl<'semantic> Analyzer<'semantic> {
             current_narrowings: HashMap::new(),
             current_path_reachable: true,
             current_tracked_return_roots: HashSet::new(),
+            current_borrow_containing_return_roots: HashSet::new(),
             current_specialized_owner: None,
             current_template_substitutions: None,
             current_template_syntax_types: None,
@@ -1244,6 +1267,7 @@ impl<'semantic> Analyzer<'semantic> {
         }
         self.visit_generated_struct_methods(program);
         self.validate_finite_inline_layouts();
+        self.validate_borrow_storage_fields();
         self.checking.runtime_specialization_calls = self.runtime_specialization_calls;
         self.checking.runtime_specializations = self.runtime_specializations;
         self.checking
@@ -1333,6 +1357,7 @@ impl<'semantic> Analyzer<'semantic> {
                     tracked_borrows: local_checking.tracked_borrows,
                     tracked_parameter_borrows: local_checking.tracked_parameter_borrows,
                     tracked_lifetime_links: local_checking.tracked_lifetime_links,
+                    tracked_binding_lifetimes: local_checking.tracked_binding_lifetimes,
                     physical_places: local_checking.physical_places,
                     resolved_members: local_checking.resolved_members,
                     runtime_specialization_calls: method_specialization_calls,
@@ -1351,6 +1376,8 @@ impl<'semantic> Analyzer<'semantic> {
         let enclosing_reachability = self.current_path_reachable;
         let enclosing_loops = std::mem::take(&mut self.active_loops);
         let enclosing_tracked_roots = std::mem::take(&mut self.current_tracked_return_roots);
+        let enclosing_borrow_containing_roots =
+            std::mem::take(&mut self.current_borrow_containing_return_roots);
         self.current_path_reachable = true;
         self.seed_callable_parameters(function.id, &function.parameters);
         let signature = self.resolved_callable_signature(function.id);
@@ -1361,12 +1388,20 @@ impl<'semantic> Analyzer<'semantic> {
                     let type_id = semantic_parameters
                         .next()
                         .expect("collected signature must contain every named parameter");
+                    self.validate_borrow_storage_type(type_id, parameter.span);
                     if self.tracked_reference_parts(type_id).is_some() {
                         let symbol = self
                             .names
                             .symbol_for_declaration(parameter.id)
                             .expect("named parameter must have a semantic symbol");
                         self.current_tracked_return_roots
+                            .insert(PhysicalPlaceRoot::Symbol(symbol));
+                    } else if self.type_contains_tracked_reference(type_id) {
+                        let symbol = self
+                            .names
+                            .symbol_for_declaration(parameter.id)
+                            .expect("named parameter must have a semantic symbol");
+                        self.current_borrow_containing_return_roots
                             .insert(PhysicalPlaceRoot::Symbol(symbol));
                     }
                 }
@@ -1376,9 +1411,38 @@ impl<'semantic> Analyzer<'semantic> {
                     self.current_tracked_return_roots
                         .insert(PhysicalPlaceRoot::SelfValue(function.id));
                 }
-                FunctionParameterKind::Receiver { .. }
-                | FunctionParameterKind::Comptime { .. } => {}
+                FunctionParameterKind::Receiver { storage, .. } => {
+                    if *storage == ReceiverStorage::Gc
+                        && self
+                            .method_owners
+                            .get(&function.id)
+                            .copied()
+                            .is_some_and(|owner| self.type_contains_tracked_reference(owner))
+                    {
+                        let owner = self.method_owners[&function.id];
+                        self.checking.errors.push(ExpressionCheckingError {
+                            kind: ExpressionCheckingErrorKind::BorrowContainingGcStorage {
+                                found: owner,
+                            },
+                            span: parameter.span,
+                        });
+                    }
+                }
+                FunctionParameterKind::Comptime { .. } => {}
             }
+        }
+        if let Some(return_syntax) = &function.return_type {
+            self.validate_borrow_storage_type(signature.return_type, return_syntax.span);
+        }
+        if signature.receiver.is_some()
+            && self
+                .method_owners
+                .get(&function.id)
+                .copied()
+                .is_some_and(|owner| self.type_contains_tracked_reference(owner))
+        {
+            self.current_borrow_containing_return_roots
+                .insert(PhysicalPlaceRoot::SelfValue(function.id));
         }
         let return_type = signature.return_type;
         self.visit_callable_body(&function.body, return_type);
@@ -1388,6 +1452,7 @@ impl<'semantic> Analyzer<'semantic> {
         self.current_path_reachable = enclosing_reachability;
         self.active_loops = enclosing_loops;
         self.current_tracked_return_roots = enclosing_tracked_roots;
+        self.current_borrow_containing_return_roots = enclosing_borrow_containing_roots;
     }
 
     /// Makes a named function's or lambda's parameters available while checking
@@ -1449,7 +1514,7 @@ impl<'semantic> Analyzer<'semantic> {
                 if let Some(outcome) = outcome
                     && outcome.explicitly_produces_value
                 {
-                    if self.tracked_reference_parts(expected).is_some()
+                    if self.type_contains_tracked_reference(expected)
                         && !self.validate_tracked_return_source(value)
                     {
                         self.checking.errors.push(ExpressionCheckingError {
@@ -1690,7 +1755,9 @@ impl<'semantic> Analyzer<'semantic> {
             let resolved = self
                 .resolved_type_syntax(id)
                 .expect("binding annotation must have a resolved type");
-            self.with_value_capability(resolved, qualifiers.value)
+            let resolved = self.with_value_capability(resolved, qualifiers.value);
+            self.validate_borrow_storage_type(resolved, statement.span);
+            resolved
         });
         let source = match expected {
             Some(expected) => self.check(initializer, expected),
@@ -1747,6 +1814,15 @@ impl<'semantic> Analyzer<'semantic> {
                 category,
             },
         );
+        let sources = self.tracked_lifetime_sources(initializer);
+        if sources.is_empty() {
+            self.checking.tracked_binding_lifetimes.remove(&symbol);
+        } else {
+            self.checking.tracked_binding_lifetimes.insert(
+                symbol,
+                TrackedLifetimeLink { sources },
+            );
+        }
         self.current_binding_categories.insert(symbol, category);
         Some(source)
     }
@@ -1787,7 +1863,7 @@ impl<'semantic> Analyzer<'semantic> {
         let Some(source) = self.check_with_capability(value, expected, true) else {
             return;
         };
-        if self.tracked_reference_parts(expected).is_some()
+        if self.type_contains_tracked_reference(expected)
             && !self.validate_tracked_return_source(value)
         {
             self.checking.errors.push(ExpressionCheckingError {
@@ -1808,10 +1884,24 @@ impl<'semantic> Analyzer<'semantic> {
 
     fn validate_tracked_return_source(&self, value: &Expression) -> bool {
         let sources = self.tracked_lifetime_sources(value);
+        let aggregate_result = self
+            .checking
+            .expressions
+            .get(&value.id)
+            .is_some_and(|typed| {
+                self.tracked_reference_parts(typed.type_id).is_none()
+                    && self.type_contains_tracked_reference(typed.type_id)
+            });
         !sources.is_empty()
             && sources
                 .iter()
-                .all(|source| self.current_tracked_return_roots.contains(&source.root))
+                .all(|source| {
+                    self.current_tracked_return_roots.contains(&source.root)
+                        || (aggregate_result
+                            && self
+                                .current_borrow_containing_return_roots
+                                .contains(&source.root))
+                })
     }
 
     fn tracked_lifetime_sources(&self, expression: &Expression) -> Vec<PhysicalPlace> {
@@ -1828,7 +1918,7 @@ impl<'semantic> Analyzer<'semantic> {
             .checking
             .expressions
             .get(&expression.id)
-            .is_some_and(|typed| self.tracked_reference_parts(typed.type_id).is_some())
+            .is_some_and(|typed| self.type_contains_tracked_reference(typed.type_id))
             && let Some(place) = self.checking.physical_places.get(&expression.id)
         {
             return vec![place.clone()];
@@ -1854,6 +1944,28 @@ impl<'semantic> Analyzer<'semantic> {
             projections: Vec::new(),
             storage,
         }]
+    }
+
+    fn extend_tracked_lifetime_sources(
+        &self,
+        destination: &mut Vec<PhysicalPlace>,
+        expression: &Expression,
+    ) {
+        for source in self.tracked_lifetime_sources(expression) {
+            if !destination.contains(&source) {
+                destination.push(source);
+            }
+        }
+    }
+
+    fn record_tracked_lifetime_link(&mut self, node: NodeId, sources: Vec<PhysicalPlace>) {
+        if sources.is_empty() {
+            self.checking.tracked_lifetime_links.remove(&node);
+        } else {
+            self.checking
+                .tracked_lifetime_links
+                .insert(node, TrackedLifetimeLink { sources });
+        }
     }
 
     fn record_return_transfer(&mut self, value: &Expression, source: TypedExpression) {
@@ -2630,7 +2742,7 @@ impl<'semantic> Analyzer<'semantic> {
             typed,
             explicitly_produces_value: any_explicit,
         };
-        if self.tracked_reference_parts(outcome.typed.type_id).is_some() {
+        if self.type_contains_tracked_reference(outcome.typed.type_id) {
             let mut sources = Vec::new();
             for (block, branch) in &normally_completing {
                 if branch.explicit_value.is_none() {
@@ -3332,10 +3444,14 @@ impl<'semantic> Analyzer<'semantic> {
                 typed
             }
             ExpressionKind::Tuple { elements } => {
-                self.synthesize_tuple_literal(elements, None)?
+                self.synthesize_tuple_literal(expression, elements, None)?
             }
             ExpressionKind::Block(block) => {
                 let outcome = self.analyze_block(block, None, ConditionalUse::Value, false)?;
+                if let Some(value) = block.value.as_deref() {
+                    let sources = self.tracked_lifetime_sources(value);
+                    self.record_tracked_lifetime_link(expression.id, sources);
+                }
                 self.checking
                     .explicit_values
                     .insert(expression.id, outcome.explicit_value.is_some());
@@ -3476,6 +3592,11 @@ impl<'semantic> Analyzer<'semantic> {
         }
 
         let checked = self.check(value, expected)?;
+        if let Some(place) = self.checking.physical_places.get(&value.id).cloned() {
+            self.checking.physical_places.insert(expression.id, place);
+        }
+        let tracked_sources = self.tracked_lifetime_sources(value);
+        self.record_tracked_lifetime_link(expression.id, tracked_sources);
         let explicitly_produces_value = self.explicitly_produces_value(value);
         self.checking
             .explicit_values
@@ -3863,6 +3984,10 @@ impl<'semantic> Analyzer<'semantic> {
                 } else {
                     outcome.typed
                 };
+            if let Some(value) = block.value.as_deref() {
+                let sources = self.tracked_lifetime_sources(value);
+                self.record_tracked_lifetime_link(expression.id, sources);
+            }
             self.checking.expressions.insert(expression.id, typed);
             self.checking
                 .explicit_values
@@ -3907,7 +4032,7 @@ impl<'semantic> Analyzer<'semantic> {
                 && elements.len() == expected_elements.len()
             {
                 let found =
-                    self.synthesize_tuple_literal(elements, Some(&expected_elements))?;
+                    self.synthesize_tuple_literal(expression, elements, Some(&expected_elements))?;
                 let typed =
                     self.check_typed(expression, expected, found, allow_recursive_copy)?;
                 self.checking.expressions.insert(expression.id, typed);
@@ -3919,6 +4044,19 @@ impl<'semantic> Analyzer<'semantic> {
             && !self.checking.expressions.contains_key(&expression.id)
         {
             let typed = self.check_with_capability(inner, expected, allow_recursive_copy)?;
+            if let Some(place) = self.checking.physical_places.get(&inner.id).cloned() {
+                self.checking.physical_places.insert(expression.id, place);
+            }
+            if let Some(link) = self
+                .checking
+                .tracked_lifetime_links
+                .get(&inner.id)
+                .cloned()
+            {
+                self.checking
+                    .tracked_lifetime_links
+                    .insert(expression.id, link);
+            }
             self.checking.expressions.insert(expression.id, typed);
             let explicitly_produces_value = self.explicitly_produces_value(inner);
             self.checking
@@ -3993,6 +4131,7 @@ impl<'semantic> Analyzer<'semantic> {
     /// structural value and is never converted element by element.
     fn synthesize_tuple_literal(
         &mut self,
+        expression: &Expression,
         elements: &[Expression],
         expected_elements: Option<&[TypeId]>,
     ) -> Option<TypedExpression> {
@@ -4003,6 +4142,7 @@ impl<'semantic> Analyzer<'semantic> {
         let mut element_types = Vec::with_capacity(elements.len());
         let mut valid = true;
         let mut all_supported = true;
+        let mut tracked_sources = Vec::new();
 
         for (index, element) in elements.iter().enumerate() {
             let checked = match expected_elements {
@@ -4021,6 +4161,7 @@ impl<'semantic> Analyzer<'semantic> {
                 continue;
             }
             valid &= self.validate_owning_transfer(element, checked, true);
+            self.extend_tracked_lifetime_sources(&mut tracked_sources, element);
         }
 
         if !all_supported {
@@ -4033,6 +4174,7 @@ impl<'semantic> Analyzer<'semantic> {
             .types
             .types_mut()
             .tuple(element_types, AccessCapability::Mut);
+        self.record_tracked_lifetime_link(expression.id, tracked_sources);
         Some(TypedExpression {
             type_id,
             category: ValueCategory::FreshTemporary,
@@ -4247,17 +4389,13 @@ impl<'semantic> Analyzer<'semantic> {
                 found: found.type_id,
             });
         };
-        let interface_view = match assignment {
-            ContextualAssignment::Exact => None,
-            ContextualAssignment::InterfaceView(view) => Some(view),
-            ContextualAssignment::TrackedBorrow { .. } => {
-                // A union containing a tracked reference transitively carries
-                // its origin. That aggregate propagation belongs to Change 4.
-                return Err(ExpressionCheckingErrorKind::TypeMismatch {
-                    expected,
-                    found: found.type_id,
-                });
-            }
+        let (interface_view, tracked_borrow) = match assignment {
+            ContextualAssignment::Exact => (None, None),
+            ContextualAssignment::InterfaceView(view) => (Some(view), None),
+            ContextualAssignment::TrackedBorrow {
+                source_type,
+                target_type,
+            } => (None, Some((source_type, target_type))),
             ContextualAssignment::UnionInjection { .. }
             | ContextualAssignment::UnionWidening(_) => {
                 unreachable!("a normalized union member is not a destination union")
@@ -4266,6 +4404,7 @@ impl<'semantic> Analyzer<'semantic> {
         Ok(ContextualAssignment::UnionInjection {
             member_type,
             interface_view,
+            tracked_borrow,
         })
     }
 
@@ -4823,6 +4962,7 @@ impl<'semantic> Analyzer<'semantic> {
             ContextualAssignment::UnionInjection {
                 member_type,
                 interface_view,
+                tracked_borrow,
             } => {
                 let borrowed_view = interface_view.is_some()
                     || (found.category == ValueCategory::BorrowedPlace
@@ -4836,6 +4976,9 @@ impl<'semantic> Analyzer<'semantic> {
                             }));
                 if let Some(view) = interface_view {
                     self.checking.interface_views.insert(node, view);
+                }
+                if let Some((source_type, target_type)) = tracked_borrow {
+                    self.record_tracked_borrow(node, found, source_type, target_type);
                 }
                 self.checking.union_injections.insert(
                     node,
@@ -4904,9 +5047,15 @@ impl<'semantic> Analyzer<'semantic> {
         self.checking.tracked_borrows.insert(
             node,
             TrackedBorrow {
-                source,
+                source: source.clone(),
                 source_type,
                 target_type,
+            },
+        );
+        self.checking.tracked_lifetime_links.insert(
+            node,
+            TrackedLifetimeLink {
+                sources: vec![source],
             },
         );
     }
@@ -5140,6 +5289,15 @@ impl<'semantic> Analyzer<'semantic> {
         if matches!(semantic, SemanticType::Recovery | SemanticType::Divergence) {
             return Some(source);
         }
+        if self.type_contains_tracked_reference(source.type_id) {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::BorrowContainingGcStorage {
+                    found: source.type_id,
+                },
+                span: value.span,
+            });
+            return Some(self.recovery_temporary());
+        }
         if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
             self.checking
                 .transfers
@@ -5351,6 +5509,7 @@ impl<'semantic> Analyzer<'semantic> {
         let mut seen = HashSet::new();
         let mut valid = true;
         let mut all_supported = true;
+        let mut tracked_sources = Vec::new();
         for field in fields {
             let name = self
                 .module
@@ -5402,6 +5561,7 @@ impl<'semantic> Analyzer<'semantic> {
                 continue;
             }
             valid &= self.validate_owning_transfer(&field.value, checked, true);
+            self.extend_tracked_lifetime_sources(&mut tracked_sources, &field.value);
         }
 
         for name in signature.field_order() {
@@ -5434,6 +5594,7 @@ impl<'semantic> Analyzer<'semantic> {
             .types_mut()
             .with_capability(signature.type_id, AccessCapability::Mut)
             .expect("named struct type belongs to the program type store");
+        self.record_tracked_lifetime_link(expression.id, tracked_sources);
         Some(TypedExpression {
             type_id,
             category: ValueCategory::FreshTemporary,
@@ -5459,6 +5620,7 @@ impl<'semantic> Analyzer<'semantic> {
         let first_error = self.checking.errors.len();
         let mut layout_fields = Vec::new();
         let mut all_supported = true;
+        let mut tracked_sources = Vec::new();
 
         for member in members {
             let AnonymousStructMember::Field(field) = member else {
@@ -5515,6 +5677,10 @@ impl<'semantic> Analyzer<'semantic> {
             });
             if !self.is_recovery(checked.type_id) {
                 self.validate_owning_transfer(&field.initializer, checked, true);
+                self.extend_tracked_lifetime_sources(
+                    &mut tracked_sources,
+                    &field.initializer,
+                );
             }
         }
 
@@ -5548,6 +5714,7 @@ impl<'semantic> Analyzer<'semantic> {
             .types_mut()
             .with_capability(signature.type_id, AccessCapability::Mut)
             .expect("anonymous struct type belongs to the program type store");
+        self.record_tracked_lifetime_link(expression.id, tracked_sources);
         Some(TypedExpression {
             type_id,
             category: ValueCategory::FreshTemporary,
@@ -5739,6 +5906,7 @@ impl<'semantic> Analyzer<'semantic> {
                     object,
                     expression.id,
                     PhysicalPlaceProjection::Field(field.declaration),
+                    type_id,
                     category,
                 );
                 Some(TypedExpression { type_id, category })
@@ -5838,6 +6006,7 @@ impl<'semantic> Analyzer<'semantic> {
             object,
             expression.id,
             PhysicalPlaceProjection::TupleElement(index),
+            declared_type_id,
             category,
         );
         TypedExpression {
@@ -5867,8 +6036,12 @@ impl<'semantic> Analyzer<'semantic> {
         source: &Expression,
         target: NodeId,
         projection: PhysicalPlaceProjection,
+        target_type: TypeId,
         category: ValueCategory,
     ) {
+        if !self.type_contains_tracked_reference(target_type) {
+            return;
+        }
         let Some(link) = self
             .checking
             .tracked_lifetime_links
@@ -5877,11 +6050,18 @@ impl<'semantic> Analyzer<'semantic> {
         else {
             return;
         };
+        let source_is_tracked_reference = self
+            .checking
+            .expressions
+            .get(&source.id)
+            .is_some_and(|typed| self.tracked_reference_parts(typed.type_id).is_some());
         let sources = link
             .sources
             .into_iter()
             .map(|mut place| {
-                place.projections.push(projection);
+                if source_is_tracked_reference {
+                    place.projections.push(projection);
+                }
                 if category == ValueCategory::GcReference {
                     place.storage = ValueCategory::GcReference;
                 }
@@ -6498,7 +6678,9 @@ impl<'semantic> Analyzer<'semantic> {
             .types()
             .get(source.type_id)
             .expect("owning source type belongs to the program type store");
-        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::TrackedReference) {
+            Some(ValueTransfer::Borrow)
+        } else if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
             Some(ValueTransfer::CopyGcReference)
         } else if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
             Some(ValueTransfer::TrivialCopy)
@@ -6819,6 +7001,15 @@ impl<'semantic> Analyzer<'semantic> {
                 }
                 let (category, transfer) = self.assignment_transfer(checked);
                 self.current_binding_categories.insert(symbol, category);
+                let sources = self.tracked_lifetime_sources(value);
+                if sources.is_empty() {
+                    self.checking.tracked_binding_lifetimes.remove(&symbol);
+                } else {
+                    self.checking.tracked_binding_lifetimes.insert(
+                        symbol,
+                        TrackedLifetimeLink { sources },
+                    );
+                }
                 self.checking.reassigned_bindings.insert(symbol);
                 self.checking.transfers.insert(value.id, transfer);
                 return Some(self.fresh_primitive(PrimitiveType::Unit));
@@ -7375,6 +7566,7 @@ impl<'semantic> Analyzer<'semantic> {
         let mut valid = arguments.len() == parameters.len();
         let mut supported = true;
         let mut tracked_inputs = Vec::new();
+        let mut borrow_containing_inputs = Vec::new();
         for (index, argument) in arguments.iter().enumerate() {
             let Some(expected) = parameters.get(index).copied() else {
                 supported &= self.synthesize(argument).is_some();
@@ -7393,6 +7585,12 @@ impl<'semantic> Analyzer<'semantic> {
                             tracked_inputs.push(source);
                         }
                     }
+                } else if self.type_contains_tracked_reference(expected) {
+                    for source in self.tracked_input_lifetime_sources(argument) {
+                        if !borrow_containing_inputs.contains(&source) {
+                            borrow_containing_inputs.push(source);
+                        }
+                    }
                 }
                 if let Some(transfer) = self.argument_transfer(checked) {
                     self.checking.transfers.insert(argument.id, transfer);
@@ -7402,6 +7600,9 @@ impl<'semantic> Analyzer<'semantic> {
         self.checking
             .tracked_call_inputs
             .insert(call.id, tracked_inputs);
+        self.checking
+            .borrow_containing_call_inputs
+            .insert(call.id, borrow_containing_inputs);
         supported.then_some(valid)
     }
 
@@ -7492,6 +7693,8 @@ impl<'semantic> Analyzer<'semantic> {
                 .types
                 .types_mut()
                 .tuple(elements, AccessCapability::Mut);
+            let sources = self.tracked_lifetime_sources(object);
+            self.record_tracked_lifetime_link(call.id, sources);
             return Some(Some(TypedExpression {
                 type_id,
                 category: ValueCategory::FreshTemporary,
@@ -7552,6 +7755,8 @@ impl<'semantic> Analyzer<'semantic> {
                 .types_mut()
                 .with_capability(plain, AccessCapability::Mut)
                 .expect("copied struct type belongs to the program type store");
+            let sources = self.tracked_lifetime_sources(object);
+            self.record_tracked_lifetime_link(call.id, sources);
             return Some(Some(TypedExpression {
                 type_id,
                 category: ValueCategory::FreshTemporary,
@@ -7665,7 +7870,12 @@ impl<'semantic> Analyzer<'semantic> {
         Some(Some(self.call_result(
             call,
             signature.return_type,
-            (receiver.storage == ReceiverStorage::Tracked).then_some(object),
+            self.receiver_lifetime_source(
+                receiver,
+                object,
+                typed_object.type_id,
+                signature.return_type,
+            ),
         )))
     }
 
@@ -7841,7 +8051,12 @@ impl<'semantic> Analyzer<'semantic> {
         Some(self.call_result(
             call,
             signature.return_type,
-            (receiver.storage == ReceiverStorage::Tracked).then_some(object),
+            self.receiver_lifetime_source(
+                receiver,
+                object,
+                typed_object.type_id,
+                signature.return_type,
+            ),
         ))
     }
 
@@ -8063,6 +8278,7 @@ impl<'semantic> Analyzer<'semantic> {
         let mut valid = arity_matches;
         let mut all_supported = true;
         let mut tracked_inputs = Vec::new();
+        let mut borrow_containing_inputs = Vec::new();
         for (index, argument) in arguments.iter().enumerate() {
             let Some(expected) = parameters.get(index).copied() else {
                 all_supported &= self.synthesize(argument).is_some();
@@ -8082,6 +8298,12 @@ impl<'semantic> Analyzer<'semantic> {
                         tracked_inputs.push(source);
                     }
                 }
+            } else if self.type_contains_tracked_reference(expected) {
+                for source in self.tracked_input_lifetime_sources(argument) {
+                    if !borrow_containing_inputs.contains(&source) {
+                        borrow_containing_inputs.push(source);
+                    }
+                }
             }
             if let Some(transfer) = self.argument_transfer(checked) {
                 self.checking.transfers.insert(argument.id, transfer);
@@ -8090,6 +8312,9 @@ impl<'semantic> Analyzer<'semantic> {
         self.checking
             .tracked_call_inputs
             .insert(call.id, tracked_inputs);
+        self.checking
+            .borrow_containing_call_inputs
+            .insert(call.id, borrow_containing_inputs);
         all_supported.then_some(valid)
     }
 
@@ -8193,15 +8418,20 @@ impl<'semantic> Analyzer<'semantic> {
         })
     }
 
-    /// Gives all successful ordinary calls their declared result type. GC and
-    /// tracked results preserve reference provenance; other results are fresh
-    /// values supplied by the callee's result storage.
+    /// Gives all successful ordinary calls their declared result type. GC,
+    /// tracked, and transitively borrow-containing results preserve their
+    /// storage provenance; other results are fresh callee-supplied values.
     fn call_result(
         &mut self,
         call: &Expression,
         return_type: TypeId,
         tracked_receiver: Option<&Expression>,
     ) -> TypedExpression {
+        if !self.validate_borrow_storage_type(return_type, call.span) {
+            self.checking.tracked_call_inputs.remove(&call.id);
+            self.checking.borrow_containing_call_inputs.remove(&call.id);
+            return self.recovery_temporary();
+        }
         let category = match self
             .types
             .types()
@@ -8212,12 +8442,26 @@ impl<'semantic> Analyzer<'semantic> {
             Some(StorageSemantics::TrackedReference) => ValueCategory::BorrowedPlace,
             _ => ValueCategory::FreshTemporary,
         };
-        if self.tracked_reference_parts(return_type).is_some() {
+        if self.type_contains_tracked_reference(return_type) {
             let mut sources = self
                 .checking
                 .tracked_call_inputs
                 .remove(&call.id)
                 .unwrap_or_default();
+            if self.tracked_reference_parts(return_type).is_none() {
+                for source in self
+                    .checking
+                    .borrow_containing_call_inputs
+                    .remove(&call.id)
+                    .unwrap_or_default()
+                {
+                    if !sources.contains(&source) {
+                        sources.push(source);
+                    }
+                }
+            } else {
+                self.checking.borrow_containing_call_inputs.remove(&call.id);
+            }
             if let Some(receiver) = tracked_receiver {
                 for source in self.tracked_input_lifetime_sources(receiver) {
                     if !sources.contains(&source) {
@@ -8235,11 +8479,28 @@ impl<'semantic> Analyzer<'semantic> {
                 .insert(call.id, TrackedLifetimeLink { sources });
         } else {
             self.checking.tracked_call_inputs.remove(&call.id);
+            self.checking.borrow_containing_call_inputs.remove(&call.id);
         }
         TypedExpression {
             type_id: return_type,
             category,
         }
+    }
+
+    fn receiver_lifetime_source<'expression>(
+        &self,
+        receiver: ReceiverSignature,
+        object: &'expression Expression,
+        object_type: TypeId,
+        return_type: TypeId,
+    ) -> Option<&'expression Expression> {
+        if receiver.storage == ReceiverStorage::Tracked {
+            return Some(object);
+        }
+        (self.tracked_reference_parts(return_type).is_none()
+            && self.type_contains_tracked_reference(return_type)
+            && self.type_contains_tracked_reference(object_type))
+        .then_some(object)
     }
 
     fn primitive_kind(&self, type_id: TypeId) -> Option<PrimitiveType> {
@@ -8464,6 +8725,16 @@ impl<'semantic> Analyzer<'semantic> {
                     storage: category,
                 },
             );
+            if let Some(link) = self
+                .checking
+                .tracked_binding_lifetimes
+                .get(&symbol)
+                .cloned()
+            {
+                self.checking
+                    .tracked_lifetime_links
+                    .insert(expression.id, link);
+            }
             return Some(typed);
         }
         let Some(type_id) = self.signatures.callable_value_type(symbol) else {
@@ -8685,6 +8956,48 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
+    fn validate_borrow_storage_fields(&mut self) {
+        let violations: Vec<_> = self
+            .aggregate_order
+            .iter()
+            .filter_map(|owner| self.aggregate_layouts.get(owner))
+            .flat_map(|layout| layout.fields.iter())
+            .filter_map(|field| {
+                self.borrow_storage_violation(field.type_id)
+                    .map(|violation| (violation, field.span))
+            })
+            .collect();
+        for (violation, span) in violations {
+            self.push_borrow_storage_violation(violation, span);
+        }
+    }
+
+    fn validate_borrow_storage_type(&mut self, type_id: TypeId, span: Span) -> bool {
+        let Some(violation) = self.borrow_storage_violation(type_id) else {
+            return true;
+        };
+        self.push_borrow_storage_violation(violation, span);
+        false
+    }
+
+    fn push_borrow_storage_violation(
+        &mut self,
+        violation: BorrowStorageViolation,
+        span: Span,
+    ) {
+        let kind = match violation {
+            BorrowStorageViolation::Gc(found) => {
+                ExpressionCheckingErrorKind::BorrowContainingGcStorage { found }
+            }
+            BorrowStorageViolation::ExternalBuffer(found) => {
+                ExpressionCheckingErrorKind::BorrowContainingExternalBuffer { found }
+            }
+        };
+        self.checking
+            .errors
+            .push(ExpressionCheckingError { kind, span });
+    }
+
     fn inline_aggregate_dependencies(
         &self,
         type_id: TypeId,
@@ -8875,6 +9188,125 @@ impl<'semantic> Analyzer<'semantic> {
             | SemanticType::Recovery
             | SemanticType::Divergence)
             | None => false,
+        }
+    }
+
+    /// Tracked references contribute lifetimes only through inline storage.
+    /// GC references and external-buffer collections are ownership boundaries,
+    /// while `Error`, unions, tuples, and struct fields remain inline and are
+    /// traversed transitively.
+    fn type_contains_tracked_reference(&self, type_id: TypeId) -> bool {
+        self.type_contains_tracked_reference_inner(type_id, &mut HashSet::new())
+    }
+
+    fn type_contains_tracked_reference_inner(
+        &self,
+        type_id: TypeId,
+        visited: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visited.insert(type_id) {
+            return false;
+        }
+        match self.types.types().get(type_id) {
+            Some(SemanticType::Tracked { .. }) => true,
+            Some(SemanticType::Tuple { elements, .. }
+            | SemanticType::Union {
+                members: elements, ..
+            }) => elements
+                .iter()
+                .any(|element| self.type_contains_tracked_reference_inner(*element, visited)),
+            Some(SemanticType::Builtin {
+                builtin: BuiltinType::Error,
+                arguments,
+                ..
+            }) => arguments
+                .iter()
+                .any(|argument| self.type_contains_tracked_reference_inner(*argument, visited)),
+            Some(
+                SemanticType::NamedStruct { .. }
+                | SemanticType::GeneratedStruct { .. }
+                | SemanticType::AnonymousStruct { .. },
+            ) => self
+                .aggregate_layout_for_type(type_id)
+                .is_some_and(|layout| {
+                    layout.fields.iter().any(|field| {
+                        self.type_contains_tracked_reference_inner(field.type_id, visited)
+                    })
+                }),
+            Some(
+                SemanticType::Gc { .. }
+                | SemanticType::Primitive { .. }
+                | SemanticType::Callable { .. }
+                | SemanticType::Interface { .. }
+                | SemanticType::TemplateParameter { .. }
+                | SemanticType::Builtin { .. }
+                | SemanticType::Intersection { .. }
+                | SemanticType::Recovery
+                | SemanticType::Divergence,
+            )
+            | None => false,
+        }
+    }
+
+    fn aggregate_layout_for_type(&self, type_id: TypeId) -> Option<&AggregateLayout> {
+        self.aggregate_layouts.get(&type_id).or_else(|| {
+            self.aggregate_layouts.values().find(|layout| {
+                self.types.types().has_same_shape(layout.type_id, type_id) == Some(true)
+            })
+        })
+    }
+
+    fn borrow_storage_violation(&self, type_id: TypeId) -> Option<BorrowStorageViolation> {
+        self.borrow_storage_violation_inner(type_id, &mut HashSet::new())
+    }
+
+    fn borrow_storage_violation_inner(
+        &self,
+        type_id: TypeId,
+        visited: &mut HashSet<TypeId>,
+    ) -> Option<BorrowStorageViolation> {
+        if !visited.insert(type_id) {
+            return None;
+        }
+        match self.types.types().get(type_id) {
+            Some(SemanticType::Gc { target, .. })
+                if self.type_contains_tracked_reference(*target) =>
+            {
+                Some(BorrowStorageViolation::Gc(type_id))
+            }
+            Some(SemanticType::Builtin {
+                builtin: BuiltinType::Queue | BuiltinType::Vector | BuiltinType::Map,
+                arguments,
+                ..
+            }) if arguments
+                .iter()
+                .any(|argument| self.type_contains_tracked_reference(*argument)) =>
+            {
+                Some(BorrowStorageViolation::ExternalBuffer(type_id))
+            }
+            Some(SemanticType::Tuple { elements, .. }
+            | SemanticType::Union {
+                members: elements, ..
+            }) => elements.iter().find_map(|element| {
+                self.borrow_storage_violation_inner(*element, visited)
+            }),
+            Some(SemanticType::Builtin {
+                builtin: BuiltinType::Error,
+                arguments,
+                ..
+            }) => arguments.iter().find_map(|argument| {
+                self.borrow_storage_violation_inner(*argument, visited)
+            }),
+            Some(
+                SemanticType::NamedStruct { .. }
+                | SemanticType::GeneratedStruct { .. }
+                | SemanticType::AnonymousStruct { .. },
+            ) => self.aggregate_layout_for_type(type_id).and_then(|layout| {
+                layout.fields.iter().find_map(|field| {
+                    self.borrow_storage_violation_inner(field.type_id, visited)
+                })
+            }),
+            _ => None,
         }
     }
 
@@ -14116,6 +14548,72 @@ fn main() {
             method_sources[0].root,
             PhysicalPlaceRoot::Symbol(_)
         ));
+    }
+
+    #[test]
+    fn propagates_tracked_lifetimes_through_inline_aggregates_and_unions() {
+        let source = concat!(
+            "struct Inner {}\n",
+            "struct Item { inner: Inner, }\n",
+            "struct Holder { reference: *Inner, }\n",
+            "struct InvalidGc { holder: &Holder, }\n",
+            "struct InvalidBuffer { holders: Vector(Holder), }\n",
+            "fn pack(first: *Item, second: *Item) -> (Holder, *Inner) {\n",
+            "    (Holder { reference: first.inner }, second.inner)\n",
+            "}\n",
+            "fn forward(value: (Holder, *Inner)) -> (Holder, *Inner) { value.copy() }\n",
+            "fn main() {\n",
+            "    const first = Item { inner: Inner {} };\n",
+            "    const second = Item { inner: Inner {} };\n",
+            "    const packed = pack(first, second);\n",
+            "    const forwarded = forward(packed);\n",
+            "    const selected: *Inner | int = first.inner;\n",
+            "    const invalid_temporary = pack(Item { inner: Inner {} }, second);\n",
+            "    const invalid_heap = &Holder { reference: first.inner };\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 4, "{:#?}", checking.errors);
+        assert_eq!(
+            checking
+                .errors
+                .iter()
+                .filter(|error| {
+                    error.kind == ExpressionCheckingErrorKind::TemporaryTrackedBorrowEscapes
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            checking
+                .errors
+                .iter()
+                .filter(|error| matches!(
+                    error.kind,
+                    ExpressionCheckingErrorKind::BorrowContainingGcStorage { .. }
+                ))
+                .count(),
+            2
+        );
+        assert!(checking.errors.iter().any(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::BorrowContainingExternalBuffer { .. }
+        )));
+
+        let main = function(&program.declarations[7]);
+        for statement in &main.body.statements[2..5] {
+            let initializer = binding_initializer(statement);
+            let sources = &checking.tracked_lifetime_links[&initializer.id].sources;
+            assert!(!sources.is_empty());
+            assert!(sources
+                .iter()
+                .all(|source| matches!(source.root, PhysicalPlaceRoot::Symbol(_))));
+        }
+        let packed = binding_initializer(&main.body.statements[2]);
+        assert_eq!(checking.tracked_lifetime_links[&packed.id].sources.len(), 2);
+        let forwarded = binding_initializer(&main.body.statements[3]);
+        assert_eq!(checking.tracked_lifetime_links[&forwarded.id].sources.len(), 2);
     }
 
     #[test]

@@ -144,6 +144,12 @@ backend-required padding. Anonymous structs place copied hidden captures after
 their declared fields. Plain values do not carry GC allocation-list or mark
 bookkeeping.
 
+An inline value may contain tracked non-GC references and carries their complete
+lifetime intersection. Such a layout cannot be placed in a GC allocation or an
+external collection buffer, since either boundary could outlive or relocate the
+referenced storage. Plain frame, containing-aggregate, and result-slot storage
+preserves the tracked origins transitively.
+
 A plain callable is a non-escaping code-and-environment view. Its environment is
 owned inline by the creating frame. `&fn(...)` places the callable environment
 in GC storage and may escape. Named functions and non-capturing lambdas use a

@@ -491,7 +491,7 @@ reviewable phases:
         reject escalation.
       - Complete: keep tracked references non-owning through local bindings and
         calls; reject general `*T` to `T`/`&T` conversion. Borrow-containing
-        unions remain deferred to Change 4.
+        unions were completed in Change 4.
       - Complete: add focused expression-checking coverage for plain, mutable,
         GC-backed, and interior-field borrow formation; physical paths;
         automatic member dereferencing; capability rejection; and storage-kind
@@ -545,11 +545,10 @@ reviewable phases:
          tracked receivers, conservative multi-parameter links, valid stable
          returns, invalid callable-owned origins, and caller-side plain/GC
          temporary escapes.
-       - Implementation and documentation ready for review. Stop for review
-         and commit before implementing borrow-containing
-         aggregates.
-     - Change 4, borrow-containing aggregates:
-       - Permit plain, stack-resident structs and tuples to contain `*T` fields or
+       - Complete: reviewed Change 3. Stop for commit before implementing
+         borrow-containing aggregates.
+     - Change 4, borrow-containing aggregates (complete):
+       - Complete: permit plain, stack-resident structs and tuples to contain `*T` fields or
          elements. Such a value transitively carries the intersection of the
          lifetimes of all tracked
          references stored within it. A type containing a tracked reference,
@@ -558,8 +557,19 @@ reviewable phases:
          buffer collections. Returning or otherwise propagating a borrow-
          containing plain value must preserve its tracked origins just as
          returning `*T` does.
-       - Stop for review and commit before implementing flow-sensitive validity
-         and GC rooting.
+       - Complete: propagate complete tracked-origin intersections through
+         aggregate and tuple construction, bindings, copies, stable projections,
+         union injection and widening, calls, receivers, conditionals, and returns.
+         Keep direct tracked returns restricted to tracked parameters and
+         receivers while allowing borrow-containing returns to propagate
+         borrow-containing parameters and receivers.
+       - Complete: reject GC allocation, GC fields, and `Queue`, `Vector`, or
+         `Map` external-buffer storage when the stored type transitively contains
+         a tracked reference.
+       - Complete: add focused expression-analysis coverage and update the
+         tracked-reference and implementation-status documentation.
+       - Implementation and documentation ready for review. Stop for review and
+         commit before implementing flow-sensitive validity and GC rooting.
      - Change 5, flow-sensitive validity and GC rooting:
        - Rebinding a reference slot does not invalidate existing references to
          the old backing storage, while replacement or movement which could make
