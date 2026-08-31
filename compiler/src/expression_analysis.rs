@@ -152,6 +152,48 @@ struct InterfaceView {
     destination_type: TypeId,
 }
 
+/// The stable physical storage from which a tracked reference is formed.
+/// Expression roots cover temporaries and call results; named storage and
+/// `self` use semantic identities so repeated source reads denote one owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PhysicalPlaceRoot {
+    Symbol(SymbolId),
+    SelfValue(NodeId),
+    Expression(NodeId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PhysicalPlaceProjection {
+    Field(NodeId),
+    TupleElement(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PhysicalPlace {
+    root: PhysicalPlaceRoot,
+    projections: Vec<PhysicalPlaceProjection>,
+    storage: ValueCategory,
+}
+
+/// Records the implicit conversion from plain or GC-backed storage to a
+/// tracked reference. Callable lifetime linking consumes this provenance in
+/// the next change; this change only establishes the physical source path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedBorrow {
+    source: PhysicalPlace,
+    source_type: TypeId,
+    target_type: TypeId,
+}
+
+/// A call-only view which lets a tracked reference supply the address expected
+/// by an ordinary by-reference aggregate parameter. This is deliberately not
+/// part of general contextual assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrackedParameterBorrow {
+    source_type: TypeId,
+    parameter_type: TypeId,
+}
+
 /// A stable source-level route to physical union storage. Expression node IDs
 /// are deliberately absent: two reads such as `holder.value` must identify the
 /// same place so a narrowing established by one read applies to the other.
@@ -270,6 +312,11 @@ impl InterfaceView {
 enum ContextualAssignment {
     /// The source representation already has the required shape.
     Exact,
+    /// Existing plain or GC-backed storage is exposed as a tracked reference.
+    TrackedBorrow {
+        source_type: TypeId,
+        target_type: TypeId,
+    },
     /// Existing concrete storage is exposed through an interface view.
     InterfaceView(InterfaceView),
     /// One value is wrapped with the selected destination-union tag.
@@ -513,6 +560,7 @@ enum ExpressionCheckingErrorKind {
         found: TypeId,
         category: ValueCategory,
     },
+    TemporaryTrackedBorrowEscapes,
     NotCallable {
         found: TypeId,
     },
@@ -598,6 +646,11 @@ struct ExpressionChecking {
     union_injections: HashMap<NodeId, UnionInjection>,
     union_widenings: HashMap<NodeId, UnionWidening>,
     interface_views: HashMap<NodeId, InterfaceView>,
+    tracked_borrows: HashMap<NodeId, TrackedBorrow>,
+    tracked_parameter_borrows: HashMap<NodeId, TrackedParameterBorrow>,
+    /// Stable storage routes for place expressions. Keeping this separate from
+    /// `Place` avoids conflating assignment rules with borrow provenance.
+    physical_places: HashMap<NodeId, PhysicalPlace>,
     /// Runtime tag-counter updates, retained in control-flow order for typed IR.
     narrowing_edges: Vec<NarrowingEdge>,
     /// The narrowed type produced by each valid `is` expression on each edge.
@@ -643,6 +696,9 @@ struct GeneratedMethodChecking {
     bindings: HashMap<SymbolId, BindingSemantics>,
     transfers: HashMap<NodeId, ValueTransfer>,
     places: HashMap<NodeId, Place>,
+    tracked_borrows: HashMap<NodeId, TrackedBorrow>,
+    tracked_parameter_borrows: HashMap<NodeId, TrackedParameterBorrow>,
+    physical_places: HashMap<NodeId, PhysicalPlace>,
     resolved_members: HashMap<NodeId, ResolvedMember>,
     runtime_specialization_calls: HashMap<NodeId, RuntimeCallableSpecializationId>,
 }
@@ -1258,6 +1314,9 @@ impl<'semantic> Analyzer<'semantic> {
                     bindings: local_checking.bindings,
                     transfers: local_checking.transfers,
                     places: local_checking.places,
+                    tracked_borrows: local_checking.tracked_borrows,
+                    tracked_parameter_borrows: local_checking.tracked_parameter_borrows,
+                    physical_places: local_checking.physical_places,
                     resolved_members: local_checking.resolved_members,
                     runtime_specialization_calls: method_specialization_calls,
                 };
@@ -1580,6 +1639,14 @@ impl<'semantic> Analyzer<'semantic> {
             return None;
         };
 
+        if self.reject_escaping_temporary_tracked_borrow(initializer) {
+            source = TypedExpression {
+                type_id: self.types.types().recovery(),
+                category: ValueCategory::BorrowedPlace,
+            };
+            self.checking.expressions.insert(initializer.id, source);
+        }
+
         let mut stored_type = if self.is_recovery(source.type_id) {
             source.type_id
         } else {
@@ -1621,6 +1688,46 @@ impl<'semantic> Analyzer<'semantic> {
         );
         self.current_binding_categories.insert(symbol, category);
         Some(source)
+    }
+
+    fn tracked_borrow_for_expression(&self, expression: &Expression) -> Option<&TrackedBorrow> {
+        self.checking
+            .tracked_borrows
+            .get(&expression.id)
+            .or_else(|| match &expression.kind {
+                ExpressionKind::Group(inner) => self.tracked_borrow_for_expression(inner),
+                _ => None,
+            })
+    }
+
+    fn remove_tracked_borrow_for_expression(&mut self, expression: &Expression) {
+        self.checking.tracked_borrows.remove(&expression.id);
+        if let ExpressionKind::Group(inner) = &expression.kind {
+            self.remove_tracked_borrow_for_expression(inner);
+        }
+    }
+
+    fn reject_escaping_temporary_tracked_borrow(&mut self, expression: &Expression) -> bool {
+        let escapes = self
+            .tracked_borrow_for_expression(expression)
+            .is_some_and(|borrow| {
+                matches!(borrow.source.root, PhysicalPlaceRoot::Expression(_))
+            });
+        if escapes {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::TemporaryTrackedBorrowEscapes,
+                span: expression.span,
+            });
+            self.remove_tracked_borrow_for_expression(expression);
+            self.checking.expressions.insert(
+                expression.id,
+                TypedExpression {
+                    type_id: self.types.types().recovery(),
+                    category: ValueCategory::BorrowedPlace,
+                },
+            );
+        }
+        escapes
     }
 
     /// Checks a returned expression and records how its value enters the
@@ -3062,6 +3169,9 @@ impl<'semantic> Analyzer<'semantic> {
             ExpressionKind::SelfValue => self.synthesize_self(expression),
             ExpressionKind::Group(inner) => {
                 let typed = self.synthesize(inner)?;
+                if let Some(place) = self.checking.physical_places.get(&inner.id).cloned() {
+                    self.checking.physical_places.insert(expression.id, place);
+                }
                 let explicitly_produces_value = self.explicitly_produces_value(inner);
                 self.checking
                     .explicit_values
@@ -3841,6 +3951,52 @@ impl<'semantic> Analyzer<'semantic> {
             };
         }
 
+        if let Some((target, destination_capability)) =
+            self.tracked_reference_parts(expected)
+        {
+            let Some((source_target, source_capability)) =
+                self.tracked_borrow_source_parts(found.type_id)
+            else {
+                return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                    expected,
+                    found: found.type_id,
+                });
+            };
+            let same_target = self
+                .types
+                .types()
+                .has_same_shape(source_target, target)
+                .expect("tracked borrow types belong to the program type store");
+            let capability_valid = !matches!(
+                (source_capability, destination_capability),
+                (AccessCapability::Const, AccessCapability::Mut)
+            );
+            if same_target && capability_valid {
+                return Ok(ContextualAssignment::TrackedBorrow {
+                    source_type: found.type_id,
+                    target_type: target,
+                });
+            }
+            return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            });
+        }
+
+        if self
+            .types
+            .types()
+            .get(found.type_id)
+            .is_some_and(|semantic| {
+                semantic.storage_semantics() == Some(StorageSemantics::TrackedReference)
+            })
+        {
+            return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            });
+        }
+
         if let Some(destination_members) = self.union_members(expected) {
             if !self.value_capability_is_compatible(found, expected, allow_recursive_copy) {
                 return Err(ExpressionCheckingErrorKind::TypeMismatch {
@@ -3941,6 +4097,14 @@ impl<'semantic> Analyzer<'semantic> {
         let interface_view = match assignment {
             ContextualAssignment::Exact => None,
             ContextualAssignment::InterfaceView(view) => Some(view),
+            ContextualAssignment::TrackedBorrow { .. } => {
+                // A union containing a tracked reference transitively carries
+                // its origin. That aggregate propagation belongs to Change 4.
+                return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                    expected,
+                    found: found.type_id,
+                });
+            }
             ContextualAssignment::UnionInjection { .. }
             | ContextualAssignment::UnionWidening(_) => {
                 unreachable!("a normalized union member is not a destination union")
@@ -3979,6 +4143,52 @@ impl<'semantic> Analyzer<'semantic> {
             };
         }
 
+        if let Some((target, destination_capability)) =
+            self.tracked_reference_parts(expected)
+        {
+            let Some((source_target, source_capability)) =
+                self.tracked_borrow_source_parts(found.type_id)
+            else {
+                return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                    expected,
+                    found: found.type_id,
+                });
+            };
+            if self
+                .types
+                .types()
+                .has_same_shape(source_target, target)
+                == Some(true)
+                && !matches!(
+                    (source_capability, destination_capability),
+                    (AccessCapability::Const, AccessCapability::Mut)
+                )
+            {
+                return Ok(ContextualAssignment::TrackedBorrow {
+                    source_type: found.type_id,
+                    target_type: target,
+                });
+            }
+            return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            });
+        }
+
+        if self
+            .types
+            .types()
+            .get(found.type_id)
+            .is_some_and(|semantic| {
+                semantic.storage_semantics() == Some(StorageSemantics::TrackedReference)
+            })
+        {
+            return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            });
+        }
+
         self.validate_interface_view_source(found, expected, source_capability)?;
         Ok(ContextualAssignment::InterfaceView(InterfaceView {
             source_type: found.type_id,
@@ -3997,6 +4207,19 @@ impl<'semantic> Analyzer<'semantic> {
         expected: TypeId,
         source_capability: Option<AccessCapability>,
     ) -> Result<(), ExpressionCheckingErrorKind> {
+        if self
+            .types
+            .types()
+            .get(found.type_id)
+            .is_some_and(|semantic| {
+                semantic.storage_semantics() == Some(StorageSemantics::TrackedReference)
+            })
+        {
+            return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            });
+        }
         let (interface_type, destination_capability, destination_is_gc) = self
             .interface_destination(expected)
             .ok_or(ExpressionCheckingErrorKind::TypeMismatch {
@@ -4420,6 +4643,16 @@ impl<'semantic> Analyzer<'semantic> {
     ) -> TypedExpression {
         match assignment {
             ContextualAssignment::Exact => found,
+            ContextualAssignment::TrackedBorrow {
+                source_type,
+                target_type,
+            } => {
+                self.record_tracked_borrow(node, found, source_type, target_type);
+                TypedExpression {
+                    type_id: expected,
+                    category: ValueCategory::BorrowedPlace,
+                }
+            }
             ContextualAssignment::InterfaceView(view) => {
                 let destination_is_gc = self
                     .interface_destination(expected)
@@ -4498,8 +4731,35 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
-    /// Peels plain or GC-qualified interface destinations while preserving
-    /// the access capability enforced at the conversion boundary.
+    fn record_tracked_borrow(
+        &mut self,
+        node: NodeId,
+        found: TypedExpression,
+        source_type: TypeId,
+        target_type: TypeId,
+    ) {
+        let source = self
+            .checking
+            .physical_places
+            .get(&node)
+            .cloned()
+            .unwrap_or(PhysicalPlace {
+                root: PhysicalPlaceRoot::Expression(node),
+                projections: Vec::new(),
+                storage: found.category,
+            });
+        self.checking.tracked_borrows.insert(
+            node,
+            TrackedBorrow {
+                source,
+                source_type,
+                target_type,
+            },
+        );
+    }
+
+    /// Peels plain, GC-qualified, or tracked interfaces while preserving the
+    /// access capability enforced at conversion or member-access boundaries.
     fn interface_destination(&self, type_id: TypeId) -> Option<(TypeId, AccessCapability, bool)> {
         match self.types.types().get(type_id)? {
             SemanticType::Interface { capability, .. }
@@ -4512,6 +4772,11 @@ impl<'semantic> Analyzer<'semantic> {
             {
                 Some((*target, *capability, true))
             }
+            SemanticType::Tracked { target, capability }
+                if matches!(
+                    self.types.types().get(*target),
+                    Some(SemanticType::Interface { .. } | SemanticType::Intersection { .. })
+                ) => Some((*target, *capability, false)),
             SemanticType::TemplateParameter { capability, .. } => self
                 .template_parameter_bound(type_id)
                 .flatten()
@@ -4628,12 +4893,43 @@ impl<'semantic> Analyzer<'semantic> {
         };
         match (found_semantic.capability(), expected_semantic.capability()) {
             (Some(AccessCapability::Const), Some(AccessCapability::Mut)) => {
-                found.category == ValueCategory::FreshTemporary
+                (found.category == ValueCategory::FreshTemporary
+                    && !matches!(
+                        found_semantic.storage_semantics(),
+                        Some(
+                            StorageSemantics::Gc
+                                | StorageSemantics::BorrowedView
+                                | StorageSemantics::TrackedReference
+                        )
+                    ))
                     || found_semantic.copy_semantics() == Some(CopySemantics::Trivial)
                     || (allow_recursive_copy
                         && found_semantic.copy_semantics() == Some(CopySemantics::Recursive))
             }
             _ => true,
+        }
+    }
+
+    fn tracked_reference_parts(&self, type_id: TypeId) -> Option<(TypeId, AccessCapability)> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Tracked { target, capability } => Some((*target, *capability)),
+            _ => None,
+        }
+    }
+
+    /// Plain values and GC references can both provide storage for a tracked
+    /// borrow. Existing tracked references are handled by exact assignment and
+    /// are deliberately not unwrapped into another storage conversion.
+    fn tracked_borrow_source_parts(
+        &self,
+        type_id: TypeId,
+    ) -> Option<(TypeId, AccessCapability)> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Gc { target, capability } => Some((*target, *capability)),
+            semantic if semantic.storage_semantics() == Some(StorageSemantics::Inline) => {
+                Some((type_id, semantic.capability()?))
+            }
+            _ => None,
         }
     }
 
@@ -5126,6 +5422,7 @@ impl<'semantic> Analyzer<'semantic> {
         if member_text.bytes().all(|byte| byte.is_ascii_digit()) {
             return Some(self.synthesize_tuple_element_access(
                 expression,
+                object,
                 typed_object,
                 member,
                 &member_text,
@@ -5277,6 +5574,14 @@ impl<'semantic> Analyzer<'semantic> {
                         declaration: field.declaration,
                     },
                 );
+                let mut physical = self.physical_place_for(object, typed_object);
+                physical
+                    .projections
+                    .push(PhysicalPlaceProjection::Field(field.declaration));
+                if category == ValueCategory::GcReference {
+                    physical.storage = ValueCategory::GcReference;
+                }
+                self.checking.physical_places.insert(expression.id, physical);
                 Some(TypedExpression { type_id, category })
             }
             StructMemberSignatureKind::Method { .. } => {
@@ -5303,6 +5608,7 @@ impl<'semantic> Analyzer<'semantic> {
     fn synthesize_tuple_element_access(
         &mut self,
         expression: &Expression,
+        object: &Expression,
         typed_object: TypedExpression,
         member: Span,
         member_text: &str,
@@ -5361,10 +5667,34 @@ impl<'semantic> Analyzer<'semantic> {
             expression.id,
             ResolvedMember::TupleElement { index },
         );
+        let mut physical = self.physical_place_for(object, typed_object);
+        physical
+            .projections
+            .push(PhysicalPlaceProjection::TupleElement(index));
+        if category == ValueCategory::GcReference {
+            physical.storage = ValueCategory::GcReference;
+        }
+        self.checking.physical_places.insert(expression.id, physical);
         TypedExpression {
             type_id: declared_type_id,
             category,
         }
+    }
+
+    fn physical_place_for(
+        &self,
+        expression: &Expression,
+        typed: TypedExpression,
+    ) -> PhysicalPlace {
+        self.checking
+            .physical_places
+            .get(&expression.id)
+            .cloned()
+            .unwrap_or(PhysicalPlace {
+                root: PhysicalPlaceRoot::Expression(expression.id),
+                projections: Vec::new(),
+                storage: typed.category,
+            })
     }
 
     /// Selects one requirement by source member name after flattening and
@@ -5527,9 +5857,10 @@ impl<'semantic> Analyzer<'semantic> {
         })
     }
 
-    /// Peels a plain or GC-qualified concrete struct into the information
-    /// shared by field, method, copy, and structural-interface checking. The
-    /// boolean distinguishes GC storage for receiver validation.
+    /// Peels a plain, GC-qualified, or tracked concrete struct into the
+    /// information shared by field, method, copy, and structural-interface
+    /// checking. The boolean distinguishes GC storage for receiver validation;
+    /// tracked references automatically dereference as plain receivers.
     fn aggregate_parts(&self, type_id: TypeId) -> Option<(AggregateOwner, AccessCapability, bool)> {
         match self.types.types().get(type_id)? {
             SemanticType::NamedStruct {
@@ -5556,6 +5887,21 @@ impl<'semantic> Analyzer<'semantic> {
                         AggregateOwner::Generated(self.canonical_generated_owner(*target)?),
                         *capability,
                         true,
+                    )),
+                    _ => None,
+                }
+            }
+            SemanticType::Tracked { target, capability } => {
+                match self.types.types().get(*target)? {
+                    SemanticType::NamedStruct { declaration, .. }
+                    | SemanticType::AnonymousStruct {
+                        expression: declaration,
+                        ..
+                    } => Some((AggregateOwner::Source(*declaration), *capability, false)),
+                    SemanticType::GeneratedStruct { .. } => Some((
+                        AggregateOwner::Generated(self.canonical_generated_owner(*target)?),
+                        *capability,
+                        false,
                     )),
                     _ => None,
                 }
@@ -5597,9 +5943,10 @@ impl<'semantic> Analyzer<'semantic> {
             })
     }
 
-    /// Peels a plain or GC-qualified tuple. Elements retain their declared
-    /// canonical identities; the returned capability is the effective access
-    /// to the tuple payload, and the flag distinguishes GC-backed storage.
+    /// Peels a plain, GC-qualified, or tracked tuple. Elements retain their
+    /// declared canonical identities; the returned capability is the effective
+    /// access to the tuple payload, and the flag distinguishes GC-backed
+    /// storage.
     fn tuple_parts(
         &self,
         type_id: TypeId,
@@ -5615,13 +5962,19 @@ impl<'semantic> Analyzer<'semantic> {
                 };
                 Some((elements.clone(), *capability, true))
             }
+            SemanticType::Tracked { target, capability } => {
+                let SemanticType::Tuple { elements, .. } = self.types.types().get(*target)? else {
+                    return None;
+                };
+                Some((elements.clone(), *capability, false))
+            }
             _ => None,
         }
     }
 
-    /// Peels a plain or GC-qualified string/byte sequence. The capability is
-    /// the effective access to the sequence payload, while the final flag
-    /// records whether that payload lives behind a GC reference.
+    /// Peels a plain, GC-qualified, or tracked string/byte sequence. The
+    /// capability is the effective access to the sequence payload, while the
+    /// final flag records whether that payload lives behind a GC reference.
     fn sequence_parts(
         &self,
         type_id: TypeId,
@@ -5648,6 +6001,20 @@ impl<'semantic> Analyzer<'semantic> {
                     _ => return None,
                 };
                 Some((sequence, *capability, true))
+            }
+            SemanticType::Tracked { target, capability } => {
+                let sequence = match self.types.types().get(*target)? {
+                    SemanticType::Primitive {
+                        primitive: PrimitiveType::String,
+                        ..
+                    } => SequenceKind::String,
+                    SemanticType::Primitive {
+                        primitive: PrimitiveType::Bytes,
+                        ..
+                    } => SequenceKind::Bytes,
+                    _ => return None,
+                };
+                Some((sequence, *capability, false))
             }
             _ => None,
         }
@@ -5846,18 +6213,23 @@ impl<'semantic> Analyzer<'semantic> {
     /// a symbolic template parameter reaches this check only when it has no
     /// interface bound, so it deliberately exposes no members at all.
     fn member_owner_is_definitively_invalid(&self, type_id: TypeId) -> bool {
-        matches!(
-            self.types.types().get(type_id),
-            Some(SemanticType::Primitive {
-                primitive: PrimitiveType::Unit
-                    | PrimitiveType::None
-                    | PrimitiveType::Int
-                    | PrimitiveType::Float
-                    | PrimitiveType::Bool
-                    | PrimitiveType::Char,
-                ..
-            } | SemanticType::TemplateParameter { .. })
-        )
+        match self.types.types().get(type_id) {
+            Some(SemanticType::Tracked { target, .. }) => {
+                self.member_owner_is_definitively_invalid(*target)
+            }
+            Some(
+                SemanticType::Primitive {
+                    primitive: PrimitiveType::Unit
+                        | PrimitiveType::None
+                        | PrimitiveType::Int
+                        | PrimitiveType::Float
+                        | PrimitiveType::Bool
+                        | PrimitiveType::Char,
+                    ..
+                } | SemanticType::TemplateParameter { .. },
+            ) => true,
+            _ => false,
+        }
     }
 
     /// Applies transitive access capability to a field reached through an
@@ -5875,7 +6247,10 @@ impl<'semantic> Analyzer<'semantic> {
             .get(declared)
             .expect("field type belongs to the program type store");
         let capability =
-            if declared_semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+            if matches!(
+                declared_semantic.storage_semantics(),
+                Some(StorageSemantics::Gc | StorageSemantics::TrackedReference)
+            ) {
                 match (object_capability, declared_semantic.capability()) {
                     (AccessCapability::Const, _) | (_, Some(AccessCapability::Const)) => {
                         AccessCapability::Const
@@ -6223,7 +6598,8 @@ impl<'semantic> Analyzer<'semantic> {
                 });
             }
             let checked = self.check(value, place.declared_type_id)?;
-            let valid_value = !self.is_recovery(checked.type_id);
+            let valid_value = !self.is_recovery(checked.type_id)
+                && !self.reject_escaping_temporary_tracked_borrow(value);
             if mutable && valid_value {
                 if let Some(narrowing_place) = self.narrowing_place(target)
                     && self.union_members(place.declared_type_id).is_some()
@@ -6805,7 +7181,7 @@ impl<'semantic> Analyzer<'semantic> {
                 supported &= self.synthesize(argument).is_some();
                 continue;
             };
-            let Some(checked) = self.check(argument, expected) else {
+            let Some(checked) = self.check_call_argument(argument, expected) else {
                 supported = false;
                 continue;
             };
@@ -7462,7 +7838,7 @@ impl<'semantic> Analyzer<'semantic> {
                 all_supported &= self.synthesize(argument).is_some();
                 continue;
             };
-            let Some(checked) = self.check(argument, expected) else {
+            let Some(checked) = self.check_call_argument(argument, expected) else {
                 all_supported = false;
                 continue;
             };
@@ -7477,16 +7853,109 @@ impl<'semantic> Analyzer<'semantic> {
         all_supported.then_some(valid)
     }
 
-    /// Gives all successful ordinary calls their declared result type. GC
-    /// results preserve reference provenance; other results are fresh values
-    /// supplied by the callee's result storage.
+    /// Checks one actual argument with the one dereference rule that is
+    /// specific to the calling convention: `*T` may provide the address for a
+    /// plain aggregate parameter `T`. No general expected-type boundary uses
+    /// this path, so bindings, fields, and returns still reject `*T -> T`.
+    fn check_call_argument(
+        &mut self,
+        argument: &Expression,
+        expected: TypeId,
+    ) -> Option<TypedExpression> {
+        if matches!(
+            &argument.kind,
+            ExpressionKind::Tuple { .. }
+                | ExpressionKind::Block(_)
+                | ExpressionKind::If { .. }
+                | ExpressionKind::Loop { .. }
+                | ExpressionKind::While { .. }
+                | ExpressionKind::RangeFor { .. }
+        ) {
+            return self.check(argument, expected);
+        }
+        if let ExpressionKind::Group(inner) = &argument.kind {
+            let checked = self.check_call_argument(inner, expected)?;
+            if let Some(borrow) = self
+                .checking
+                .tracked_parameter_borrows
+                .remove(&inner.id)
+            {
+                self.checking
+                    .tracked_parameter_borrows
+                    .insert(argument.id, borrow);
+            }
+            if let Some(place) = self.checking.physical_places.get(&inner.id).cloned() {
+                self.checking.physical_places.insert(argument.id, place);
+            }
+            self.checking.expressions.insert(argument.id, checked);
+            let explicitly_produces_value = self.explicitly_produces_value(inner);
+            self.checking
+                .explicit_values
+                .insert(argument.id, explicitly_produces_value);
+            return Some(checked);
+        }
+        let found = self.synthesize(argument)?;
+        if self.is_recovery(found.type_id) || self.is_divergence(found.type_id) {
+            return Some(found);
+        }
+        if let Some((target, source_capability)) =
+            self.tracked_reference_parts(found.type_id)
+            && self.plain_parameter_is_passed_by_reference(expected)
+        {
+            let destination_capability = self
+                .types
+                .types()
+                .get(expected)
+                .and_then(SemanticType::capability)
+                .expect("plain parameter type has an access capability");
+            let same_target = self
+                .types
+                .types()
+                .has_same_shape(target, expected)
+                .expect("call argument types belong to the program type store");
+            let capability_valid = !matches!(
+                (source_capability, destination_capability),
+                (AccessCapability::Const, AccessCapability::Mut)
+            );
+            if same_target && capability_valid {
+                self.checking.tracked_parameter_borrows.insert(
+                    argument.id,
+                    TrackedParameterBorrow {
+                        source_type: found.type_id,
+                        parameter_type: expected,
+                    },
+                );
+                let checked = TypedExpression {
+                    type_id: expected,
+                    category: ValueCategory::BorrowedPlace,
+                };
+                self.checking.expressions.insert(argument.id, checked);
+                return Some(checked);
+            }
+        }
+        self.check_typed(argument, expected, found, false)
+    }
+
+    fn plain_parameter_is_passed_by_reference(&self, type_id: TypeId) -> bool {
+        self.types.types().get(type_id).is_some_and(|semantic| {
+            semantic.storage_semantics() == Some(StorageSemantics::Inline)
+                && semantic.copy_semantics() == Some(CopySemantics::Recursive)
+        })
+    }
+
+    /// Gives all successful ordinary calls their declared result type. GC and
+    /// tracked results preserve reference provenance; other results are fresh
+    /// values supplied by the callee's result storage.
     fn call_result(&self, return_type: TypeId) -> TypedExpression {
-        let category = if self.types.types().get(return_type).is_some_and(|semantic| {
-            semantic.storage_semantics() == Some(StorageSemantics::Gc)
-        }) {
-            ValueCategory::GcReference
-        } else {
-            ValueCategory::FreshTemporary
+        let category = match self
+            .types
+            .types()
+            .get(return_type)
+            .and_then(SemanticType::storage_semantics)
+        {
+            Some(StorageSemantics::Gc) => ValueCategory::GcReference,
+            Some(StorageSemantics::TrackedReference) => ValueCategory::BorrowedPlace,
+            _ => ValueCategory::FreshTemporary,
         };
         TypedExpression {
             type_id: return_type,
@@ -7708,6 +8177,14 @@ impl<'semantic> Analyzer<'semantic> {
                     value_capability: binding.qualifiers.value,
                 },
             );
+            self.checking.physical_places.insert(
+                expression.id,
+                PhysicalPlace {
+                    root: PhysicalPlaceRoot::Symbol(symbol),
+                    projections: Vec::new(),
+                    storage: category,
+                },
+            );
             return Some(typed);
         }
         let Some(type_id) = self.signatures.callable_value_type(symbol) else {
@@ -7778,6 +8255,14 @@ impl<'semantic> Analyzer<'semantic> {
                     AccessCapability::Const => ValueCapability::Const,
                     AccessCapability::Mut => ValueCapability::Mut,
                 },
+            },
+        );
+        self.checking.physical_places.insert(
+            expression.id,
+            PhysicalPlace {
+                root: PhysicalPlaceRoot::SelfValue(method),
+                projections: Vec::new(),
+                storage: typed.category,
             },
         );
         typed
@@ -13141,6 +13626,139 @@ fn main() {
             }
         )));
         assert!(checking.runtime_specializations.is_empty());
+    }
+
+    #[test]
+    fn forms_tracked_borrows_and_auto_dereferences_member_places() {
+        let source = concat!(
+            "struct Inner { value: int, }\n",
+            "struct User { inner: Inner, fn read(self) -> int { self.inner.value } }\n",
+            "fn inspect(readonly: *User, const vmut writable: *mut User, heap: *User) {\n",
+            "    readonly.inner.value;\n",
+            "    writable.inner.value = 1;\n",
+            "    heap.read();\n",
+            "}\n",
+            "fn inspect_inner(inner: *Inner) {}\n",
+            "fn main() {\n",
+            "    const vmut user = User { inner: Inner { value: 1 } };\n",
+            "    const vmut writable = User { inner: Inner { value: 2 } };\n",
+            "    const heap = &User { inner: Inner { value: 3 } };\n",
+            "    const borrowed: *User = user;\n",
+            "    inspect(user, writable, heap);\n",
+            "    inspect_inner(heap.inner);\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let main = function(&program.declarations[4]);
+        let borrowed = binding_initializer(&main.body.statements[3]);
+        assert_eq!(checking.transfers[&borrowed.id], ValueTransfer::Borrow);
+        assert!(matches!(
+            types.types().get(checking.expressions[&borrowed.id].type_id),
+            Some(SemanticType::Tracked { .. })
+        ));
+        let (_, arguments) = call(expression(&main.body.statements[4]));
+        assert_eq!(checking.tracked_borrows.len(), 5);
+        for argument in arguments {
+            let borrow = checking
+                .tracked_borrows
+                .get(&argument.id)
+                .expect("each plain or GC argument should form a tracked borrow");
+            assert!(matches!(borrow.source.root, PhysicalPlaceRoot::Symbol(_)));
+            assert!(borrow.source.projections.is_empty());
+        }
+        assert!(matches!(
+            types.types().get(checking.tracked_borrows[&arguments[2].id].source_type),
+            Some(SemanticType::Gc { .. })
+        ));
+        let (_, interior_arguments) = call(expression(&main.body.statements[5]));
+        let interior = &checking.tracked_borrows[&interior_arguments[0].id];
+        assert_eq!(interior.source.storage, ValueCategory::GcReference);
+        assert_eq!(interior.source.projections.len(), 1);
+
+        let inspect = function(&program.declarations[2]);
+        let value = expression(&inspect.body.statements[0]);
+        let place = checking
+            .physical_places
+            .get(&value.id)
+            .expect("automatically dereferenced fields should retain a physical path");
+        assert!(matches!(place.root, PhysicalPlaceRoot::Symbol(_)));
+        assert_eq!(place.projections.len(), 2);
+        assert!(place
+            .projections
+            .iter()
+            .all(|projection| matches!(projection, PhysicalPlaceProjection::Field(_))));
+    }
+
+    #[test]
+    fn tracked_borrows_preserve_capability_and_only_dereference_for_plain_parameters() {
+        let source = concat!(
+            "struct User {}\n",
+            "fn wants_plain(value: User) {}\n",
+            "fn wants_gc(value: &User) {}\n",
+            "fn wants_mut(const vmut value: *mut User) {}\n",
+            "fn reject_existing(value: *User) { wants_mut(value); wants_plain(value); wants_gc(value); }\n",
+            "fn main() {\n",
+            "    const user = User {};\n",
+            "    const heap = &User {};\n",
+            "    wants_mut(user);\n",
+            "    wants_mut(heap);\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 4, "{:#?}", checking.errors);
+        assert!(checking.errors.iter().all(|error| matches!(
+            error.kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        )));
+        assert!(checking.tracked_borrows.is_empty());
+        let reject_existing = function(&program.declarations[4]);
+        let plain_argument = call(expression(&reject_existing.body.statements[1])).1[0].id;
+        assert!(checking
+            .tracked_parameter_borrows
+            .contains_key(&plain_argument));
+        assert_eq!(checking.transfers[&plain_argument], ValueTransfer::Borrow);
+    }
+
+    #[test]
+    fn rejects_tracked_bindings_formed_from_plain_and_gc_temporaries() {
+        let source = concat!(
+            "struct User {}\n",
+            "fn inspect(value: *User) {}\n",
+            "fn main() {\n",
+            "    const invalid_plain: *User = User {};\n",
+            "    const invalid_gc: *User = &User {};\n",
+            "    const stable = User {};\n",
+            "    mut vconst reference: *User = stable;\n",
+            "    reference = User {};\n",
+            "    inspect(User {});\n",
+            "    inspect(&User {});\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 3, "{:#?}", checking.errors);
+        assert!(checking.errors.iter().all(|error| {
+            error.kind == ExpressionCheckingErrorKind::TemporaryTrackedBorrowEscapes
+        }));
+        let main = function(&program.declarations[2]);
+        for statement in &main.body.statements[..2] {
+            let initializer = binding_initializer(statement);
+            assert!(!checking.tracked_borrows.contains_key(&initializer.id));
+        }
+        let ExpressionKind::Assignment { value, .. } =
+            &expression(&main.body.statements[4]).kind
+        else {
+            panic!("expected tracked-reference assignment")
+        };
+        assert!(!checking.tracked_borrows.contains_key(&value.id));
+        for statement in &main.body.statements[5..] {
+            let (_, arguments) = call(expression(statement));
+            assert!(checking.tracked_borrows.contains_key(&arguments[0].id));
+        }
     }
 
     #[test]

@@ -469,11 +469,41 @@ reviewable phases:
          storage-contract, and source-resolution tests for `*T` and `*mut T`.
        - Complete: reviewed Change 1. Stop for commit before implementing borrow
          formation and place provenance.
-     - Change 2, borrow formation and place provenance:
-       - Permit plain and GC-backed values to borrow as `*T`; never implicitly
+    - Change 2, borrow formation and place provenance:
+      - Complete: reject tracked bindings and reference-slot assignments formed
+        from complete-expression plain or GC temporaries. Continue allowing
+        the same temporary borrow for a call which does not retain it.
+      - Complete: allow a tracked reference to supply an ordinary plain
+        by-reference aggregate parameter as a call-scoped borrow. Record this
+        call-only dereference separately and keep `*T -> T` invalid for general
+        assignment, fields, and returns; keep `*T -> &T` invalid everywhere.
+      - Complete: preserve the existing expected-type-driven argument path for
+        tuple literals, unions, control-flow expressions, and runtime-template
+        specialization while applying the call-only tracked dereference only
+        to synthesized tracked arguments.
+      - Complete: form tracked borrows from capability-compatible plain and
+        GC-backed expressions at direct `*T` expected-type boundaries. Record
+        each source's stable physical root and field or tuple-element path,
+        retaining GC-backed root provenance.
+      - Complete: automatically dereference tracked aggregate, tuple,
+        interface, and supported primitive receivers for ordinary `.` field,
+        element, and method access. Preserve or reduce target capability and
+        reject escalation.
+      - Complete: keep tracked references non-owning through local bindings and
+        calls; reject general `*T` to `T`/`&T` conversion. Borrow-containing
+        unions remain deferred to Change 4.
+      - Complete: add focused expression-checking coverage for plain, mutable,
+        GC-backed, and interior-field borrow formation; physical paths;
+        automatic member dereferencing; capability rejection; and storage-kind
+        rejection.
+      - Complete: reviewed Change 2. Stop for commit before implementing
+        callable lifetime links.
+      - Permit plain and GC-backed values to borrow as `*T`; never generally
          convert `*T` into `T` or `&T`, because those conversions would require
-         copying or allocation. Continue using `.` for member access with
-         automatic dereferencing rather than adding `->`.
+         copying or allocation. A `*T` may supply a plain aggregate parameter
+         `T` because that call boundary only borrows the existing address.
+         Continue using `.` for member access with automatic dereferencing
+         rather than adding `->`.
        - Preserve or reduce target access capability through a tracked borrow but
          never increase it. Track the physical source storage and field path.
        - Stop for review and commit before implementing callable lifetime links.

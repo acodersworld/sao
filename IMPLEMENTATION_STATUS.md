@@ -164,9 +164,17 @@ bounded-template parameters, and owner-specialized generated syntax. It
 diagnoses invalid applications and constraints, alias cycles, expanding factory
 recursion, compiler-known arity, queue element types, and non-interface
 intersection members. Unknown type names are diagnosed earlier by name
-resolution. Tracked-reference borrow formation, automatic dereferencing, place
-provenance, lifetime links, and expression-level conversions are not yet
-implemented.
+resolution. Tracked-reference expression checking forms `*T` borrows from
+compatible plain and GC-backed storage, preserves or reduces target capability,
+automatically dereferences tracked aggregate, tuple, interface, and supported
+primitive members through `.`, and records stable physical roots plus
+field/tuple paths. Direct tracked bindings and reference-slot assignments reject
+plain and GC temporary sources, while a non-escaping call may borrow one.
+There is no general `*T` into `T` or `&T` conversion; a `*T` argument may supply
+the existing address for a plain by-reference aggregate parameter `T`, but not
+for a binding, field, return, or GC parameter.
+Callable lifetime links, borrow-containing aggregates and unions,
+flow-sensitive validity, and GC-owner rooting are not yet implemented.
 
 Declaration and signature collection is implemented for source and generated
 struct fields and functions, callable headers, interface requirements,
