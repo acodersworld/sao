@@ -8,7 +8,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-08-30
+Last reviewed: 2026-09-01
 
 ## Lexer status
 
@@ -188,7 +188,10 @@ through conditionals and loop fixed points. Redirected reference slots preserve
 distinct displaced backing storage, replacement of an ancestor with a live
 interior reference is rejected, last-use analysis ends constraints
 non-lexically, and GC-backed origins record the owner roots required for the
-tracked holder's live range.
+tracked holder's live range. Ordinary callables, generated methods, and runtime
+callable specializations retain the same complete private-origin,
+lifetime-intersection, GC-owner-root, and borrow-validity metadata for post-type
+escape analysis, typed IR, and lowering.
 
 Declaration and signature collection is implemented for source and generated
 struct fields and functions, callable headers, interface requirements,

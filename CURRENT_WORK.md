@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-08-30
+Last reviewed: 2026-09-01
 
 Maintenance rule: update this file as part of completing every phase or
 independently reviewable change. Mark the completed item accurately, summarize
@@ -592,17 +592,18 @@ reviewable phases:
          and displaced roots.
        - Implementation and documentation ready for review. Stop for review and
          commit before integration and completion.
-     - Change 6, lowering-facing metadata completion:
-       - Record private origin, lifetime-intersection, GC-owner-root, and borrow-
+     - Change 6, lowering-facing metadata completion (complete):
+       - Complete: record private origin, lifetime-intersection, GC-owner-root, and borrow-
          validity metadata for post-type escape analysis, typed IR, and lowering.
-       - Ensure generated methods and runtime callable specializations retain
+       - Complete: ensure generated methods and runtime callable specializations retain
          the same complete tracked-reference metadata as ordinary callable
          analysis.
-       - Add focused metadata coverage for ordinary versus tracked parameters,
+       - Complete: add focused metadata coverage for ordinary versus tracked parameters,
          field-derived references, multiple-input lifetime intersections,
          capability direction, plain and GC coercions, GC rooting, flow joins,
          shadowing, mutation and rebinding, recovery, and callable composition.
-       - Stop for review and commit before capture safety and final integration.
+       - Implementation and documentation ready for review. Stop for review and
+         commit before capture safety and final integration.
      - Change 7, capture safety and final integration:
        - Reject capturing `*T` or a transitively borrow-containing value in a
          lambda until authoritative capture and escape analysis can prove that

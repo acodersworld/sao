@@ -140,6 +140,8 @@ provenance.
 Callable lifetime links, tracked receivers, tracked-return origin validation,
 caller-side temporary escape checks, borrow-containing inline aggregates and
 unions, flow-sensitive origin joins, interior-address validity, displaced
-backing identities, and GC-owner rooting are implemented. Lowering-facing
-metadata completion and conservative lambda capture rejection remain later
-Phase 7.6 work.
+backing identities, and GC-owner rooting are implemented. Complete private
+origin, lifetime-intersection, GC-owner-root, and borrow-validity metadata is
+retained for ordinary callables, generated methods, and runtime callable
+specializations for post-type escape analysis, typed IR, and lowering.
+Conservative lambda capture rejection remains later Phase 7.6 work.

@@ -741,23 +741,13 @@ struct ExpressionChecking {
 /// applications reuse one source AST, so `NodeId` alone cannot distinguish
 /// `Box(int).get` from `Box(string).get`. Keeping the owner type in the key
 /// prevents one checked application from overwriting another before typed IR
-/// gives specializations their final identities.
+/// gives specializations their final identities. Retaining the complete
+/// checking result is important: post-type escape analysis and lowering need
+/// the same tracked-origin, lifetime, GC-root, and validity facts here as they
+/// do for an ordinary callable or runtime specialization.
 #[derive(Debug, Clone)]
 struct GeneratedMethodChecking {
-    expressions: HashMap<NodeId, TypedExpression>,
-    bindings: HashMap<SymbolId, BindingSemantics>,
-    transfers: HashMap<NodeId, ValueTransfer>,
-    places: HashMap<NodeId, Place>,
-    tracked_borrows: HashMap<NodeId, TrackedBorrow>,
-    tracked_parameter_borrows: HashMap<NodeId, TrackedParameterBorrow>,
-    tracked_lifetime_links: HashMap<NodeId, TrackedLifetimeLink>,
-    tracked_binding_lifetimes: HashMap<SymbolId, TrackedLifetimeLink>,
-    gc_owner_roots: HashMap<NodeId, Vec<PhysicalPlace>>,
-    borrow_invalidations: HashMap<NodeId, Vec<PhysicalPlace>>,
-    displaced_roots: HashMap<NodeId, PhysicalPlaceRoot>,
-    physical_places: HashMap<NodeId, PhysicalPlace>,
-    resolved_members: HashMap<NodeId, ResolvedMember>,
-    runtime_specialization_calls: HashMap<NodeId, RuntimeCallableSpecializationId>,
+    checking: Box<ExpressionChecking>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1448,21 +1438,10 @@ impl<'semantic> Analyzer<'semantic> {
                     }
                 }
                 self.runtime_specialization_calls = parent_specialization_calls;
+                let mut local_checking = local_checking;
+                local_checking.runtime_specialization_calls = method_specialization_calls;
                 let checking = GeneratedMethodChecking {
-                    expressions: local_checking.expressions,
-                    bindings: local_checking.bindings,
-                    transfers: local_checking.transfers,
-                    places: local_checking.places,
-                    tracked_borrows: local_checking.tracked_borrows,
-                    tracked_parameter_borrows: local_checking.tracked_parameter_borrows,
-                    tracked_lifetime_links: local_checking.tracked_lifetime_links,
-                    tracked_binding_lifetimes: local_checking.tracked_binding_lifetimes,
-                    gc_owner_roots: local_checking.gc_owner_roots,
-                    borrow_invalidations: local_checking.borrow_invalidations,
-                    displaced_roots: local_checking.displaced_roots,
-                    physical_places: local_checking.physical_places,
-                    resolved_members: local_checking.resolved_members,
-                    runtime_specialization_calls: method_specialization_calls,
+                    checking: Box::new(local_checking),
                 };
                 self.checking
                     .generated_methods
@@ -15536,6 +15515,84 @@ fn main() {
                 matches!(source.root, PhysicalPlaceRoot::SelfValue(_))
             })
         }));
+    }
+
+    #[test]
+    fn retains_complete_tracked_metadata_for_generated_methods_and_runtime_specializations() {
+        let source = concat!(
+            "fn Box(comptime T: type) -> type {\n",
+            "    struct {\n",
+            "        inner: T,\n",
+            "        fn project(*self, other: *T) -> *T { other }\n",
+            "        fn redirect(self, flag: bool, left: &T, right: &T) {\n",
+            "            mut vconst reference: *T = left;\n",
+            "            if flag { reference = right; }\n",
+            "            reference;\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+            "struct Item {}\n",
+            "fn choose(comptime T: type, first: *T, second: *T) -> *T { first }\n",
+            "fn main() {\n",
+            "    const boxed = Box(Item) { inner: Item {} };\n",
+            "    const heap = &Item {};\n",
+            "    const other = &Item {};\n",
+            "    const projected: *Item = boxed.project(heap);\n",
+            "    boxed.redirect(false, heap, other);\n",
+            "    const selected: *Item = choose(Item, boxed.inner, heap);\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let main = function(&program.declarations[3]);
+        for statement in [&main.body.statements[3], &main.body.statements[5]] {
+            let result = binding_initializer(statement);
+            let sources = &checking.tracked_lifetime_links[&result.id].sources;
+            assert_eq!(sources.len(), 2);
+            assert!(sources.iter().all(|source| {
+                source
+                    .projections
+                    .contains(&PhysicalPlaceProjection::OpaqueDerived)
+            }));
+            assert!(sources
+                .iter()
+                .any(|source| source.storage == ValueCategory::GcReference));
+            assert!(checking
+                .gc_owner_roots
+                .get(&statement.id)
+                .is_some_and(|roots| roots.len() == 1
+                    && roots[0].storage == ValueCategory::GcReference));
+        }
+
+        assert_eq!(checking.generated_methods.len(), 2);
+        assert!(checking.generated_methods.values().any(|method| {
+            method
+                .checking
+                .tracked_lifetime_links
+                .values()
+                .any(|link| link.sources.len() == 2)
+                && method.checking.gc_owner_roots.len() == 2
+        }));
+        assert!(checking.generated_methods.values().any(|method| {
+            method.checking.tracked_lifetime_links.values().any(|link| {
+                link.sources.iter().all(|source| {
+                    !source
+                        .projections
+                        .contains(&PhysicalPlaceProjection::OpaqueDerived)
+                })
+            })
+        }));
+
+        assert_eq!(checking.runtime_specializations.len(), 1);
+        let specialization = &checking.runtime_specializations[0];
+        assert!(specialization
+            .checking
+            .tracked_lifetime_links
+            .values()
+            .any(|link| link.sources.len() == 1
+                && link.sources[0].projections.is_empty()));
     }
 
     #[test]
