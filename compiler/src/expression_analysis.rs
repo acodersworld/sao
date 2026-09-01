@@ -536,9 +536,10 @@ enum LambdaCaptureSource {
 
 /// The type-facing portion of a lambda capture.
 ///
-/// This deliberately records only the source and its two capabilities. The
-/// later capture-analysis pass still decides environment layout, recursive
-/// copies, shared mutable cells, tracing, and escape validity.
+/// This deliberately records only the source and its two capabilities.
+/// Expression checking conservatively rejects borrow-containing sources; later
+/// lowering still decides environment layout, recursive copies, shared mutable
+/// cells, and tracing for the remaining captures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LambdaCapture {
     source: LambdaCaptureSource,
@@ -590,6 +591,7 @@ enum ExpressionCheckingErrorKind {
     },
     TemporaryTrackedBorrowEscapes,
     InvalidTrackedReturnSource,
+    BorrowContainingLambdaCapture,
     BorrowContainingGcStorage {
         found: TypeId,
     },
@@ -3923,6 +3925,15 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("lambda signature must have been collected")
             .clone();
         let captures = self.lambda_captures(expression.id, body);
+        let borrow_containing_capture = captures
+            .iter()
+            .any(|capture| self.lambda_capture_contains_tracked_reference(*capture));
+        if borrow_containing_capture {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::BorrowContainingLambdaCapture,
+                span: expression.span,
+            });
+        }
         let capability = if captures.iter().any(|capture| {
             capture.qualifiers.binding == BindingMutability::Mut
                 || capture.qualifiers.value == ValueCapability::Mut
@@ -3937,18 +3948,44 @@ impl<'semantic> Analyzer<'semantic> {
 
         let first_body_error = self.checking.errors.len();
         let enclosing_categories = self.current_binding_categories.clone();
+        let enclosing_tracked_bindings =
+            std::mem::take(&mut self.current_tracked_bindings);
         let enclosing_narrowings = std::mem::take(&mut self.current_narrowings);
         let enclosing_reachability = self.current_path_reachable;
         let enclosing_loops = std::mem::take(&mut self.active_loops);
+        let enclosing_tracked_roots =
+            std::mem::take(&mut self.current_tracked_return_roots);
+        let enclosing_borrow_containing_roots =
+            std::mem::take(&mut self.current_borrow_containing_return_roots);
         self.current_path_reachable = true;
         self.seed_callable_parameters(expression.id, parameters);
+        for parameter in parameters {
+            let FunctionParameterKind::Named { .. } = &parameter.kind else {
+                continue;
+            };
+            let symbol = self
+                .names
+                .symbol_for_declaration(parameter.id)
+                .expect("lambda parameter must have a semantic symbol");
+            let type_id = self.checking.bindings[&symbol].type_id;
+            if self.tracked_reference_parts(type_id).is_some() {
+                self.current_tracked_return_roots
+                    .insert(PhysicalPlaceRoot::Symbol(symbol));
+            } else if self.type_contains_tracked_reference(type_id) {
+                self.current_borrow_containing_return_roots
+                    .insert(PhysicalPlaceRoot::Symbol(symbol));
+            }
+        }
         self.visit_callable_body(body, signature.return_type);
         self.release_all_narrowings(body.id, NarrowingEdgeKind::CallableCompletion);
         self.current_binding_categories = enclosing_categories;
+        self.current_tracked_bindings = enclosing_tracked_bindings;
         self.current_narrowings = enclosing_narrowings;
         self.current_path_reachable = enclosing_reachability;
         self.active_loops = enclosing_loops;
-        if self.checking.errors.len() != first_body_error {
+        self.current_tracked_return_roots = enclosing_tracked_roots;
+        self.current_borrow_containing_return_roots = enclosing_borrow_containing_roots;
+        if borrow_containing_capture || self.checking.errors.len() != first_body_error {
             return Some(self.recovery_temporary());
         }
 
@@ -3962,9 +3999,9 @@ impl<'semantic> Analyzer<'semantic> {
         })
     }
 
-    /// Discovers only the free sources needed to infer a lambda's callable
-    /// capability. The post-type capture pass remains responsible for deciding
-    /// how these sources are represented and whether they may escape.
+    /// Discovers the free sources needed for lambda capability and conservative
+    /// borrow-containing capture rejection. Lowering remains responsible for
+    /// the representation of captures which pass this safety boundary.
     fn lambda_captures(&self, lambda: NodeId, body: &Block) -> Vec<LambdaCapture> {
         let mut sources = Vec::new();
         let mut seen = HashSet::new();
@@ -3988,6 +4025,30 @@ impl<'semantic> Analyzer<'semantic> {
                 LambdaCapture { source, qualifiers }
             })
             .collect()
+    }
+
+    fn lambda_capture_contains_tracked_reference(&self, capture: LambdaCapture) -> bool {
+        match capture.source {
+            LambdaCaptureSource::Symbol(symbol) => self
+                .checking
+                .bindings
+                .get(&symbol)
+                .is_some_and(|binding| self.type_contains_tracked_reference(binding.type_id)),
+            LambdaCaptureSource::SelfValue { method } => {
+                let receiver = self
+                    .current_specialized_owner
+                    .and_then(|owner| self.signatures.specialized_callable(owner, method))
+                    .or_else(|| self.signatures.callable(method))
+                    .and_then(|signature| signature.receiver)
+                    .expect("captured self must have a receiver signature");
+                receiver.storage == ReceiverStorage::Tracked
+                    || (receiver.storage == ReceiverStorage::Plain
+                        && self.current_specialized_owner.or_else(|| {
+                            self.method_owners.get(&method).copied()
+                        })
+                            .is_some_and(|owner| self.type_contains_tracked_reference(owner)))
+            }
+        }
     }
 
     fn collect_captures_from_block(
@@ -12338,6 +12399,109 @@ mod tests {
     }
 
     #[test]
+    fn rejects_direct_transitive_receiver_and_gc_backed_tracked_captures() {
+        let source = concat!(
+            "struct Inner {}\n",
+            "struct Holder {\n",
+            "    reference: *Inner,\n",
+            "    fn capture(*self) { const invalid = lambda() { self; }; }\n",
+            "    fn capture_inline(self) { const invalid = lambda() { self; }; }\n",
+            "}\n",
+            "fn inspect(value: *Inner, aggregate: (*Inner, int), heap: &Inner) {\n",
+            "    const direct = lambda() { value; };\n",
+            "    const transitive = lambda() { aggregate; };\n",
+            "    const gc_backed: *Inner = heap;\n",
+            "    const rooted = lambda() { gc_backed; };\n",
+            "    const ordinary = 1;\n",
+            "    const valid = lambda() -> int { ordinary };\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 5, "{:#?}", checking.errors);
+        assert!(checking.errors.iter().all(|error| {
+            error.kind == ExpressionCheckingErrorKind::BorrowContainingLambdaCapture
+        }));
+
+        let holder = structure(&program.declarations[1]);
+        let method = holder
+            .members
+            .iter()
+            .find_map(|member| match member {
+                StructMember::Function(method) => Some(method),
+                StructMember::Field(_) => None,
+            })
+            .expect("holder should have a method");
+        let receiver_capture = binding_initializer(&method.body.statements[0]);
+        assert_eq!(
+            checking.expressions[&receiver_capture.id].type_id,
+            types.types().recovery()
+        );
+
+        let inspect = function(&program.declarations[2]);
+        for statement in [&inspect.body.statements[0], &inspect.body.statements[1], &inspect.body.statements[3]] {
+            let capture = binding_initializer(statement);
+            assert_eq!(
+                checking.expressions[&capture.id].type_id,
+                types.types().recovery()
+            );
+        }
+        let valid = binding_initializer(&inspect.body.statements[5]);
+        assert!(!matches!(
+            types.types().get(checking.expressions[&valid.id].type_id),
+            Some(SemanticType::Recovery)
+        ));
+    }
+
+    #[test]
+    fn isolates_lambda_tracked_return_roots_from_the_enclosing_callable() {
+        let source = concat!(
+            "struct Inner {}\n",
+            "fn inspect(enclosing: *Inner) {\n",
+            "    const captured = lambda() -> *Inner { enclosing };\n",
+            "    const local = lambda() -> *Inner {\n",
+            "        const value = Inner {};\n",
+            "        value\n",
+            "    };\n",
+            "    const temporary = lambda() -> *Inner { Inner {} };\n",
+            "    const valid = lambda(input: *Inner) -> *Inner { input };\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 4, "{:#?}", checking.errors);
+        assert_eq!(
+            checking
+                .errors
+                .iter()
+                .filter(|error| {
+                    error.kind == ExpressionCheckingErrorKind::InvalidTrackedReturnSource
+                })
+                .count(),
+            3
+        );
+        assert_eq!(
+            checking
+                .errors
+                .iter()
+                .filter(|error| {
+                    error.kind == ExpressionCheckingErrorKind::BorrowContainingLambdaCapture
+                })
+                .count(),
+            1
+        );
+
+        let inspect = function(&program.declarations[1]);
+        let valid = binding_initializer(&inspect.body.statements[3]);
+        assert!(!matches!(
+            types.types().get(checking.expressions[&valid.id].type_id),
+            Some(SemanticType::Recovery)
+        ));
+    }
+
+    #[test]
     fn recovers_lambda_body_errors_without_parent_diagnostics_or_transfers() {
         let source = concat!(
             "fn main() {\n",
@@ -15540,6 +15704,8 @@ fn main() {
             "    const projected: *Item = boxed.project(heap);\n",
             "    boxed.redirect(false, heap, other);\n",
             "    const selected: *Item = choose(Item, boxed.inner, heap);\n",
+            "    projected;\n",
+            "    selected;\n",
             "}\n",
         );
         let (module, program, names, context, mut types, signatures) = prepare(source);

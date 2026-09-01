@@ -144,4 +144,12 @@ backing identities, and GC-owner rooting are implemented. Complete private
 origin, lifetime-intersection, GC-owner-root, and borrow-validity metadata is
 retained for ordinary callables, generated methods, and runtime callable
 specializations for post-type escape analysis, typed IR, and lowering.
-Conservative lambda capture rejection remains later Phase 7.6 work.
+Lambdas conservatively reject captures whose type is a tracked reference or
+transitively contains one, including tracked receivers and references backed by
+GC-owned storage. Each lambda has its own tracked-return roots, so only its own
+tracked or borrow-containing parameters may contribute to its escaping result.
+This restriction can be relaxed once authoritative closure escape analysis can
+prove that a particular callable cannot outlive all of its captured sources.
+
+Phase 7.6 is complete. References into relocatable collection buffers remain
+deferred until the corresponding built-ins define their invalidation rules.

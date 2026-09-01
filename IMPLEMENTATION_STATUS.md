@@ -192,6 +192,11 @@ tracked holder's live range. Ordinary callables, generated methods, and runtime
 callable specializations retain the same complete private-origin,
 lifetime-intersection, GC-owner-root, and borrow-validity metadata for post-type
 escape analysis, typed IR, and lowering.
+Lambdas reject direct and transitive tracked-reference captures, including
+tracked receivers and GC-backed tracked values, and isolate their permitted
+tracked-return roots from the enclosing callable. Phase 7.6 tracked non-GC
+reference integration is complete; references into relocatable collection
+buffers remain deferred with their built-ins.
 
 Declaration and signature collection is implemented for source and generated
 struct fields and functions, callable headers, interface requirements,

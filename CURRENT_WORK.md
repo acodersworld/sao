@@ -455,7 +455,7 @@ reviewable phases:
          deferred.
        - Complete: reviewed Change 4; Phase 7.5 is complete. Stop before Phase
          7.6.
-   - Phase 7.6, tracked non-GC references and lifetime links (in progress):
+   - Phase 7.6, tracked non-GC references and lifetime links (complete):
      - Change 1, syntax and canonical types (complete):
        - Complete: add `*T` as a first-class tracked borrowed-reference type. It describes
          a lifetime relationship, not a raw pointer or a distinct argument-passing
@@ -604,18 +604,20 @@ reviewable phases:
          shadowing, mutation and rebinding, recovery, and callable composition.
        - Implementation and documentation ready for review. Stop for review and
          commit before capture safety and final integration.
-     - Change 7, capture safety and final integration:
-       - Reject capturing `*T` or a transitively borrow-containing value in a
+     - Change 7, capture safety and final integration (complete):
+       - Complete: reject capturing `*T` or a transitively borrow-containing value in a
          lambda until authoritative capture and escape analysis can prove that
          the callable cannot outlive every source. Keep references into
          relocatable collection buffers deferred until their invalidation rules
          are defined with the corresponding built-ins.
-       - Add focused capture-safety and end-to-end tests, including invalid local
+       - Complete: add focused capture-safety and end-to-end tests, including invalid local
          and temporary returns. Update the complex-program test with direct,
          receiver-derived, multi-input, tuple-contained, and GC-backed tracked
          references.
-       - Update the tracked-reference design and implementation-status documents,
+       - Complete: update the tracked-reference design and implementation-status documents,
          review the completed integration, and mark Phase 7.6 complete.
+       - Implementation and documentation ready for review. Stop for review and
+         commit before Phase 7.7.
    - Phase 7.7, remaining built-ins and completion (pending):
      - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
        `yield`, `co`, and `defer`.

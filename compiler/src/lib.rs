@@ -116,6 +116,26 @@ struct DetailedFormatter {
     }
 }
 
+struct Detail {
+    value: int,
+}
+
+struct Record {
+    detail: Detail,
+
+    fn project(*self) -> *Detail {
+        self.detail
+    }
+}
+
+fn choose_detail(first: *Record, second: *Record) -> *Detail {
+    first.detail
+}
+
+fn pair_details(first: *Record, second: *Record) -> (*Detail, *Detail) {
+    (first.detail, second.detail)
+}
+
 fn cleanup(summary: Summary) {
     print(summary.name);
 }
@@ -146,6 +166,12 @@ fn main() {
     mut summary: Summary = Summary::new("language tour");
     const vmut shared_summary = summary;
     const heap_summary = &Summary::new("shared");
+    const record = Record { detail: Detail { value: initial } };
+    const heap_record = &Record { detail: Detail { value: initial } };
+    const direct_record: *Record = record;
+    const receiver_detail = record.project();
+    const selected_detail = choose_detail(record, heap_record);
+    const detail_pair = pair_details(record, heap_record);
     mut vconst stable_seed = initial;
 
     fn fibonacci(value: int) -> int {
@@ -287,6 +313,11 @@ fn main() {
     heap_scale(initial);
     notify();
     heap_summary.format("shared: ");
+    announce(direct_record.detail.value);
+    announce(receiver_detail.value);
+    announce(selected_detail.value);
+    announce(detail_pair.0.value);
+    announce(detail_pair.1.value);
     capabilities.format("capabilities: ");
     formatter_only.format("reduced: ");
     formatter_view.format("union: ");
