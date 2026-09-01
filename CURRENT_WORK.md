@@ -16,7 +16,8 @@ later documentation-only pass.
 ## Current phase
 
 Frontend syntax work is complete for the currently designed language. The
-active phase is semantic analysis, followed by typed IR and lowering.
+active work is type-checking Phase 7.7, remaining built-ins and completion,
+followed by post-type semantic analysis, typed IR, and lowering.
 
 For the semantic-analysis phase, use a hands-on, guided workflow. The project
 owner should write a substantial portion of the implementation in small,
@@ -618,14 +619,134 @@ reviewable phases:
          review the completed integration, and mark Phase 7.6 complete.
        - Implementation and documentation ready for review. Stop for review and
          commit before Phase 7.7.
-   - Phase 7.7, remaining built-ins and completion (pending):
-     - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
-       `yield`, `co`, and `defer`.
-   - Aggregate deterministic diagnostics and expose successful semantic
-     metadata for expressions, bindings, declarations, and callable signatures.
-   - Add comprehensive tests and update implementation-status documents only
-     after the complete pass is implemented.
-
+   - Phase 7.7, remaining built-ins and completion (in progress):
+     - Implement this phase as seven independently reviewable changes. Stop
+       after each change so it can be reviewed and committed before beginning
+       the next one. The compiler-known signature catalogue is already
+       collected, but expression checking currently handles only the completed
+       string/byte operations and ordinary callable behavior shared by some
+       global built-ins. The changes below must resolve each built-in operation
+       explicitly and retain lowering-facing metadata rather than relying on
+       later name or member lookup.
+     - Change 1, parameterized built-in construction and `Error` values:
+       - Check associated selection and calls for `Queue(T)::new()`,
+         `Vector(T)::new()`, and `Map(K, V)::new()`. Each constructor takes no
+         runtime arguments and produces a fresh mutable value of its exact
+         applied type. Vector and Map APIs beyond empty construction remain
+         deferred by design.
+       - Check both `Error(T)::new(value)` and inferred `Error::new(value)`.
+         The explicit form checks the payload against `T`; the inferred form
+         uses an expected `Error(T)` when available and otherwise uses the
+         payload's exact type without inventing a payload union.
+       - Implement the immutable built-in `.value` field and the specific
+         covariant conversion from `Error(A)` to `Error(B)` when `A` is
+         contextually assignable to `B`. Payload access must not increase its
+         capability. Preserve value transfers, union injection, tracked
+         origins, and recovery behavior through construction, field access,
+         and widening.
+       - Record resolved constructor, field, inference, and Error-widening
+         metadata. Add focused tests for first-class constructor selection,
+         arity, explicit and expected-type inference, invalid payloads,
+         capability reduction, tracked payload propagation, and deterministic
+         recovery.
+       - Stop for review and commit before implementing queue operations.
+     - Change 2, queue operations and external-buffer ownership:
+       - Check `queue.send(value)` and `queue.try_receive()`, for a value of
+         type `Queue(T)`, including a
+         mutable receiver, exact method selection, argument counts, and the
+         `T | none` receive result. Retain the existing prohibition on `T`
+         containing `none`.
+       - Treat `send` as an owning boundary: move fresh plain values, require an
+         explicit copy for named nontrivial plain values, and copy GC references
+         with the capability admitted by `T`. Preserve the Phase 7.6 rejection
+         of transitively borrow-containing Queue, Vector, and Map storage.
+       - Record resolved queue-operation, receiver, element-transfer, and
+         receive-union metadata. Do not add implicit scheduling, blocking
+         receives, collection iteration, or references into relocatable
+         buffers.
+       - Add focused tests for receiver mutability, sends of every storage
+         category, empty/nonempty receive typing, member misuse, recovery, and
+         source evaluation order.
+       - Stop for review and commit before implementing the remaining ordinary
+         compiler-known functions.
+     - Change 3, ASCII, output, panic, and yield built-ins:
+       - Resolve and check `ascii.encode(string) -> mut bytes`,
+         `ascii.decode(bytes) -> string | Error(string)`,
+         `print(string) -> ()`, `println(string) -> ()`,
+         `panic(string) ->` divergence, and `yield() -> ()` through the shared
+         call rules. Reject namespace/value misuse and unsupported members.
+       - Preserve ordinary left-to-right call evaluation and parameter
+         transfers. Record stable built-in operation identities, including the
+         ASCII decode result shape, output mode, panic divergence, and yield
+         scheduling point, for typed IR and lowering.
+       - Add focused tests for type and arity errors, first-class callable
+         values where specified, namespace selection, result categories,
+         divergence and unreachable tails, recovery, and metadata.
+       - Stop for review and commit before implementing error propagation.
+     - Change 4, postfix error propagation:
+       - Check `operand?` only for a normalized `S | Error(E)` operand. Evaluate
+         the operand once, produce the complete non-error remainder `S`, and
+         model the error alternative as an early return from the current
+         callable. Require its declared result to accept the propagated
+         `Error(E)`, including the built-in Error payload widening from Change
+         1.
+       - Define and test invalid operands, missing or ambiguous Error members,
+         no success remainder, incompatible callable results, recovery without
+         parent cascades, and interaction with tracked origins and temporary
+         ownership.
+       - Record success projection, propagated member, return conversion and
+         transfer, single-evaluation, and control-flow-edge metadata. Integrate
+         the propagation edge with narrowing-lock release and flow-sensitive
+         borrow validity; lexical defer cleanup is attached in Change 6.
+       - Stop for review and commit before implementing coroutine starts.
+     - Change 5, coroutine starts:
+       - Type-check the call wrapped by `co` using ordinary receiver and
+         argument evaluation and transfer rules, but give the statement type
+         `()` and discard the callable's eventual result regardless of its
+         type. The called body does not execute at the statement.
+       - Record the resolved call target plus the prepared receiver and
+         arguments in source evaluation order for later coroutine-frame
+         construction. Preserve enough retained-position information for
+         post-type capture and escape analysis; do not introduce handles,
+         joins, cancellation, or parent-child lifetimes.
+       - Add focused tests for functions, methods, callable values, argument
+         and receiver failures, discarded Error and non-Error results,
+         tracked/borrowed inputs, recovery, and metadata.
+       - Stop for review and commit before implementing lexical defer.
+     - Change 6, lexical defer:
+       - Type-check the call wrapped by `defer`, evaluating and saving its
+         function value or receiver and arguments immediately while discarding
+         the eventual result. Associate each registration with its innermost
+         executable lexical block and preserve reverse registration order.
+       - Record cleanup edges for normal block completion and every exited
+         scope on `return`, `break`, `continue`, and the Error-propagation path
+         from Change 4. Evaluate transfer values before cleanup.
+         Panic has no cleanup edge. A deferred call may yield normally.
+       - Integrate cleanup edges with narrowing locks, tracked-origin validity,
+         GC rooting, loop iterations and backedges, unreachable code, generated
+         methods, and runtime callable specializations. Retain saved-value
+         lifetime facts for post-type capture and escape analysis.
+       - Add focused tests for nested scopes, conditional registration, LIFO
+         order, each exit kind, loop iterations, yielding cleanup calls,
+         panic/non-unwinding behavior, recovery, and lowering-facing metadata.
+       - Stop for review and commit before final type-checking integration.
+     - Change 7, diagnostics and type-checking completion:
+       - Audit all Phase 7.7 paths for deterministic source-ordered diagnostics
+         and complete successful semantic metadata for expressions, bindings,
+         declarations, callable signatures, generated methods, and runtime
+         specializations. Ensure recovery nodes do not suppress independent
+         later diagnostics or create parent cascades.
+       - Add end-to-end coverage combining construction, queues, Error
+         widening and `?`, ASCII conversion, output, panic, yield, `co`, and
+         nested `defer`. Extend the complex-program test only with behavior
+         specified by the design; keep Vector and Map APIs and other deferred
+         features out of scope.
+       - Update `IMPLEMENTATION_STATUS.md` with what is actually implemented,
+         review the completed semantic pass, and mark Phase 7.7 complete.
+         Continue to leave authoritative capture/escape decisions and typed IR
+         emission to post-type semantic analysis.
+       - Stop for review and commit before beginning post-type semantic
+         analysis.
 Type checking consumes successful name and context resolution. Capture analysis
 and typed IR remain separate post-type work. Do not begin a later phase until
 the current phase and its focused tests have been reviewed.
@@ -635,8 +756,9 @@ the current phase and its focused tests have been reviewed.
 1. Post-type semantic analysis
    - Analyze lambda and anonymous-struct captures, shared mutable capture cells,
      and forbidden captures by nested named functions.
-   - Record the Error-propagation, coroutine-call, and deferred-call metadata
-     required by lowering, and emit a typed program representation.
+   - Consume and finalize the type checker's Error-propagation, coroutine-call,
+     and deferred-call metadata for lowering, and emit a typed program
+     representation.
    - Run per-function escape analysis after capture discovery. Reject borrowed
      values reaching retained positions and record frame tracing, borrowed-view
      traversal, recursive copies, and cleanup requirements for typed IR.
