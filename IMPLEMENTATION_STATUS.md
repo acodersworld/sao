@@ -183,8 +183,12 @@ bindings, copying, projection, union conversion, calls, and returns. Direct
 tracked returns retain their stricter tracked-parameter rule, while aggregate
 returns may also propagate origins already carried by borrow-containing inputs.
 GC allocation, GC fields, and `Queue`/`Vector`/`Map` external-buffer storage of
-transitively borrow-containing types are rejected. Flow-sensitive validity and
-GC-owner rooting are not yet implemented.
+transitively borrow-containing types are rejected. Tracked origins merge
+through conditionals and loop fixed points. Redirected reference slots preserve
+distinct displaced backing storage, replacement of an ancestor with a live
+interior reference is rejected, last-use analysis ends constraints
+non-lexically, and GC-backed origins record the owner roots required for the
+tracked holder's live range.
 
 Declaration and signature collection is implemented for source and generated
 struct fields and functions, callable headers, interface requirements,

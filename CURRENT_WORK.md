@@ -571,19 +571,27 @@ reviewable phases:
        - Implementation and documentation ready for review. Stop for review and
          commit before implementing flow-sensitive validity and GC rooting.
      - Change 5, flow-sensitive validity and GC rooting:
-       - Rebinding a reference slot does not invalidate existing references to
-         the old backing storage, while replacement or movement which could make
-         an interior address invalid is rejected for the reference's live range.
+       - Complete: rebinding a reference slot does not invalidate existing
+         references to the old backing storage, while replacement or movement
+         which could make an interior address invalid is rejected for the
+         reference's live range.
          Do not implement Rust-style exclusive mutable borrowing: multiple
          tracked references may alias the same stable storage, and `*mut T`
          controls mutation through that particular view rather than proving that
          no other views exist. SAO remains single-threaded, and this phase tracks
          storage validity rather than data-race freedom.
-       - Keep a GC owner rooted while a tracked reference into its payload remains
-         live.
-       - Integrate tracked references with control-flow joins, returns, calls,
-         assignments, conditionals, loops, union tag locks, and interface views.
-       - Stop for review and commit before integration and completion.
+       - Complete: keep a GC owner rooted while a tracked reference into its
+         payload remains live.
+       - Complete: integrate tracked references with control-flow joins,
+         returns, calls, assignments, conditionals, loops, union tag locks, and
+         interface views.
+       - Complete: add focused coverage for branch-sensitive last use, aliasing,
+         exact and ancestor replacement, slot and GC-root transitions, loop
+         backedges, `break`, `continue`, linked calls, tuple paths, union tag
+         locks, tracked interface and ordinary receivers, shadowing, recovery,
+         and displaced roots.
+       - Implementation and documentation ready for review. Stop for review and
+         commit before integration and completion.
      - Change 6, integration and completion:
        - Record private origin, lifetime-intersection, GC-owner-root, and borrow-
          validity metadata for post-type escape analysis, typed IR, and lowering.

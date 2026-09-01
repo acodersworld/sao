@@ -108,7 +108,27 @@ field, or used as an element, key, or value in `Queue`, `Vector`, or `Map`
 external-buffer storage. `Error(T)`, tuples, unions, and plain structs remain
 inline and therefore propagate tracked origins transitively.
 
-## 21.6 Current implementation boundary
+## 21.6 Flow-sensitive validity and GC rooting
+
+Tracked origins held by mutable reference slots and borrow-containing inline
+values are flow facts. Conditional joins retain every possible origin, and loop
+heads are checked to a fixed point so backedges, `break`, and `continue` cannot
+discard a shorter contributing lifetime.
+
+Redirecting a root binding preserves its former backing storage for existing
+tracked references and gives that displaced storage a distinct physical
+identity. Replacing a strict ancestor of a live interior address is invalid;
+mutating or replacing the referenced leaf itself keeps its address stable. A
+tracked holder ceases to constrain mutation after its last use. This is storage
+validity analysis, not exclusive borrowing: const and mutable tracked views may
+alias, and `*mut T` grants capability only through that view.
+
+When a live tracked value has a GC-backed physical origin, the checker records
+that owner as a tracing root for the holder's live range. Redirecting either the
+owner slot or the tracked slot preserves the old owner only for references
+which still denote it.
+
+## 21.7 Current implementation boundary
 
 The frontend currently parses, names, formats, resolves, interns, compares,
 capability-qualifies, and template-substitutes tracked-reference types. Its
@@ -118,6 +138,8 @@ automatically dereferences them for member access, and records physical place
 provenance.
 
 Callable lifetime links, tracked receivers, tracked-return origin validation,
-caller-side temporary escape checks, and borrow-containing inline aggregates
-and unions are implemented. Flow-sensitive validity and GC-owner rooting remain
-later Phase 7.6 work.
+caller-side temporary escape checks, borrow-containing inline aggregates and
+unions, flow-sensitive origin joins, interior-address validity, displaced
+backing identities, and GC-owner rooting are implemented. Lowering-facing
+metadata completion and conservative lambda capture rejection remain later
+Phase 7.6 work.

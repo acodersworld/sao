@@ -88,6 +88,7 @@ struct LoopResultPath {
     span: Span,
     typed: TypedExpression,
     categories: HashMap<SymbolId, ValueCategory>,
+    tracked_bindings: TrackedBindingState,
     narrowings: NarrowingState,
 }
 
@@ -99,7 +100,11 @@ struct ActiveLoop {
     expression: NodeId,
     expected_result_type: Option<TypeId>,
     breaks: Vec<LoopResultPath>,
-    continues: Vec<(HashMap<SymbolId, ValueCategory>, NarrowingState)>,
+    continues: Vec<(
+        HashMap<SymbolId, ValueCategory>,
+        TrackedBindingState,
+        NarrowingState,
+    )>,
     entry_narrowings: NarrowingState,
 }
 
@@ -107,6 +112,7 @@ struct ActiveLoop {
 struct LoopIterationOutcome {
     breaks: Vec<LoopResultPath>,
     natural_categories: Option<HashMap<SymbolId, ValueCategory>>,
+    natural_tracked_bindings: Option<TrackedBindingState>,
     natural_narrowings: Option<NarrowingState>,
     invalid: bool,
 }
@@ -158,6 +164,9 @@ struct InterfaceView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum PhysicalPlaceRoot {
     Symbol(SymbolId),
+    /// Backing storage retained after its source-level reference slot was
+    /// redirected. It remains stable but no longer denotes later symbol reads.
+    DisplacedSymbol(SymbolId, NodeId),
     SelfValue(NodeId),
     Expression(NodeId),
 }
@@ -166,6 +175,9 @@ enum PhysicalPlaceRoot {
 enum PhysicalPlaceProjection {
     Field(NodeId),
     TupleElement(usize),
+    /// A callable links this result to an input without exposing the private
+    /// interior path selected by its implementation.
+    OpaqueDerived,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -227,6 +239,7 @@ struct NarrowingFact {
 }
 
 type NarrowingState = HashMap<NarrowingPlace, Vec<NarrowingFact>>;
+type TrackedBindingState = HashMap<SymbolId, TrackedLifetimeLink>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NarrowingLockKind {
@@ -583,6 +596,7 @@ enum ExpressionCheckingErrorKind {
     BorrowContainingExternalBuffer {
         found: TypeId,
     },
+    TrackedBorrowInvalidated,
     NotCallable {
         found: TypeId,
     },
@@ -675,6 +689,15 @@ struct ExpressionChecking {
     /// Reading the binding restores these rather than treating the slot itself
     /// as ownership of the referenced storage.
     tracked_binding_lifetimes: HashMap<SymbolId, TrackedLifetimeLink>,
+    /// GC-backed owners which must remain traced while the tracked value held
+    /// by a binding is live. The key is the binding or assignment node which
+    /// established that lifetime.
+    gc_owner_roots: HashMap<NodeId, Vec<PhysicalPlace>>,
+    /// Writes rejected because they replace an ancestor of a live interior
+    /// tracked reference. Retaining the conflicting sources lets later IR
+    /// diagnostics and lowering avoid reconstructing physical-place overlap.
+    borrow_invalidations: HashMap<NodeId, Vec<PhysicalPlace>>,
+    displaced_roots: HashMap<NodeId, PhysicalPlaceRoot>,
     tracked_call_inputs: HashMap<NodeId, Vec<PhysicalPlace>>,
     borrow_containing_call_inputs: HashMap<NodeId, Vec<PhysicalPlace>>,
     /// Stable storage routes for place expressions. Keeping this separate from
@@ -729,6 +752,9 @@ struct GeneratedMethodChecking {
     tracked_parameter_borrows: HashMap<NodeId, TrackedParameterBorrow>,
     tracked_lifetime_links: HashMap<NodeId, TrackedLifetimeLink>,
     tracked_binding_lifetimes: HashMap<SymbolId, TrackedLifetimeLink>,
+    gc_owner_roots: HashMap<NodeId, Vec<PhysicalPlace>>,
+    borrow_invalidations: HashMap<NodeId, Vec<PhysicalPlace>>,
+    displaced_roots: HashMap<NodeId, PhysicalPlaceRoot>,
     physical_places: HashMap<NodeId, PhysicalPlace>,
     resolved_members: HashMap<NodeId, ResolvedMember>,
     runtime_specialization_calls: HashMap<NodeId, RuntimeCallableSpecializationId>,
@@ -757,6 +783,13 @@ struct LexicalIndex {
     callable_parents: HashMap<NodeId, Option<NodeId>>,
     symbol_owners: HashMap<SymbolId, NodeId>,
     receiver_qualifiers: HashMap<NodeId, BindingQualifiers>,
+    symbol_references: HashMap<SymbolId, Vec<NodeId>>,
+    loop_symbol_references: HashMap<NodeId, HashSet<SymbolId>>,
+    active_loops: Vec<NodeId>,
+    expression_branches: HashMap<NodeId, Vec<(NodeId, u8)>>,
+    active_branches: Vec<(NodeId, u8)>,
+    expression_spans: HashMap<NodeId, Span>,
+    mutation_ends: HashMap<NodeId, usize>,
 }
 
 impl LexicalIndex {
@@ -784,6 +817,8 @@ impl LexicalIndex {
         parent: Option<NodeId>,
         names: &NameResolution,
     ) {
+        let enclosing_loops = std::mem::take(&mut self.active_loops);
+        let enclosing_branches = std::mem::take(&mut self.active_branches);
         self.callable_parents.insert(function.id, parent);
         self.record_parameters(function.id, &function.parameters, names);
         if let Some(receiver) = function
@@ -795,6 +830,8 @@ impl LexicalIndex {
                 .insert(function.id, receiver.qualifiers);
         }
         self.visit_block(&function.body, function.id, names);
+        self.active_loops = enclosing_loops;
+        self.active_branches = enclosing_branches;
     }
 
     fn record_parameters(
@@ -850,9 +887,25 @@ impl LexicalIndex {
         callable: NodeId,
         names: &NameResolution,
     ) {
+        self.expression_branches
+            .insert(expression.id, self.active_branches.clone());
+        self.expression_spans.insert(expression.id, expression.span);
         match &expression.kind {
-            ExpressionKind::Identifier
-            | ExpressionKind::SelfValue
+            ExpressionKind::Identifier => {
+                if let Some(symbol) = names.symbol_for_reference(expression.id) {
+                    self.symbol_references
+                        .entry(symbol)
+                        .or_default()
+                        .push(expression.id);
+                    for loop_id in &self.active_loops {
+                        self.loop_symbol_references
+                            .entry(*loop_id)
+                            .or_default()
+                            .insert(symbol);
+                    }
+                }
+            }
+            ExpressionKind::SelfValue
             | ExpressionKind::Literal(_)
             | ExpressionKind::AssociatedAccess { .. } => {}
             ExpressionKind::TypeValue(type_syntax) => self.visit_type(type_syntax, names),
@@ -877,8 +930,13 @@ impl LexicalIndex {
                     self.visit_expression(element, callable, names);
                 }
             }
-            ExpressionKind::Block(block) | ExpressionKind::Loop { body: block } => {
+            ExpressionKind::Block(block) => {
                 self.visit_block(block, callable, names);
+            }
+            ExpressionKind::Loop { body } => {
+                self.active_loops.push(expression.id);
+                self.visit_block(body, callable, names);
+                self.active_loops.pop();
             }
             ExpressionKind::If {
                 condition,
@@ -886,14 +944,18 @@ impl LexicalIndex {
                 else_branch,
             } => {
                 self.visit_expression(condition, callable, names);
+                self.active_branches.push((expression.id, 0));
                 self.visit_block(then_branch, callable, names);
+                self.active_branches.pop();
                 if let Some(else_branch) = else_branch {
+                    self.active_branches.push((expression.id, 1));
                     match else_branch {
                         ConditionalElse::Block(block) => self.visit_block(block, callable, names),
                         ConditionalElse::If(expression) => {
                             self.visit_expression(expression, callable, names);
                         }
                     }
+                    self.active_branches.pop();
                 }
             }
             ExpressionKind::While {
@@ -901,11 +963,13 @@ impl LexicalIndex {
                 body,
                 else_branch,
             } => {
+                self.active_loops.push(expression.id);
                 self.visit_expression(condition, callable, names);
                 self.visit_block(body, callable, names);
                 if let Some(block) = else_branch {
                     self.visit_block(block, callable, names);
                 }
+                self.active_loops.pop();
             }
             ExpressionKind::RangeFor {
                 start,
@@ -914,6 +978,7 @@ impl LexicalIndex {
                 else_branch,
                 ..
             } => {
+                self.active_loops.push(expression.id);
                 self.visit_expression(start, callable, names);
                 self.visit_expression(end, callable, names);
                 let symbol = names
@@ -924,6 +989,7 @@ impl LexicalIndex {
                 if let Some(block) = else_branch {
                     self.visit_block(block, callable, names);
                 }
+                self.active_loops.pop();
             }
             ExpressionKind::Lambda {
                 parameters, body, ..
@@ -961,14 +1027,26 @@ impl LexicalIndex {
                 left: object,
                 right: index,
                 ..
-            }
-            | ExpressionKind::Assignment {
-                target: object,
-                value: index,
-                ..
             } => {
                 self.visit_expression(object, callable, names);
                 self.visit_expression(index, callable, names);
+            }
+            ExpressionKind::Assignment {
+                target,
+                operator,
+                value,
+            } => {
+                self.mutation_ends.insert(target.id, expression.span.end);
+                self.expression_branches
+                    .entry(target.id)
+                    .or_insert_with(|| self.active_branches.clone());
+                self.expression_spans.entry(target.id).or_insert(target.span);
+                if *operator != AssignmentOperator::Assign
+                    || !matches!(&target.kind, ExpressionKind::Identifier)
+                {
+                    self.visit_expression(target, callable, names);
+                }
+                self.visit_expression(value, callable, names);
             }
             ExpressionKind::Slice { object, start, end } => {
                 self.visit_expression(object, callable, names);
@@ -1066,6 +1144,11 @@ struct Analyzer<'semantic> {
     callable_parents: HashMap<NodeId, Option<NodeId>>,
     symbol_owners: HashMap<SymbolId, NodeId>,
     receiver_qualifiers: HashMap<NodeId, BindingQualifiers>,
+    symbol_references: HashMap<SymbolId, Vec<NodeId>>,
+    loop_symbol_references: HashMap<NodeId, HashSet<SymbolId>>,
+    expression_branches: HashMap<NodeId, Vec<(NodeId, u8)>>,
+    expression_spans: HashMap<NodeId, Span>,
+    mutation_ends: HashMap<NodeId, usize>,
     /// Aggregate declarations and expressions in source discovery order. The
     /// order is retained so recursive-layout diagnostics are deterministic.
     aggregate_order: Vec<TypeId>,
@@ -1077,6 +1160,9 @@ struct Analyzer<'semantic> {
     /// Flow-sensitive provenance of the storage currently denoted by each
     /// binding. Declared type and qualifiers remain in `checking.bindings`.
     current_binding_categories: HashMap<SymbolId, ValueCategory>,
+    /// Flow-sensitive origins held by tracked-reference slots and inline
+    /// values which transitively contain tracked references.
+    current_tracked_bindings: TrackedBindingState,
     /// Flow facts currently guaranteed on this path. Each stack entry owns one
     /// runtime tag lock and therefore must be released exactly once.
     current_narrowings: NarrowingState,
@@ -1144,6 +1230,13 @@ impl<'semantic> Analyzer<'semantic> {
             callable_parents,
             symbol_owners,
             receiver_qualifiers,
+            symbol_references,
+            loop_symbol_references,
+            active_loops: _,
+            expression_branches,
+            active_branches: _,
+            expression_spans,
+            mutation_ends,
         } = LexicalIndex::build(program, names);
         let mut method_owners = HashMap::new();
         let mut aggregate_order = Vec::new();
@@ -1239,11 +1332,17 @@ impl<'semantic> Analyzer<'semantic> {
             callable_parents,
             symbol_owners,
             receiver_qualifiers,
+            symbol_references,
+            loop_symbol_references,
+            expression_branches,
+            expression_spans,
+            mutation_ends,
             aggregate_order,
             aggregate_layouts,
             runtime_generated_structs: HashMap::new(),
             runtime_generated_callables: HashMap::new(),
             current_binding_categories: HashMap::new(),
+            current_tracked_bindings: HashMap::new(),
             current_narrowings: HashMap::new(),
             current_path_reachable: true,
             current_tracked_return_roots: HashSet::new(),
@@ -1358,6 +1457,9 @@ impl<'semantic> Analyzer<'semantic> {
                     tracked_parameter_borrows: local_checking.tracked_parameter_borrows,
                     tracked_lifetime_links: local_checking.tracked_lifetime_links,
                     tracked_binding_lifetimes: local_checking.tracked_binding_lifetimes,
+                    gc_owner_roots: local_checking.gc_owner_roots,
+                    borrow_invalidations: local_checking.borrow_invalidations,
+                    displaced_roots: local_checking.displaced_roots,
                     physical_places: local_checking.physical_places,
                     resolved_members: local_checking.resolved_members,
                     runtime_specialization_calls: method_specialization_calls,
@@ -1372,6 +1474,8 @@ impl<'semantic> Analyzer<'semantic> {
 
     fn visit_function(&mut self, function: &Function) {
         let enclosing_categories = self.current_binding_categories.clone();
+        let enclosing_tracked_bindings =
+            std::mem::take(&mut self.current_tracked_bindings);
         let enclosing_narrowings = std::mem::take(&mut self.current_narrowings);
         let enclosing_reachability = self.current_path_reachable;
         let enclosing_loops = std::mem::take(&mut self.active_loops);
@@ -1448,6 +1552,7 @@ impl<'semantic> Analyzer<'semantic> {
         self.visit_callable_body(&function.body, return_type);
         self.release_all_narrowings(function.body.id, NarrowingEdgeKind::CallableCompletion);
         self.current_binding_categories = enclosing_categories;
+        self.current_tracked_bindings = enclosing_tracked_bindings;
         self.current_narrowings = enclosing_narrowings;
         self.current_path_reachable = enclosing_reachability;
         self.active_loops = enclosing_loops;
@@ -1486,6 +1591,17 @@ impl<'semantic> Analyzer<'semantic> {
                 },
             );
             self.current_binding_categories.insert(symbol, category);
+            if self.type_contains_tracked_reference(type_id) {
+                let link = TrackedLifetimeLink {
+                    sources: vec![PhysicalPlace {
+                        root: PhysicalPlaceRoot::Symbol(symbol),
+                        projections: Vec::new(),
+                        storage: category,
+                    }],
+                };
+                self.current_tracked_bindings.insert(symbol, link.clone());
+                self.checking.tracked_binding_lifetimes.insert(symbol, link);
+            }
         }
         assert!(
             semantic_parameters.next().is_none(),
@@ -1643,6 +1759,7 @@ impl<'semantic> Analyzer<'semantic> {
         }
         if self.current_path_reachable {
             let categories = self.current_binding_categories.clone();
+            let tracked_bindings = self.current_tracked_bindings.clone();
             let narrowings = self
                 .active_loops
                 .last()
@@ -1662,6 +1779,7 @@ impl<'semantic> Analyzer<'semantic> {
                 span: value.map_or(statement.span, |value| value.span),
                 typed,
                 categories,
+                tracked_bindings,
                 narrowings,
             });
         }
@@ -1693,6 +1811,7 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("continue statement must have a resolved loop target");
         if self.current_path_reachable {
             let categories = self.current_binding_categories.clone();
+            let tracked_bindings = self.current_tracked_bindings.clone();
             let narrowings = self.current_narrowings.clone();
             let active = self
                 .active_loops
@@ -1702,7 +1821,9 @@ impl<'semantic> Analyzer<'semantic> {
                 active.expression, target,
                 "resolved continue target must be the innermost active loop"
             );
-            active.continues.push((categories, narrowings));
+            active
+                .continues
+                .push((categories, tracked_bindings, narrowings));
         }
         let destination = self
             .active_loops
@@ -1723,11 +1844,16 @@ impl<'semantic> Analyzer<'semantic> {
             self.current_path_reachable = enclosing_reachability && can_reach_block_end;
             let unreachable_categories =
                 (!self.current_path_reachable).then(|| self.current_binding_categories.clone());
+            let unreachable_tracked_bindings =
+                (!self.current_path_reachable).then(|| self.current_tracked_bindings.clone());
             let unreachable_narrowings =
                 (!self.current_path_reachable).then(|| self.current_narrowings.clone());
             let flow = self.visit_statement(statement);
             if let Some(categories) = unreachable_categories {
                 self.current_binding_categories = categories;
+            }
+            if let Some(bindings) = unreachable_tracked_bindings {
+                self.current_tracked_bindings = bindings;
             }
             if let Some(narrowings) = unreachable_narrowings {
                 self.current_narrowings = narrowings;
@@ -1815,16 +1941,37 @@ impl<'semantic> Analyzer<'semantic> {
             },
         );
         let sources = self.tracked_lifetime_sources(initializer);
-        if sources.is_empty() {
-            self.checking.tracked_binding_lifetimes.remove(&symbol);
-        } else {
-            self.checking.tracked_binding_lifetimes.insert(
-                symbol,
-                TrackedLifetimeLink { sources },
-            );
-        }
+        self.set_tracked_binding_sources(statement.id, symbol, sources);
         self.current_binding_categories.insert(symbol, category);
         Some(source)
+    }
+
+    fn set_tracked_binding_sources(
+        &mut self,
+        node: NodeId,
+        symbol: SymbolId,
+        sources: Vec<PhysicalPlace>,
+    ) {
+        if sources.is_empty() {
+            self.current_tracked_bindings.remove(&symbol);
+            self.checking.tracked_binding_lifetimes.remove(&symbol);
+            self.checking.gc_owner_roots.remove(&node);
+            return;
+        }
+        let link = TrackedLifetimeLink {
+            sources: sources.clone(),
+        };
+        self.current_tracked_bindings.insert(symbol, link.clone());
+        self.checking.tracked_binding_lifetimes.insert(symbol, link);
+        let gc_roots: Vec<_> = sources
+            .into_iter()
+            .filter(|source| source.storage == ValueCategory::GcReference)
+            .collect();
+        if gc_roots.is_empty() || !self.symbol_is_live_after(symbol, node) {
+            self.checking.gc_owner_roots.remove(&node);
+        } else {
+            self.checking.gc_owner_roots.insert(node, gc_roots);
+        }
     }
 
     fn remove_tracked_borrow_for_expression(&mut self, expression: &Expression) {
@@ -1896,12 +2043,26 @@ impl<'semantic> Analyzer<'semantic> {
             && sources
                 .iter()
                 .all(|source| {
-                    self.current_tracked_return_roots.contains(&source.root)
+                    self.return_roots_contain(&self.current_tracked_return_roots, source.root)
                         || (aggregate_result
-                            && self
-                                .current_borrow_containing_return_roots
-                                .contains(&source.root))
+                            && self.return_roots_contain(
+                                &self.current_borrow_containing_return_roots,
+                                source.root,
+                            ))
                 })
+    }
+
+    fn return_roots_contain(
+        &self,
+        permitted: &HashSet<PhysicalPlaceRoot>,
+        source: PhysicalPlaceRoot,
+    ) -> bool {
+        permitted.contains(&source)
+            || matches!(
+                source,
+                PhysicalPlaceRoot::DisplacedSymbol(symbol, _)
+                    if permitted.contains(&PhysicalPlaceRoot::Symbol(symbol))
+            )
     }
 
     fn tracked_lifetime_sources(&self, expression: &Expression) -> Vec<PhysicalPlace> {
@@ -2132,6 +2293,8 @@ impl<'semantic> Analyzer<'semantic> {
         if local_symbols.is_empty() {
             return;
         }
+        self.current_tracked_bindings
+            .retain(|symbol, _| !local_symbols.contains(symbol));
         let from = self.current_narrowings.clone();
         self.current_narrowings.retain(|place, _| {
             !matches!(place.root, NarrowingRoot::Symbol(symbol) if local_symbols.contains(&symbol))
@@ -2484,12 +2647,16 @@ impl<'semantic> Analyzer<'semantic> {
             .primitive(PrimitiveType::Unit, AccessCapability::Const);
         let mut condition_invalid = false;
         let incoming_categories = self.current_binding_categories.clone();
+        let incoming_tracked_bindings = self.current_tracked_bindings.clone();
         let incoming_narrowings = self.current_narrowings.clone();
         let mut fallthrough_categories = incoming_categories.clone();
+        let mut fallthrough_tracked_bindings = incoming_tracked_bindings.clone();
         let mut fallthrough_narrowings = Some(incoming_narrowings.clone());
         let mut branches =
             Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
         let mut branch_categories =
+            Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
+        let mut branch_tracked_bindings =
             Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
         let mut branch_narrowings =
             Vec::with_capacity(arms.len() + if final_else.is_some() { 1 } else { 0 });
@@ -2499,6 +2666,7 @@ impl<'semantic> Analyzer<'semantic> {
             .collect();
         for (_, condition, branch) in arms {
             self.current_binding_categories = fallthrough_categories;
+            self.current_tracked_bindings = fallthrough_tracked_bindings;
             let condition_reachable = fallthrough_narrowings.is_some();
             self.current_narrowings = fallthrough_narrowings
                 .clone()
@@ -2509,12 +2677,14 @@ impl<'semantic> Analyzer<'semantic> {
             self.current_path_reachable = enclosing_reachability;
             condition_invalid |= condition_flow.invalid;
             fallthrough_categories = self.current_binding_categories.clone();
+            fallthrough_tracked_bindings = self.current_tracked_bindings.clone();
             fallthrough_narrowings = if condition_reachable {
                 condition_flow.when_false
             } else {
                 None
             };
             self.current_binding_categories = fallthrough_categories.clone();
+            self.current_tracked_bindings = fallthrough_tracked_bindings.clone();
             let true_narrowings = if condition_reachable {
                 condition_flow.when_true
             } else {
@@ -2542,6 +2712,7 @@ impl<'semantic> Analyzer<'semantic> {
             }
             branches.push((branch, branch_outcome));
             branch_categories.push(self.current_binding_categories.clone());
+            branch_tracked_bindings.push(self.current_tracked_bindings.clone());
             branch_narrowings.push(
                 (!self.is_divergence(branch_outcome.typed.type_id))
                     .then(|| self.current_narrowings.clone()),
@@ -2549,6 +2720,7 @@ impl<'semantic> Analyzer<'semantic> {
         }
         if let Some(branch) = final_else {
             self.current_binding_categories = fallthrough_categories.clone();
+            self.current_tracked_bindings = fallthrough_tracked_bindings.clone();
             let else_reachable = fallthrough_narrowings.is_some();
             self.current_narrowings = fallthrough_narrowings
                 .clone()
@@ -2573,6 +2745,7 @@ impl<'semantic> Analyzer<'semantic> {
             }
             branches.push((branch, branch_outcome));
             branch_categories.push(self.current_binding_categories.clone());
+            branch_tracked_bindings.push(self.current_tracked_bindings.clone());
             branch_narrowings.push(
                 (!self.is_divergence(branch_outcome.typed.type_id))
                     .then(|| self.current_narrowings.clone()),
@@ -2591,6 +2764,19 @@ impl<'semantic> Analyzer<'semantic> {
         }
         self.current_binding_categories =
             self.merge_binding_categories(&incoming_categories, &completing_categories);
+        let mut completing_tracked_bindings: Vec<_> = branches
+            .iter()
+            .zip(&branch_tracked_bindings)
+            .filter(|((_, outcome), _)| !self.is_divergence(outcome.typed.type_id))
+            .map(|(_, bindings)| bindings)
+            .collect();
+        if !has_else {
+            completing_tracked_bindings.push(&fallthrough_tracked_bindings);
+        }
+        self.current_tracked_bindings = self.merge_tracked_binding_states(
+            &incoming_tracked_bindings,
+            &completing_tracked_bindings,
+        );
         let mut completing_narrowings: Vec<_> = branch_narrowings
             .iter()
             .filter_map(Option::as_ref)
@@ -2882,6 +3068,40 @@ impl<'semantic> Analyzer<'semantic> {
             .collect()
     }
 
+    /// Merges tracked origins at a control-flow join. An origin present on any
+    /// completing path is retained: a later use of the binding can observe
+    /// any of those values, so its effective lifetime is their intersection.
+    fn merge_tracked_binding_states(
+        &self,
+        incoming: &TrackedBindingState,
+        completing: &[&TrackedBindingState],
+    ) -> TrackedBindingState {
+        if completing.is_empty() {
+            return incoming.clone();
+        }
+        let mut merged = TrackedBindingState::new();
+        let mut symbols: HashSet<_> = incoming.keys().copied().collect();
+        for state in completing {
+            symbols.extend(state.keys().copied());
+        }
+        for symbol in symbols {
+            let mut sources = Vec::new();
+            for state in completing {
+                if let Some(link) = state.get(&symbol) {
+                    for source in &link.sources {
+                        if !sources.contains(source) {
+                            sources.push(source.clone());
+                        }
+                    }
+                }
+            }
+            if !sources.is_empty() {
+                merged.insert(symbol, TrackedLifetimeLink { sources });
+            }
+        }
+        merged
+    }
+
     /// Records each `else if` node from the result paths belonging to that
     /// suffix rather than copying the outer conditional's category blindly.
     fn record_conditional_suffix_outcomes(
@@ -2944,6 +3164,7 @@ impl<'semantic> Analyzer<'semantic> {
     ) -> Option<TypedExpression> {
         let first_error = self.checking.errors.len();
         let incoming_categories = self.current_binding_categories.clone();
+        let incoming_tracked_bindings = self.current_tracked_bindings.clone();
         let incoming_narrowings = self.current_narrowings.clone();
         let mut invalid = false;
         let (iteration, else_branch, naturally_terminating) = match &expression.kind {
@@ -3026,6 +3247,10 @@ impl<'semantic> Analyzer<'semantic> {
         if naturally_terminating {
             if let Some(natural_categories) = iteration.natural_categories {
                 self.current_binding_categories = natural_categories;
+                self.current_tracked_bindings = iteration
+                    .natural_tracked_bindings
+                    .clone()
+                    .unwrap_or_else(|| incoming_tracked_bindings.clone());
                 self.current_narrowings = iteration
                     .natural_narrowings
                     .clone()
@@ -3059,6 +3284,7 @@ impl<'semantic> Analyzer<'semantic> {
                                 .map_or(else_branch.span, |value| value.span),
                             typed,
                             categories: self.current_binding_categories.clone(),
+                            tracked_bindings: self.current_tracked_bindings.clone(),
                             narrowings: self.current_narrowings.clone(),
                         });
                     }
@@ -3091,6 +3317,15 @@ impl<'semantic> Analyzer<'semantic> {
             .collect();
         self.current_binding_categories =
             self.merge_binding_categories(&incoming_categories, &completing_categories);
+        let completing_tracked_bindings: Vec<_> = paths
+            .iter()
+            .filter(|path| !self.is_divergence(path.typed.type_id))
+            .map(|path| &path.tracked_bindings)
+            .collect();
+        self.current_tracked_bindings = self.merge_tracked_binding_states(
+            &incoming_tracked_bindings,
+            &completing_tracked_bindings,
+        );
         let completing_narrowings: Vec<_> = paths
             .iter()
             .filter(|path| !self.is_divergence(path.typed.type_id))
@@ -3117,16 +3352,19 @@ impl<'semantic> Analyzer<'semantic> {
         header_can_complete: bool,
     ) -> Option<LoopIterationOutcome> {
         let base_categories = self.current_binding_categories.clone();
+        let base_tracked_bindings = self.current_tracked_bindings.clone();
         let base_narrowings = self.current_narrowings.clone();
         let baseline_checking = self.checking.clone();
         let baseline_loops = self.active_loops.clone();
         let enclosing_reachability = self.current_path_reachable;
         let mut loop_head = base_categories.clone();
+        let mut tracked_loop_head = base_tracked_bindings.clone();
 
         loop {
             self.checking = baseline_checking.clone();
             self.active_loops = baseline_loops.clone();
             self.current_binding_categories = loop_head.clone();
+            self.current_tracked_bindings = tracked_loop_head.clone();
             self.current_narrowings = base_narrowings.clone();
             self.current_path_reachable = enclosing_reachability;
 
@@ -3161,6 +3399,9 @@ impl<'semantic> Analyzer<'semantic> {
             let mut natural_categories = natural_narrowings
                 .is_some()
                 .then(|| self.current_binding_categories.clone());
+            let mut natural_tracked_bindings = natural_narrowings
+                .is_some()
+                .then(|| self.current_tracked_bindings.clone());
             self.active_loops.push(ActiveLoop {
                 expression,
                 expected_result_type,
@@ -3172,6 +3413,8 @@ impl<'semantic> Analyzer<'semantic> {
             let body_completes = self.visit_loop_iteration_body(body);
             let normal_state = (body_reachable && body_completes)
                 .then(|| self.current_binding_categories.clone());
+            let normal_tracked_state = (body_reachable && body_completes)
+                .then(|| self.current_tracked_bindings.clone());
             if normal_state.is_some() {
                 self.transition_current_narrowings(
                     body.id,
@@ -3187,27 +3430,44 @@ impl<'semantic> Analyzer<'semantic> {
             let mut looping_states: Vec<_> = active
                 .continues
                 .iter()
-                .map(|(categories, _)| categories)
+                .map(|(categories, _, _)| categories)
                 .collect();
             if let Some(normal_state) = &normal_state {
                 looping_states.push(normal_state);
             }
             let next_head = self.merge_binding_categories(&base_categories, &looping_states);
-            if next_head == loop_head {
+            let mut tracked_looping_states: Vec<_> = vec![&base_tracked_bindings];
+            tracked_looping_states.extend(active
+                .continues
+                .iter()
+                .map(|(_, bindings, _)| bindings));
+            if let Some(normal_state) = &normal_tracked_state {
+                tracked_looping_states.push(normal_state);
+            }
+            let next_tracked_head = self.merge_tracked_binding_states(
+                &base_tracked_bindings,
+                &tracked_looping_states,
+            );
+            if next_head == loop_head && next_tracked_head == tracked_loop_head {
                 if let Some((symbol, _)) = range_binding {
                     if let Some(categories) = &mut natural_categories {
                         categories.remove(&symbol);
+                    }
+                    if let Some(bindings) = &mut natural_tracked_bindings {
+                        bindings.remove(&symbol);
                     }
                 }
                 self.current_path_reachable = enclosing_reachability;
                 return Some(LoopIterationOutcome {
                     breaks: active.breaks,
                     natural_categories,
+                    natural_tracked_bindings,
                     natural_narrowings,
                     invalid,
                 });
             }
             loop_head = next_head;
+            tracked_loop_head = next_tracked_head;
         }
     }
 
@@ -3261,6 +3521,7 @@ impl<'semantic> Analyzer<'semantic> {
                 span: expression.span,
                 typed: unit,
                 categories: self.current_binding_categories.clone(),
+                tracked_bindings: self.current_tracked_bindings.clone(),
                 narrowings: self.current_narrowings.clone(),
             });
             if !requires_else {
@@ -6764,7 +7025,11 @@ impl<'semantic> Analyzer<'semantic> {
             if self.is_recovery(checked.type_id) {
                 return Some(self.recovery_temporary());
             }
-            if !self.validate_owning_transfer(value, checked, mutable) || !mutable {
+            let preserves_borrows = self.validate_place_replacement(target, value);
+            if !self.validate_owning_transfer(value, checked, mutable)
+                || !mutable
+                || !preserves_borrows
+            {
                 return Some(self.recovery_temporary());
             }
             if let Some(narrowing_place) = self.narrowing_place(target)
@@ -6848,6 +7113,120 @@ impl<'semantic> Analyzer<'semantic> {
                 .insert(target.id, UnionMutationKind::PayloadMutation);
         }
         Some(self.fresh_primitive(PrimitiveType::Unit))
+    }
+
+    /// Rejects replacing storage which is a strict ancestor of an outstanding
+    /// tracked interior address. Replacing the referenced leaf itself keeps
+    /// that address stable, and redirecting an identifier root is handled by
+    /// root assignment without touching its old backing storage.
+    fn validate_place_replacement(
+        &mut self,
+        target: &Expression,
+        value: &Expression,
+    ) -> bool {
+        let Some(replaced) = self.checking.physical_places.get(&target.id).cloned() else {
+            return true;
+        };
+        let changes_locked_union_member = self
+            .checking
+            .places
+            .get(&target.id)
+            .is_some_and(|place| self.union_members(place.declared_type_id).is_some())
+            && self.narrowing_place(target).is_some_and(|place| {
+                self.effective_narrowing(&place).is_some()
+                    && !self.assignment_preserves_narrowing(&place, value.id)
+            });
+        let mut conflicts = Vec::new();
+        for (holder, link) in &self.current_tracked_bindings {
+            if !self.symbol_is_live_after(*holder, target.id) {
+                continue;
+            }
+            for source in &link.sources {
+                let replaces_ancestor = replaced.projections.len() < source.projections.len()
+                    && source.projections.starts_with(&replaced.projections);
+                let overlaps_opaque_derivation = source
+                    .projections
+                    .iter()
+                    .position(|projection| {
+                        *projection == PhysicalPlaceProjection::OpaqueDerived
+                    })
+                    .is_some_and(|opaque| {
+                        let known = &source.projections[..opaque];
+                        replaced.projections.starts_with(known)
+                            || known.starts_with(&replaced.projections)
+                    });
+                let replaces_narrowed_union_payload = changes_locked_union_member
+                    && source.projections == replaced.projections;
+                if source.root == replaced.root
+                    && (replaces_ancestor
+                        || overlaps_opaque_derivation
+                        || replaces_narrowed_union_payload)
+                    && !conflicts.contains(source)
+                {
+                    conflicts.push(source.clone());
+                }
+            }
+        }
+        if conflicts.is_empty() {
+            return true;
+        }
+        self.checking.errors.push(ExpressionCheckingError {
+            kind: ExpressionCheckingErrorKind::TrackedBorrowInvalidated,
+            span: target.span,
+        });
+        self.checking.borrow_invalidations.insert(target.id, conflicts);
+        false
+    }
+
+    fn symbol_is_live_after(&self, symbol: SymbolId, node: NodeId) -> bool {
+        self.active_loops.iter().any(|active| {
+            self.loop_symbol_references
+                .get(&active.expression)
+                .is_some_and(|symbols| symbols.contains(&symbol))
+        }) || self.symbol_references.get(&symbol).is_some_and(|references| {
+            let mutation_end = self.mutation_ends.get(&node).copied().unwrap_or_else(|| {
+                self.expression_spans
+                    .get(&node)
+                    .map_or(0, |span| span.end)
+            });
+            references.iter().any(|reference| {
+                self.expression_spans.get(reference).is_some_and(|span| {
+                    span.module_id == node.module_id && span.start >= mutation_end
+                })
+                    && self.control_paths_are_compatible(node, *reference)
+            })
+        })
+    }
+
+    fn control_paths_are_compatible(&self, left: NodeId, right: NodeId) -> bool {
+        let Some(left_path) = self.expression_branches.get(&left) else {
+            return true;
+        };
+        let Some(right_path) = self.expression_branches.get(&right) else {
+            return true;
+        };
+        !left_path.iter().any(|(conditional, arm)| {
+            right_path
+                .iter()
+                .any(|(other, other_arm)| conditional == other && arm != other_arm)
+        })
+    }
+
+    fn displace_rebound_storage(&mut self, symbol: SymbolId, assignment: NodeId) {
+        let displaced = PhysicalPlaceRoot::DisplacedSymbol(symbol, assignment);
+        self.checking.displaced_roots.insert(assignment, displaced);
+        for link in self.current_tracked_bindings.values_mut() {
+            for source in &mut link.sources {
+                if source.root == PhysicalPlaceRoot::Symbol(symbol) {
+                    source.root = displaced;
+                }
+            }
+        }
+        for (holder, link) in &self.current_tracked_bindings {
+            self.checking
+                .tracked_binding_lifetimes
+                .insert(*holder, link.clone());
+        }
     }
 
     /// Checks writes through string/byte index places. Index-place mutation is
@@ -7001,15 +7380,32 @@ impl<'semantic> Analyzer<'semantic> {
                 }
                 let (category, transfer) = self.assignment_transfer(checked);
                 self.current_binding_categories.insert(symbol, category);
-                let sources = self.tracked_lifetime_sources(value);
-                if sources.is_empty() {
-                    self.checking.tracked_binding_lifetimes.remove(&symbol);
-                } else {
-                    self.checking.tracked_binding_lifetimes.insert(
-                        symbol,
-                        TrackedLifetimeLink { sources },
-                    );
+                let mut sources = self.tracked_lifetime_sources(value);
+                let redirects_storage = self
+                    .types
+                    .types()
+                    .get(place.declared_type_id)
+                    .is_some_and(|semantic| {
+                        semantic.copy_semantics() != Some(CopySemantics::Trivial)
+                    });
+                let preserves_old_backing = self.current_tracked_bindings.iter().any(
+                    |(holder, link)| {
+                        self.symbol_is_live_after(*holder, target.id)
+                            && link.sources.iter().any(|source| {
+                                source.root == PhysicalPlaceRoot::Symbol(symbol)
+                            })
+                    },
+                );
+                if redirects_storage && preserves_old_backing {
+                    self.displace_rebound_storage(symbol, target.id);
+                    for source in &mut sources {
+                        if source.root == PhysicalPlaceRoot::Symbol(symbol) {
+                            source.root =
+                                PhysicalPlaceRoot::DisplacedSymbol(symbol, target.id);
+                        }
+                    }
                 }
+                self.set_tracked_binding_sources(target.id, symbol, sources);
                 self.checking.reassigned_bindings.insert(symbol);
                 self.checking.transfers.insert(value.id, transfer);
                 return Some(self.fresh_primitive(PrimitiveType::Unit));
@@ -8443,12 +8839,18 @@ impl<'semantic> Analyzer<'semantic> {
             _ => ValueCategory::FreshTemporary,
         };
         if self.type_contains_tracked_reference(return_type) {
+            let direct_tracked_result = self.tracked_reference_parts(return_type).is_some();
             let mut sources = self
                 .checking
                 .tracked_call_inputs
                 .remove(&call.id)
                 .unwrap_or_default();
-            if self.tracked_reference_parts(return_type).is_none() {
+            for source in &mut sources {
+                source
+                    .projections
+                    .push(PhysicalPlaceProjection::OpaqueDerived);
+            }
+            if !direct_tracked_result {
                 for source in self
                     .checking
                     .borrow_containing_call_inputs
@@ -8463,7 +8865,10 @@ impl<'semantic> Analyzer<'semantic> {
                 self.checking.borrow_containing_call_inputs.remove(&call.id);
             }
             if let Some(receiver) = tracked_receiver {
-                for source in self.tracked_input_lifetime_sources(receiver) {
+                for mut source in self.tracked_input_lifetime_sources(receiver) {
+                    source
+                        .projections
+                        .push(PhysicalPlaceProjection::OpaqueDerived);
                     if !sources.contains(&source) {
                         sources.push(source);
                     }
@@ -8725,11 +9130,7 @@ impl<'semantic> Analyzer<'semantic> {
                     storage: category,
                 },
             );
-            if let Some(link) = self
-                .checking
-                .tracked_binding_lifetimes
-                .get(&symbol)
-                .cloned()
+            if let Some(link) = self.current_tracked_bindings.get(&symbol).cloned()
             {
                 self.checking
                     .tracked_lifetime_links
@@ -14614,6 +15015,527 @@ fn main() {
         assert_eq!(checking.tracked_lifetime_links[&packed.id].sources.len(), 2);
         let forwarded = binding_initializer(&main.body.statements[3]);
         assert_eq!(checking.tracked_lifetime_links[&forwarded.id].sources.len(), 2);
+    }
+
+    #[test]
+    fn tracks_flow_sensitive_borrow_validity_and_gc_owner_roots() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(const vmut outer: Outer) {\n",
+            "    const reference: *Leaf = outer.inner.leaf;\n",
+            "    outer.inner = Inner { leaf: Leaf {} };\n",
+            "    reference;\n",
+            "    outer.inner = Inner { leaf: Leaf {} };\n",
+            "}\n",
+            "fn rooted(heap: &Outer) {\n",
+            "    const reference: *Leaf = heap.inner.leaf;\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking
+                .errors
+                .iter()
+                .filter(|error| {
+                    error.kind == ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+                })
+                .count(),
+            1,
+            "{:#?}",
+            checking.errors
+        );
+
+        let inspect = function(&program.declarations[3]);
+        let first_target = match &expression(&inspect.body.statements[1]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected assignment"),
+        };
+        let second_target = match &expression(&inspect.body.statements[3]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected assignment"),
+        };
+        assert!(checking.borrow_invalidations.contains_key(&first_target.id));
+        assert!(!checking.borrow_invalidations.contains_key(&second_target.id));
+
+        let rooted = function(&program.declarations[4]);
+        assert!(checking
+            .gc_owner_roots
+            .get(&rooted.body.statements[0].id)
+            .is_some_and(|roots| roots.len() == 1
+                && roots[0].storage == ValueCategory::GcReference));
+    }
+
+    #[test]
+    fn merges_reassigned_tracked_origins_across_control_flow() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(flag: bool, const vmut left: Outer, const vmut right: Outer) {\n",
+            "    mut vconst reference: *Leaf = left.inner.leaf;\n",
+            "    if flag { reference = right.inner.leaf; }\n",
+            "    left.inner = Inner { leaf: Leaf {} };\n",
+            "    right.inner = Inner { leaf: Leaf {} };\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 2, "{:#?}", checking.errors);
+        assert_eq!(
+            checking
+                .errors
+                .iter()
+                .filter(|error| {
+                    error.kind == ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+                })
+                .count(),
+            2,
+            "{:#?}",
+            checking.errors
+        );
+        let inspect = function(&program.declarations[3]);
+        let reference = expression(&inspect.body.statements[4]);
+        assert_eq!(
+            checking.tracked_lifetime_links[&reference.id].sources.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn preserves_borrows_into_displaced_root_backing_storage() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(mut vconst outer: Outer) {\n",
+            "    const reference: *Leaf = outer.inner.leaf;\n",
+            "    outer = Outer { inner: Inner { leaf: Leaf {} } };\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let inspect = function(&program.declarations[3]);
+        let rebound_target = match &expression(&inspect.body.statements[1]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected assignment"),
+        };
+        assert!(matches!(
+            checking.displaced_roots.get(&rebound_target.id),
+            Some(PhysicalPlaceRoot::DisplacedSymbol(_, assignment))
+                if *assignment == rebound_target.id
+        ));
+        let reference = expression(&inspect.body.statements[2]);
+        assert!(matches!(
+            checking.tracked_lifetime_links[&reference.id].sources[0].root,
+            PhysicalPlaceRoot::DisplacedSymbol(_, _)
+        ));
+    }
+
+    #[test]
+    fn ends_borrow_constraints_on_mutually_exclusive_and_completed_paths() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(flag: bool, const vmut outer: Outer) {\n",
+            "    const reference: *Leaf = outer.inner.leaf;\n",
+            "    if flag {\n",
+            "        outer.inner = Inner { leaf: Leaf {} };\n",
+            "    } else {\n",
+            "        reference;\n",
+            "    }\n",
+            "    { const local: *Leaf = outer.inner.leaf; local; };\n",
+            "    outer.inner = Inner { leaf: Leaf {} };\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        assert!(checking.borrow_invalidations.is_empty());
+    }
+
+    #[test]
+    fn keeps_shadowed_tracked_slots_and_their_scopes_independent() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(const vmut outer: Outer, const vmut other: Outer) {\n",
+            "    const reference: *Leaf = outer.inner.leaf;\n",
+            "    { const reference: *Leaf = other.inner.leaf; reference; };\n",
+            "    other.inner = Inner { leaf: Leaf {} };\n",
+            "    outer.inner = Inner { leaf: Leaf {} };\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+        let inspect = function(&program.declarations[3]);
+        let other_target = match &expression(&inspect.body.statements[2]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected other assignment"),
+        };
+        let outer_target = match &expression(&inspect.body.statements[3]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected outer assignment"),
+        };
+        assert!(!checking.borrow_invalidations.contains_key(&other_target.id));
+        assert!(checking.borrow_invalidations.contains_key(&outer_target.id));
+    }
+
+    #[test]
+    fn permits_leaf_replacement_but_rejects_ancestor_replacement_for_aliases() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(const vmut outer: Outer) {\n",
+            "    const first: *Leaf = outer.inner.leaf;\n",
+            "    const second: *Leaf = outer.inner.leaf;\n",
+            "    outer.inner.leaf = Leaf {};\n",
+            "    outer.inner = Inner { leaf: Leaf {} };\n",
+            "    first;\n",
+            "    second;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+        let inspect = function(&program.declarations[3]);
+        let leaf_target = match &expression(&inspect.body.statements[2]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected leaf assignment"),
+        };
+        let ancestor_target = match &expression(&inspect.body.statements[3]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected ancestor assignment"),
+        };
+        assert!(!checking.borrow_invalidations.contains_key(&leaf_target.id));
+        assert_eq!(checking.borrow_invalidations[&ancestor_target.id].len(), 1);
+    }
+
+    #[test]
+    fn reassigning_a_tracked_slot_releases_its_previous_origin() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(const vmut left: Outer, const vmut right: Outer) {\n",
+            "    mut vconst reference: *Leaf = left.inner.leaf;\n",
+            "    reference = right.inner.leaf;\n",
+            "    left.inner = Inner { leaf: Leaf {} };\n",
+            "    right.inner = Inner { leaf: Leaf {} };\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+        let inspect = function(&program.declarations[3]);
+        let left_target = match &expression(&inspect.body.statements[2]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected left assignment"),
+        };
+        let right_target = match &expression(&inspect.body.statements[3]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected right assignment"),
+        };
+        assert!(!checking.borrow_invalidations.contains_key(&left_target.id));
+        assert!(checking.borrow_invalidations.contains_key(&right_target.id));
+    }
+
+    #[test]
+    fn carries_tracked_origins_through_loop_backedges_and_continue() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(flag: bool, const vmut left: Outer, const vmut right: Outer) {\n",
+            "    mut vconst reference: *Leaf = left.inner.leaf;\n",
+            "    while flag { reference = right.inner.leaf; continue; }\n",
+            "    left.inner = Inner { leaf: Leaf {} };\n",
+            "    right.inner = Inner { leaf: Leaf {} };\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 2, "{:#?}", checking.errors);
+        assert!(checking.errors.iter().all(|error| {
+            error.kind == ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        }));
+        let inspect = function(&program.declarations[3]);
+        let reference = expression(&inspect.body.statements[4]);
+        assert_eq!(checking.tracked_lifetime_links[&reference.id].sources.len(), 2);
+    }
+
+    #[test]
+    fn carries_the_selected_tracked_origin_through_break() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(const vmut left: Outer, const vmut right: Outer) {\n",
+            "    mut vconst reference: *Leaf = left.inner.leaf;\n",
+            "    loop { reference = right.inner.leaf; break; };\n",
+            "    left.inner = Inner { leaf: Leaf {} };\n",
+            "    right.inner = Inner { leaf: Leaf {} };\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+        let inspect = function(&program.declarations[3]);
+        let reference = expression(&inspect.body.statements[4]);
+        assert_eq!(checking.tracked_lifetime_links[&reference.id].sources.len(), 1);
+    }
+
+    #[test]
+    fn applies_flow_validity_and_gc_rooting_to_linked_call_results() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn project(input: *Outer) -> *Leaf { input.inner.leaf }\n",
+            "fn inspect(const vmut outer: Outer, heap: &Outer) {\n",
+            "    const direct = project(outer);\n",
+            "    const rooted = project(heap);\n",
+            "    outer.inner = Inner { leaf: Leaf {} };\n",
+            "    direct;\n",
+            "    rooted;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+        let inspect = function(&program.declarations[4]);
+        assert!(checking
+            .gc_owner_roots
+            .get(&inspect.body.statements[1].id)
+            .is_some_and(|roots| roots.len() == 1
+                && roots[0].storage == ValueCategory::GcReference));
+    }
+
+    #[test]
+    fn tracks_tuple_element_paths_during_replacement() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "fn inspect(const vmut pair: (Inner, int)) {\n",
+            "    const reference: *Leaf = pair.0.leaf;\n",
+            "    pair.1 = 2;\n",
+            "    pair.0 = Inner { leaf: Leaf {} };\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+        let inspect = function(&program.declarations[2]);
+        let unrelated = match &expression(&inspect.body.statements[1]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected tuple assignment"),
+        };
+        let ancestor = match &expression(&inspect.body.statements[2]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected tuple assignment"),
+        };
+        assert!(!checking.borrow_invalidations.contains_key(&unrelated.id));
+        assert!(checking.borrow_invalidations.contains_key(&ancestor.id));
+    }
+
+    #[test]
+    fn combines_borrow_validity_with_union_tag_locks() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Holder { choice: Leaf | int, }\n",
+            "fn inspect(const vmut holder: Holder) {\n",
+            "    if holder.choice is Leaf {\n",
+            "        const reference: *Leaf = holder.choice;\n",
+            "        holder.choice = Leaf {};\n",
+            "        reference;\n",
+            "        holder.choice = 1;\n",
+            "        reference;\n",
+            "    }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+        let inspect = function(&program.declarations[2]);
+        let conditional = body_value(inspect);
+        let ExpressionKind::If { then_branch, .. } = &conditional.kind else {
+            panic!("expected union conditional")
+        };
+        let same_tag = match &expression(&then_branch.statements[1]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected same-tag assignment"),
+        };
+        let changed_tag = match &expression(&then_branch.statements[3]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected tag-changing assignment"),
+        };
+        assert!(!checking.borrow_invalidations.contains_key(&same_tag.id));
+        assert!(checking.borrow_invalidations.contains_key(&changed_tag.id));
+        assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn preserves_valid_tracked_state_after_failed_slot_assignment() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(const vmut outer: Outer) {\n",
+            "    mut vconst reference: *Leaf = outer.inner.leaf;\n",
+            "    reference = Leaf {};\n",
+            "    outer.inner = Inner { leaf: Leaf {} };\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 2, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TemporaryTrackedBorrowEscapes
+        );
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+    }
+
+    #[test]
+    fn records_gc_root_transitions_when_a_tracked_slot_is_reassigned() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer { inner: Inner, }\n",
+            "fn inspect(left: &Outer, right: &Outer) {\n",
+            "    mut vconst reference: *Leaf = left.inner.leaf;\n",
+            "    reference = right.inner.leaf;\n",
+            "    reference;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let inspect = function(&program.declarations[3]);
+        let assignment_target = match &expression(&inspect.body.statements[1]).kind {
+            ExpressionKind::Assignment { target, .. } => target,
+            _ => panic!("expected tracked-slot assignment"),
+        };
+        for node in [inspect.body.statements[0].id, assignment_target.id] {
+            assert!(checking.gc_owner_roots.get(&node).is_some_and(|roots| {
+                roots.len() == 1 && roots[0].storage == ValueCategory::GcReference
+            }));
+        }
+        let reference = expression(&inspect.body.statements[2]);
+        assert_eq!(checking.tracked_lifetime_links[&reference.id].sources.len(), 1);
+    }
+
+    #[test]
+    fn propagates_flow_sensitive_origins_through_tracked_interface_views() {
+        let source = concat!(
+            "interface Reader { fn read(self) -> int; }\n",
+            "fn inspect(flag: bool, mut vconst reader: *Reader, other: *Reader) {\n",
+            "    if flag { reader = other; }\n",
+            "    reader.read();\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let inspect = function(&program.declarations[1]);
+        let call_expression = expression(&inspect.body.statements[1]);
+        let (callee, _) = call(call_expression);
+        let ExpressionKind::MemberAccess { object, .. } = &callee.kind else {
+            panic!("expected tracked interface method call")
+        };
+        assert_eq!(checking.tracked_lifetime_links[&object.id].sources.len(), 2);
+    }
+
+    #[test]
+    fn applies_borrow_validity_to_receiver_derived_references() {
+        let source = concat!(
+            "struct Leaf {}\n",
+            "struct Inner { leaf: Leaf, }\n",
+            "struct Outer {\n",
+            "    inner: Inner,\n",
+            "    fn inspect(mut self) {\n",
+            "        const reference: *Leaf = self.inner.leaf;\n",
+            "        self.inner = Inner { leaf: Leaf {} };\n",
+            "        reference;\n",
+            "    }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::TrackedBorrowInvalidated
+        );
+        assert!(checking.borrow_invalidations.values().any(|sources| {
+            sources.iter().any(|source| {
+                matches!(source.root, PhysicalPlaceRoot::SelfValue(_))
+            })
+        }));
     }
 
     #[test]
