@@ -27,7 +27,8 @@ use crate::{
         ValueCategory, ValueTransfer,
     },
     signature_collection::{
-        BuiltinMemberOwner, BuiltinMemberSignature, CallableSignature,
+        BuiltinGlobalSignature, BuiltinMemberOwner, BuiltinMemberSignature, BuiltinNamespace,
+        CallableSignature,
         InterfaceRequirementSignature, MethodId, ReceiverSignature, SignatureCollection,
         StructMemberSignatureKind, StructSignature,
     },
@@ -476,6 +477,23 @@ enum ResolvedBuiltinOperation {
         error_type: TypeId,
         payload_type: TypeId,
     },
+    AsciiEncode,
+    AsciiDecode {
+        result_type: TypeId,
+        string_member: usize,
+        error_member: usize,
+    },
+    Output {
+        mode: OutputMode,
+    },
+    Panic,
+    Yield,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Print,
+    PrintLine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -694,6 +712,7 @@ enum ExpressionCheckingErrorKind {
         category: ValueCategory,
     },
     CannotInferErrorPayload,
+    NamespaceRequiresMember,
     UnknownMember,
     InvalidMemberOwner {
         found: TypeId,
@@ -6281,6 +6300,13 @@ impl<'semantic> Analyzer<'semantic> {
         object: &Expression,
         member: Span,
     ) -> Option<TypedExpression> {
+        if let Some(namespace) = self.builtin_namespace_reference(object) {
+            return Some(self.synthesize_namespace_member_access(
+                expression,
+                namespace,
+                member,
+            ));
+        }
         let typed_object = self.synthesize(object)?;
         if self.is_recovery(typed_object.type_id) {
             return Some(self.recovery_temporary());
@@ -6542,6 +6568,68 @@ impl<'semantic> Analyzer<'semantic> {
                 });
                 Some(self.recovery_temporary())
             }
+        }
+    }
+
+    fn synthesize_namespace_member_access(
+        &mut self,
+        expression: &Expression,
+        namespace: BuiltinNamespace,
+        member: Span,
+    ) -> TypedExpression {
+        let name = self
+            .module
+            .text(member)
+            .expect("built-in namespace member belongs to the source module")
+            .to_string();
+        let selected = self
+            .signatures
+            .builtins()
+            .member(BuiltinMemberOwner::Namespace(namespace), &name)
+            .cloned();
+        let Some(BuiltinMemberSignature::Callable(template)) = selected else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::UnknownMember,
+                span: member,
+            });
+            return self.recovery_temporary();
+        };
+        let signature = template
+            .instantiate(&[], self.types.types_mut())
+            .expect("built-in namespace member has no type substitutions");
+        let operation = match (namespace, name.as_str()) {
+            (BuiltinNamespace::Ascii, "encode") => ResolvedBuiltinOperation::AsciiEncode,
+            (BuiltinNamespace::Ascii, "decode") => {
+                let members = self
+                    .union_members(signature.return_type)
+                    .expect("ascii.decode returns string-or-Error(string)");
+                let string_member = members
+                    .iter()
+                    .position(|member| self.primitive_kind(*member) == Some(PrimitiveType::String))
+                    .expect("ascii.decode result contains string");
+                let error_member = members
+                    .iter()
+                    .position(|member| self.error_payload_type(*member).is_some())
+                    .expect("ascii.decode result contains Error(string)");
+                ResolvedBuiltinOperation::AsciiDecode {
+                    result_type: signature.return_type,
+                    string_member,
+                    error_member,
+                }
+            }
+            _ => unreachable!("the built-in namespace catalogue exposes only known members"),
+        };
+        let type_id = self.types.types_mut().callable(
+            signature.parameters,
+            signature.return_type,
+            AccessCapability::Const,
+        );
+        self.checking
+            .resolved_builtin_operations
+            .insert(expression.id, operation);
+        TypedExpression {
+            type_id,
+            category: ValueCategory::FreshTemporary,
         }
     }
 
@@ -8789,6 +8877,35 @@ impl<'semantic> Analyzer<'semantic> {
         let ExpressionKind::MemberAccess { object, member } = &callee.kind else {
             return None;
         };
+        if self.builtin_namespace_reference(object).is_some() {
+            let typed_callee = match self.synthesize(callee) {
+                Some(typed) => typed,
+                None => return Some(None),
+            };
+            if self.is_recovery(typed_callee.type_id) {
+                for argument in arguments {
+                    let _ = self.synthesize(argument);
+                }
+                return Some(Some(self.recovery_temporary()));
+            }
+            let Some(SemanticType::Callable {
+                parameters,
+                return_type,
+                ..
+            }) = self.types.types().get(typed_callee.type_id).cloned()
+            else {
+                unreachable!("a resolved namespace member is callable")
+            };
+            let arguments_valid =
+                match self.analyze_call_arguments(call, arguments, &parameters) {
+                    Some(valid) => valid,
+                    None => return Some(None),
+                };
+            if !arguments_valid {
+                return Some(Some(self.recovery_temporary()));
+            }
+            return Some(Some(self.call_result(call, return_type, None)));
+        }
         let typed_object = match self.synthesize(object) {
             Some(typed) => typed,
             None => return None,
@@ -10040,6 +10157,21 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
+    fn builtin_namespace_reference(&self, expression: &Expression) -> Option<BuiltinNamespace> {
+        if !matches!(&expression.kind, ExpressionKind::Identifier) {
+            return None;
+        }
+        let symbol = self.names.symbol_for_reference(expression.id)?;
+        if self.names.symbols().symbol(symbol)?.kind != SymbolKind::BuiltinValue {
+            return None;
+        }
+        let name = self.module.text(expression.span).ok()?;
+        match self.signatures.builtins().global(name) {
+            Some(BuiltinGlobalSignature::Namespace(namespace)) => Some(*namespace),
+            Some(BuiltinGlobalSignature::Callable(_)) | None => None,
+        }
+    }
+
     fn synthesize_identifier(&mut self, expression: &Expression) -> Option<TypedExpression> {
         let symbol = self
             .names
@@ -10088,6 +10220,43 @@ impl<'semantic> Analyzer<'semantic> {
                     .insert(expression.id, link);
             }
             return Some(typed);
+        }
+        if self
+            .names
+            .symbols()
+            .symbol(symbol)
+            .is_some_and(|symbol| symbol.kind == SymbolKind::BuiltinValue)
+        {
+            let name = self
+                .module
+                .text(expression.span)
+                .expect("built-in identifier belongs to the source module");
+            match self.signatures.builtins().global(name) {
+                Some(BuiltinGlobalSignature::Namespace(_)) => {
+                    self.checking.errors.push(ExpressionCheckingError {
+                        kind: ExpressionCheckingErrorKind::NamespaceRequiresMember,
+                        span: expression.span,
+                    });
+                    return Some(self.recovery_temporary());
+                }
+                Some(BuiltinGlobalSignature::Callable(_)) => {
+                    let operation = match name {
+                        "print" => ResolvedBuiltinOperation::Output {
+                            mode: OutputMode::Print,
+                        },
+                        "println" => ResolvedBuiltinOperation::Output {
+                            mode: OutputMode::PrintLine,
+                        },
+                        "panic" => ResolvedBuiltinOperation::Panic,
+                        "yield" => ResolvedBuiltinOperation::Yield,
+                        _ => unreachable!("the global built-in catalogue contains known names"),
+                    };
+                    self.checking
+                        .resolved_builtin_operations
+                        .insert(expression.id, operation);
+                }
+                None => unreachable!("prelude built-in symbol must have a catalogue entry"),
+            }
         }
         let Some(type_id) = self.signatures.callable_value_type(symbol) else {
             if self
@@ -17267,5 +17436,188 @@ fn main() {
         assert!(arguments
             .iter()
             .all(|argument| checking.expressions.contains_key(&argument.id)));
+    }
+
+    #[test]
+    fn checks_ascii_output_panic_and_yield_builtin_metadata() {
+        let source = concat!(
+            "fn diverges() -> int { panic(\"stop\") }\n",
+            "fn main() {\n",
+            "    const encode = ascii.encode;\n",
+            "    const encoded = encode(\"hello\");\n",
+            "    const decode = ascii.decode;\n",
+            "    const decoded = decode(encoded);\n",
+            "    const direct = ascii.decode(encoded);\n",
+            "    const output = println;\n",
+            "    print(\"plain\");\n",
+            "    output(\"line\");\n",
+            "    yield();\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let diverges = function(&program.declarations[0]);
+        let panic_call = body_value(diverges);
+        let (panic_callee, panic_arguments) = call(panic_call);
+        assert_eq!(checking.transfers[&panic_arguments[0].id], ValueTransfer::Borrow);
+        assert_eq!(
+            checking.resolved_builtin_operations[&panic_callee.id],
+            ResolvedBuiltinOperation::Panic
+        );
+        assert!(matches!(
+            types.types().get(checking.expressions[&panic_call.id].type_id),
+            Some(SemanticType::Divergence)
+        ));
+
+        let main = function(&program.declarations[1]);
+        let encode = binding_initializer(&main.body.statements[0]);
+        assert_eq!(
+            checking.resolved_builtin_operations[&encode.id],
+            ResolvedBuiltinOperation::AsciiEncode
+        );
+        let encoded = binding_initializer(&main.body.statements[1]);
+        assert_eq!(checking.expressions[&encoded.id].category, ValueCategory::FreshTemporary);
+        assert!(matches!(
+            types.types().get(checking.expressions[&encoded.id].type_id),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Bytes,
+                capability: AccessCapability::Mut,
+            })
+        ));
+
+        let decode = binding_initializer(&main.body.statements[2]);
+        let ResolvedBuiltinOperation::AsciiDecode {
+            result_type,
+            string_member,
+            error_member,
+        } = &checking.resolved_builtin_operations[&decode.id]
+        else {
+            panic!("expected resolved ASCII decode metadata")
+        };
+        let decoded = binding_initializer(&main.body.statements[3]);
+        assert_eq!(checking.expressions[&decoded.id].type_id, *result_type);
+        assert_eq!(checking.expressions[&decoded.id].category, ValueCategory::FreshTemporary);
+        let Some(SemanticType::Union { members, .. }) = types.types().get(*result_type) else {
+            panic!("ASCII decode should return a union")
+        };
+        assert!(matches!(
+            types.types().get(members[*string_member]),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::String,
+                capability: AccessCapability::Const,
+            })
+        ));
+        assert!(matches!(
+            types.types().get(members[*error_member]),
+            Some(SemanticType::Builtin {
+                builtin: BuiltinType::Error,
+                ..
+            })
+        ));
+
+        let direct = binding_initializer(&main.body.statements[4]);
+        let (direct_callee, direct_arguments) = call(direct);
+        assert!(matches!(
+            checking.resolved_builtin_operations.get(&direct_callee.id),
+            Some(ResolvedBuiltinOperation::AsciiDecode { .. })
+        ));
+        assert_eq!(checking.transfers[&direct_arguments[0].id], ValueTransfer::Borrow);
+
+        let output = binding_initializer(&main.body.statements[5]);
+        assert_eq!(
+            checking.resolved_builtin_operations[&output.id],
+            ResolvedBuiltinOperation::Output {
+                mode: OutputMode::PrintLine,
+            }
+        );
+        let printed = expression(&main.body.statements[6]);
+        let (print_callee, print_arguments) = call(printed);
+        assert_eq!(
+            checking.resolved_builtin_operations[&print_callee.id],
+            ResolvedBuiltinOperation::Output {
+                mode: OutputMode::Print,
+            }
+        );
+        assert_eq!(checking.transfers[&print_arguments[0].id], ValueTransfer::Borrow);
+        assert!(matches!(
+            types.types().get(checking.expressions[&printed.id].type_id),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Unit,
+                ..
+            })
+        ));
+        let yielded = expression(&main.body.statements[8]);
+        let (yield_callee, _) = call(yielded);
+        assert_eq!(
+            checking.resolved_builtin_operations[&yield_callee.id],
+            ResolvedBuiltinOperation::Yield
+        );
+        assert_eq!(checking.expressions[&yielded.id].category, ValueCategory::FreshTemporary);
+    }
+
+    #[test]
+    fn diagnoses_builtin_namespace_type_arity_and_unreachable_tails() {
+        let source = concat!(
+            "fn bad() {\n",
+            "    ascii;\n",
+            "    ascii();\n",
+            "    ascii.unknown;\n",
+            "    ascii.unknown(1);\n",
+            "    ascii.encode();\n",
+            "    ascii.decode(\"text\");\n",
+            "    print();\n",
+            "    println(\"a\", \"b\");\n",
+            "    panic();\n",
+            "    yield(1);\n",
+            "}\n",
+            "fn unreachable() { panic(\"stop\"); false + true; }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 11, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::NamespaceRequiresMember
+        );
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::NamespaceRequiresMember
+        );
+        assert_eq!(checking.errors[2].kind, ExpressionCheckingErrorKind::UnknownMember);
+        assert_eq!(checking.errors[3].kind, ExpressionCheckingErrorKind::UnknownMember);
+        assert!(matches!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 1,
+                found: 0,
+            }
+        ));
+        assert!(matches!(
+            checking.errors[5].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        for error in &checking.errors[6..10] {
+            assert!(matches!(
+                error.kind,
+                ExpressionCheckingErrorKind::ArgumentCountMismatch { .. }
+            ));
+        }
+        assert!(matches!(
+            checking.errors[10].kind,
+            ExpressionCheckingErrorKind::InvalidBinaryOperand { .. }
+        ));
+
+        let unreachable = function(&program.declarations[1]);
+        let tail = expression(&unreachable.body.statements[1]);
+        assert!(checking.expressions.contains_key(&tail.id));
+        let panic_call = expression(&unreachable.body.statements[0]);
+        let (panic_callee, _) = call(panic_call);
+        assert_eq!(
+            checking.resolved_builtin_operations[&panic_callee.id],
+            ResolvedBuiltinOperation::Panic
+        );
     }
 }

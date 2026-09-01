@@ -687,7 +687,7 @@ reviewable phases:
          verification is pending. No formatting was run.
        - Reviewed and completed. Stop for commit before implementing the
          remaining ordinary compiler-known functions.
-     - Change 3, ASCII, output, panic, and yield built-ins (next):
+     - Change 3, ASCII, output, panic, and yield built-ins (complete):
        - Resolve and check `ascii.encode(string) -> mut bytes`,
          `ascii.decode(bytes) -> string | Error(string)`,
          `print(string) -> ()`, `println(string) -> ()`,
@@ -700,8 +700,24 @@ reviewable phases:
        - Add focused tests for type and arity errors, first-class callable
          values where specified, namespace selection, result categories,
          divergence and unreachable tails, recovery, and metadata.
-       - Stop for review and commit before implementing error propagation.
-     - Change 4, postfix error propagation:
+       - Implemented explicit compiler-known operation identities for first-class
+         `ascii.encode`, `ascii.decode`, `print`, `println`, `panic`, and
+         `yield` selections. ASCII member calls and callable aliases use the
+         shared call-argument path, preserving source-order analysis and
+         ordinary parameter transfers. Decode metadata retains the canonical
+         result union and exact string/Error member positions; output records
+         newline mode, while panic and yield retain their divergence and
+         scheduling identities.
+       - `ascii` is now diagnosed when used as a runtime value, and unsupported
+         namespace members recover without suppressing argument analysis.
+         Focused source tests cover first-class selection, result types and
+         categories, transfers, namespace/member misuse, arity and type errors,
+         panic divergence, unreachable-tail checking, recovery, and metadata.
+       - Compilation and test execution were not requested for this change, so
+         verification is pending. No formatting was run.
+       - Reviewed and completed. Stop for commit before implementing error
+         propagation.
+     - Change 4, postfix error propagation (next):
        - Check `operand?` only for a normalized `S | Error(E)` operand. Evaluate
          the operand once, produce the complete non-error remainder `S`, and
          model the error alternative as an early return from the current

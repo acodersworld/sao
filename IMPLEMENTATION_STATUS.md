@@ -219,7 +219,11 @@ constraints before checking ordinary arguments, and retain per-specialization
 analysis metadata for later typed IR and lowering. Queue `send` and
 `try_receive` calls resolve on plain, GC, and tracked queue receivers, record
 their concrete element transfers and receive-union layouts, and accept only the
-element categories admitted during source type resolution.
+element categories admitted during source type resolution. ASCII encode/decode,
+output, panic, and yield calls use the shared argument and transfer rules while
+recording explicit compiler-known operation identities. ASCII decode retains
+its canonical string-or-Error result layout, output distinguishes newline mode,
+panic preserves divergence flow, and yield is identified as a scheduling point.
 
 Tuple checking includes contextual and inferred construction, ordered
 structural identity, numeric element places, transitive capability, owning
