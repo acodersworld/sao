@@ -592,20 +592,29 @@ reviewable phases:
          and displaced roots.
        - Implementation and documentation ready for review. Stop for review and
          commit before integration and completion.
-     - Change 6, integration and completion:
+     - Change 6, lowering-facing metadata completion:
        - Record private origin, lifetime-intersection, GC-owner-root, and borrow-
          validity metadata for post-type escape analysis, typed IR, and lowering.
+       - Ensure generated methods and runtime callable specializations retain
+         the same complete tracked-reference metadata as ordinary callable
+         analysis.
+       - Add focused metadata coverage for ordinary versus tracked parameters,
+         field-derived references, multiple-input lifetime intersections,
+         capability direction, plain and GC coercions, GC rooting, flow joins,
+         shadowing, mutation and rebinding, recovery, and callable composition.
+       - Stop for review and commit before capture safety and final integration.
+     - Change 7, capture safety and final integration:
        - Reject capturing `*T` or a transitively borrow-containing value in a
          lambda until authoritative capture and escape analysis can prove that
          the callable cannot outlive every source. Keep references into
          relocatable collection buffers deferred until their invalidation rules
          are defined with the corresponding built-ins.
-       - Add focused tests for ordinary versus tracked parameters, field-derived
-         references, multiple-input lifetime intersections, capability direction,
-         plain and GC coercions, GC rooting, invalid local and temporary returns,
-         flow joins, shadowing, mutation and rebinding, recovery, and callable
-         composition. Update the complex-program test with direct, receiver-
-         derived, multi-input, tuple-contained, and GC-backed tracked references.
+       - Add focused capture-safety and end-to-end tests, including invalid local
+         and temporary returns. Update the complex-program test with direct,
+         receiver-derived, multi-input, tuple-contained, and GC-backed tracked
+         references.
+       - Update the tracked-reference design and implementation-status documents,
+         review the completed integration, and mark Phase 7.6 complete.
    - Phase 7.7, remaining built-ins and completion (pending):
      - Check `Queue`, `Vector`, `Map`, `Error`, `?`, `ascii`, output, `panic`,
        `yield`, `co`, and `defer`.
