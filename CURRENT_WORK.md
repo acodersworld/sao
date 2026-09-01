@@ -628,7 +628,8 @@ reviewable phases:
        global built-ins. The changes below must resolve each built-in operation
        explicitly and retain lowering-facing metadata rather than relying on
        later name or member lookup.
-     - Change 1, parameterized built-in construction and `Error` values:
+     - Change 1, parameterized built-in construction and `Error` values
+       (implementation ready for review):
        - Check associated selection and calls for `Queue(T)::new()`,
          `Vector(T)::new()`, and `Map(K, V)::new()`. Each constructor takes no
          runtime arguments and produces a fresh mutable value of its exact
@@ -649,6 +650,11 @@ reviewable phases:
          arity, explicit and expected-type inference, invalid payloads,
          capability reduction, tracked payload propagation, and deterministic
          recovery.
+       - Implemented in expression checking with dedicated constructor/value
+         operation metadata and Error-widening metadata. Focused source tests
+         cover the cases above. Verified with all 138 expression-analysis tests
+         and the complete workspace suite: 445 library tests and 12 binary
+         tests pass. No formatting was run.
        - Stop for review and commit before implementing queue operations.
      - Change 2, queue operations and external-buffer ownership:
        - Check `queue.send(value)` and `queue.try_receive()`, for a value of

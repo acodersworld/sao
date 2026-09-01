@@ -145,6 +145,18 @@ struct UnionWidening {
     destination_union: TypeId,
 }
 
+/// Records the one covariant conversion supported by a parameterized built-in.
+/// The payload identities are retained explicitly so lowering does not need to
+/// rediscover the relationship between the two `Error` applications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ErrorWidening {
+    source_error: TypeId,
+    destination_error: TypeId,
+    source_payload: TypeId,
+    destination_payload: TypeId,
+    payload_assignment: Box<ContextualAssignment>,
+}
+
 /// Describes formation of an erased interface view. This is not a conversion
 /// of the concrete object: lowering preserves its address and concrete vtable.
 /// Source alternatives and destination method requirements remain canonical
@@ -175,6 +187,7 @@ enum PhysicalPlaceRoot {
 enum PhysicalPlaceProjection {
     Field(NodeId),
     TupleElement(usize),
+    BuiltinErrorValue,
     /// A callable links this result to an input without exposing the private
     /// interior path selected by its implementation.
     OpaqueDerived,
@@ -345,9 +358,12 @@ enum ContextualAssignment {
         member_type: TypeId,
         interface_view: Option<InterfaceView>,
         tracked_borrow: Option<(TypeId, TypeId)>,
+        error_widening: Option<ErrorWidening>,
     },
     /// An existing union needs active-tag remapping into a strict superset.
     UnionWidening(UnionWidening),
+    /// `Error` alone is covariant in its immutable payload.
+    ErrorWidening(ErrorWidening),
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +455,27 @@ enum ResolvedMember {
     },
     /// The compiler-provided recursive copy operation and its source type.
     Copy { source_type: TypeId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorConstructorInference {
+    Explicit,
+    Expected,
+    Payload,
+}
+
+/// Stable identities for compiler-known construction and payload access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedBuiltinOperation {
+    Constructor {
+        builtin: BuiltinType,
+        type_arguments: Vec<TypeId>,
+        error_inference: Option<ErrorConstructorInference>,
+    },
+    ErrorValue {
+        error_type: TypeId,
+        payload_type: TypeId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,6 +666,7 @@ enum ExpressionCheckingErrorKind {
         found: TypeId,
         category: ValueCategory,
     },
+    CannotInferErrorPayload,
     UnknownMember,
     InvalidMemberOwner {
         found: TypeId,
@@ -683,6 +721,7 @@ struct ExpressionChecking {
     transfers: HashMap<NodeId, ValueTransfer>,
     union_injections: HashMap<NodeId, UnionInjection>,
     union_widenings: HashMap<NodeId, UnionWidening>,
+    error_widenings: HashMap<NodeId, ErrorWidening>,
     interface_views: HashMap<NodeId, InterfaceView>,
     tracked_borrows: HashMap<NodeId, TrackedBorrow>,
     tracked_parameter_borrows: HashMap<NodeId, TrackedParameterBorrow>,
@@ -720,6 +759,7 @@ struct ExpressionChecking {
     /// Final declaration identities selected by member lookup. Later typed IR
     /// can consume these without repeating lookup from source names.
     resolved_members: HashMap<NodeId, ResolvedMember>,
+    resolved_builtin_operations: HashMap<NodeId, ResolvedBuiltinOperation>,
     resolved_sequence_operations: HashMap<NodeId, ResolvedSequenceOperation>,
     sequence_runtime_checks: HashMap<NodeId, Vec<SequenceRuntimeCheck>>,
     primitive_conversions: HashMap<NodeId, PrimitiveConversion>,
@@ -4270,6 +4310,36 @@ impl<'semantic> Analyzer<'semantic> {
         expected: TypeId,
         allow_recursive_copy: bool,
     ) -> Option<TypedExpression> {
+        if !self.checking.expressions.contains_key(&expression.id) {
+            if let ExpressionKind::Call { callee, arguments } = &expression.kind
+                && self.inferred_error_constructor_callee(callee)
+            {
+                let contextual_error = self.contextual_error_type(expected);
+                let found = self.synthesize_inferred_error_call(
+                    expression,
+                    callee,
+                    arguments,
+                    contextual_error,
+                )?;
+                self.checking.expressions.insert(expression.id, found);
+                self.checking.explicit_values.insert(expression.id, true);
+                return self.check_typed(
+                    expression,
+                    expected,
+                    found,
+                    allow_recursive_copy,
+                );
+            }
+            if let ExpressionKind::AssociatedAccess { owner, member } = &expression.kind
+                && self.is_inferred_error_constructor(owner, *member)
+                && let Some(typed) =
+                    self.synthesize_contextual_error_constructor_value(expression, expected)
+            {
+                self.checking.expressions.insert(expression.id, typed);
+                self.checking.explicit_values.insert(expression.id, true);
+                return Some(typed);
+            }
+        }
         if let ExpressionKind::Block(block) = &expression.kind
             && !self.checking.expressions.contains_key(&expression.id)
         {
@@ -4547,6 +4617,12 @@ impl<'semantic> Analyzer<'semantic> {
             };
         }
 
+        if let Some(result) =
+            self.classify_error_widening(found, expected, allow_recursive_copy)
+        {
+            return result;
+        }
+
         if let Some((target, destination_capability)) =
             self.tracked_reference_parts(expected)
         {
@@ -4636,6 +4712,71 @@ impl<'semantic> Analyzer<'semantic> {
         self.classify_non_union_assignment(found, expected, allow_recursive_copy, None)
     }
 
+    fn classify_error_widening(
+        &self,
+        found: TypedExpression,
+        expected: TypeId,
+        allow_recursive_copy: bool,
+    ) -> Option<Result<ContextualAssignment, ExpressionCheckingErrorKind>> {
+        let Some(SemanticType::Builtin {
+            builtin: BuiltinType::Error,
+            arguments: source_arguments,
+            ..
+        }) = self.types.types().get(found.type_id)
+        else {
+            return None;
+        };
+        let Some(SemanticType::Builtin {
+            builtin: BuiltinType::Error,
+            arguments: destination_arguments,
+            ..
+        }) = self.types.types().get(expected)
+        else {
+            return None;
+        };
+        let (&[source_payload], &[destination_payload]) =
+            (source_arguments.as_slice(), destination_arguments.as_slice())
+        else {
+            return None;
+        };
+        if !self.value_capability_is_compatible(found, expected, allow_recursive_copy) {
+            return Some(Err(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            }));
+        }
+        let payload_category = if self
+            .types
+            .types()
+            .get(source_payload)
+            .is_some_and(|semantic| semantic.storage_semantics() == Some(StorageSemantics::Gc))
+        {
+            ValueCategory::GcReference
+        } else {
+            found.category
+        };
+        let payload = TypedExpression {
+            type_id: source_payload,
+            category: payload_category,
+        };
+        Some(
+            self.classify_contextual_assignment(
+                payload,
+                destination_payload,
+                allow_recursive_copy,
+            )
+            .map(|payload_assignment| {
+                ContextualAssignment::ErrorWidening(ErrorWidening {
+                    source_error: found.type_id,
+                    destination_error: expected,
+                    source_payload,
+                    destination_payload,
+                    payload_assignment: Box::new(payload_assignment),
+                })
+            }),
+        )
+    }
+
     /// Widens a union only when its canonical member set is a subset of the
     /// destination. Otherwise the complete source may still form one
     /// unambiguous interface view which is then injected as a single member;
@@ -4690,22 +4831,24 @@ impl<'semantic> Analyzer<'semantic> {
                 found: found.type_id,
             });
         };
-        let (interface_view, tracked_borrow) = match assignment {
-            ContextualAssignment::Exact => (None, None),
-            ContextualAssignment::InterfaceView(view) => (Some(view), None),
+        let (interface_view, tracked_borrow, error_widening) = match assignment {
+            ContextualAssignment::Exact => (None, None, None),
+            ContextualAssignment::InterfaceView(view) => (Some(view), None, None),
             ContextualAssignment::TrackedBorrow {
                 source_type,
                 target_type,
-            } => (None, Some((source_type, target_type))),
+            } => (None, Some((source_type, target_type)), None),
             ContextualAssignment::UnionInjection { .. }
             | ContextualAssignment::UnionWidening(_) => {
                 unreachable!("a normalized union member is not a destination union")
             }
+            ContextualAssignment::ErrorWidening(widening) => (None, None, Some(widening)),
         };
         Ok(ContextualAssignment::UnionInjection {
             member_type,
             interface_view,
             tracked_borrow,
+            error_widening,
         })
     }
 
@@ -4734,6 +4877,12 @@ impl<'semantic> Analyzer<'semantic> {
                     found: found.type_id,
                 })
             };
+        }
+
+        if let Some(result) =
+            self.classify_error_widening(found, expected, allow_recursive_copy)
+        {
+            return result;
         }
 
         if let Some((target, destination_capability)) =
@@ -5264,8 +5413,15 @@ impl<'semantic> Analyzer<'semantic> {
                 member_type,
                 interface_view,
                 tracked_borrow,
+                error_widening,
             } => {
                 let borrowed_view = interface_view.is_some()
+                    || error_widening.as_ref().is_some_and(|widening| {
+                        self.contextual_assignment_borrows(
+                            &widening.payload_assignment,
+                            found,
+                        )
+                    })
                     || (found.category == ValueCategory::BorrowedPlace
                         && self
                             .types
@@ -5280,6 +5436,9 @@ impl<'semantic> Analyzer<'semantic> {
                 }
                 if let Some((source_type, target_type)) = tracked_borrow {
                     self.record_tracked_borrow(node, found, source_type, target_type);
+                }
+                if let Some(widening) = error_widening {
+                    self.checking.error_widenings.insert(node, widening);
                 }
                 self.checking.union_injections.insert(
                     node,
@@ -5325,6 +5484,69 @@ impl<'semantic> Analyzer<'semantic> {
                     },
                 }
             }
+            ContextualAssignment::ErrorWidening(widening) => {
+                let borrowed_payload = self.contextual_assignment_borrows(
+                    &widening.payload_assignment,
+                    found,
+                );
+                self.checking.error_widenings.insert(node, widening);
+                TypedExpression {
+                    type_id: expected,
+                    category: if borrowed_payload {
+                        ValueCategory::BorrowedPlace
+                    } else {
+                        ValueCategory::FreshTemporary
+                    },
+                }
+            }
+        }
+    }
+
+    fn contextual_assignment_borrows(
+        &self,
+        assignment: &ContextualAssignment,
+        found: TypedExpression,
+    ) -> bool {
+        match assignment {
+            ContextualAssignment::TrackedBorrow { .. }
+            | ContextualAssignment::InterfaceView(_) => true,
+            ContextualAssignment::UnionInjection {
+                interface_view,
+                tracked_borrow,
+                error_widening,
+                ..
+            } => {
+                interface_view.is_some()
+                    || tracked_borrow.is_some()
+                    || error_widening.as_ref().is_some_and(|widening| {
+                        self.contextual_assignment_borrows(
+                            &widening.payload_assignment,
+                            found,
+                        )
+                    })
+            }
+            ContextualAssignment::ErrorWidening(widening) => self
+                .contextual_assignment_borrows(&widening.payload_assignment, found),
+            ContextualAssignment::UnionWidening(widening) => {
+                found.category != ValueCategory::FreshTemporary
+                    && self
+                        .union_members(widening.source_union)
+                        .expect("union widening starts from a union")
+                        .iter()
+                        .any(|member| {
+                            self.types.types().get(*member).is_some_and(|semantic| {
+                                semantic.storage_semantics() != Some(StorageSemantics::Gc)
+                                    && matches!(
+                                        semantic.copy_semantics(),
+                                        Some(
+                                            CopySemantics::Recursive
+                                                | CopySemantics::NonEscapingErasedView
+                                        )
+                                    )
+                            })
+                        })
+            }
+            ContextualAssignment::Exact => false,
         }
     }
 
@@ -6040,6 +6262,33 @@ impl<'semantic> Analyzer<'semantic> {
             .text(member)
             .expect("member name belongs to the source module")
             .to_string();
+        if let Some((builtin, arguments, _)) =
+            self.parameterized_builtin_parts(typed_object.type_id)
+        {
+            if builtin == BuiltinType::Error {
+                return Some(self.synthesize_error_value_access(
+                    expression,
+                    object,
+                    typed_object,
+                    member,
+                    &member_text,
+                    &arguments,
+                ));
+            }
+            let selected = self
+                .signatures
+                .builtins()
+                .member(BuiltinMemberOwner::Parameterized(builtin), &member_text);
+            if matches!(selected, Some(BuiltinMemberSignature::Callable(template)) if template.receiver.is_none())
+            {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::AssociatedFunctionRequiresType,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            }
+            return None;
+        }
         if member_text.bytes().all(|byte| byte.is_ascii_digit()) {
             return Some(self.synthesize_tuple_element_access(
                 expression,
@@ -6230,6 +6479,81 @@ impl<'semantic> Analyzer<'semantic> {
         }
     }
 
+    fn synthesize_error_value_access(
+        &mut self,
+        expression: &Expression,
+        object: &Expression,
+        typed_object: TypedExpression,
+        member: Span,
+        name: &str,
+        arguments: &[TypeId],
+    ) -> TypedExpression {
+        let selected = self
+            .signatures
+            .builtins()
+            .member(
+                BuiltinMemberOwner::Parameterized(BuiltinType::Error),
+                name,
+            )
+            .cloned();
+        let invalid_kind = match &selected {
+            Some(BuiltinMemberSignature::Callable(_)) => {
+                ExpressionCheckingErrorKind::AssociatedFunctionRequiresType
+            }
+            Some(BuiltinMemberSignature::Field(_)) | None => {
+                ExpressionCheckingErrorKind::UnknownMember
+            }
+        };
+        let Some(BuiltinMemberSignature::Field(template)) = selected else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: invalid_kind,
+                span: member,
+            });
+            return self.recovery_temporary();
+        };
+        let payload_type = template
+            .instantiate(arguments, self.types.types_mut())
+            .expect("Error.value has one payload substitution");
+        let category = self.field_category(typed_object, payload_type);
+        self.checking.places.insert(
+            expression.id,
+            Place {
+                symbol: None,
+                declared_type_id: payload_type,
+                type_id: payload_type,
+                category,
+                binding_mutability: None,
+                value_capability: ValueCapability::Const,
+            },
+        );
+        self.checking.resolved_builtin_operations.insert(
+            expression.id,
+            ResolvedBuiltinOperation::ErrorValue {
+                error_type: typed_object.type_id,
+                payload_type,
+            },
+        );
+        let mut physical = self.physical_place_for(object, typed_object);
+        physical
+            .projections
+            .push(PhysicalPlaceProjection::BuiltinErrorValue);
+        if category == ValueCategory::GcReference {
+            physical.storage = ValueCategory::GcReference;
+        }
+        self.checking.physical_places.insert(expression.id, physical);
+        self.propagate_tracked_lifetime_projection(
+            object,
+            expression.id,
+            PhysicalPlaceProjection::BuiltinErrorValue,
+            payload_type,
+            category,
+        );
+        TypedExpression {
+            type_id: payload_type,
+            category,
+        }
+    }
+
     /// Selects one statically known tuple element and records it as an
     /// ordinary place. Tuple fields are numeric syntax rather than dynamic
     /// indices, so no runtime bounds check or common element type is needed.
@@ -6400,7 +6724,68 @@ impl<'semantic> Analyzer<'semantic> {
         owner: &TypeSyntax,
         member: Span,
     ) -> Option<TypedExpression> {
+        if self.is_inferred_error_constructor(owner, member) {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::CannotInferErrorPayload,
+                span: expression.span,
+            });
+            return Some(self.recovery_temporary());
+        }
         let owner_type = self.resolved_type_syntax(owner.id)?;
+        if let Some((builtin, arguments, _)) = self.parameterized_builtin_parts(owner_type) {
+            let name = self
+                .module
+                .text(member)
+                .expect("built-in associated member belongs to the source module");
+            let selected = self
+                .signatures
+                .builtins()
+                .member(BuiltinMemberOwner::Parameterized(builtin), name)
+                .cloned();
+            let invalid_kind = match &selected {
+                Some(BuiltinMemberSignature::Field(_)) => {
+                    ExpressionCheckingErrorKind::FieldRequiresValue
+                }
+                Some(BuiltinMemberSignature::Callable(_)) | None => {
+                    ExpressionCheckingErrorKind::UnknownMember
+                }
+            };
+            let Some(BuiltinMemberSignature::Callable(template)) = selected else {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: invalid_kind,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            };
+            if template.receiver.is_some() {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::MethodRequiresValue,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            }
+            let signature = template
+                .instantiate(&arguments, self.types.types_mut())
+                .expect("resolved built-in application supplies the catalogue arity");
+            let type_id = self.types.types_mut().callable(
+                signature.parameters,
+                signature.return_type,
+                AccessCapability::Const,
+            );
+            self.checking.resolved_builtin_operations.insert(
+                expression.id,
+                ResolvedBuiltinOperation::Constructor {
+                    builtin,
+                    type_arguments: arguments,
+                    error_inference: (builtin == BuiltinType::Error)
+                        .then_some(ErrorConstructorInference::Explicit),
+                },
+            );
+            return Some(TypedExpression {
+                type_id,
+                category: ValueCategory::FreshTemporary,
+            });
+        }
         if self.primitive_kind(owner_type) == Some(PrimitiveType::Bytes) {
             let name = self
                 .module
@@ -6532,6 +6917,35 @@ impl<'semantic> Analyzer<'semantic> {
             type_id,
             category: ValueCategory::FreshTemporary,
         })
+    }
+
+    fn parameterized_builtin_parts(
+        &self,
+        type_id: TypeId,
+    ) -> Option<(BuiltinType, Vec<TypeId>, AccessCapability)> {
+        let SemanticType::Builtin {
+            builtin,
+            arguments,
+            capability,
+        } = self.types.types().get(type_id)?
+        else {
+            return None;
+        };
+        Some((*builtin, arguments.clone(), *capability))
+    }
+
+    fn is_inferred_error_constructor(&self, owner: &TypeSyntax, member: Span) -> bool {
+        matches!(
+            &owner.kind,
+            crate::ast::TypeKind::Builtin {
+                builtin: BuiltinType::Error,
+                arguments,
+            } if arguments.is_empty()
+                && self
+                    .module
+                    .text(member)
+                    .is_ok_and(|name| name == "new")
+        )
     }
 
     /// Peels a plain, GC-qualified, or tracked concrete struct into the
@@ -7543,6 +7957,18 @@ impl<'semantic> Analyzer<'semantic> {
         callee: &Expression,
         arguments: &[Expression],
     ) -> Option<TypedExpression> {
+        if self.inferred_error_constructor_callee(callee) {
+            return self.synthesize_inferred_error_call(expression, callee, arguments, None);
+        }
+        if let Some((error_type, payload_type)) = self.explicit_error_constructor_callee(callee) {
+            let _ = self.synthesize(callee)?;
+            return self.synthesize_explicit_error_call(
+                expression,
+                arguments,
+                error_type,
+                payload_type,
+            );
+        }
         if self.types.runtime_template_call(expression.id).is_some() {
             return self.synthesize_runtime_template_call(expression, arguments);
         }
@@ -7593,6 +8019,221 @@ impl<'semantic> Analyzer<'semantic> {
             return Some(self.recovery_temporary());
         }
         Some(self.call_result(expression, return_type, None))
+    }
+
+    fn inferred_error_constructor_callee(&self, callee: &Expression) -> bool {
+        let ExpressionKind::AssociatedAccess { owner, member } = &callee.kind else {
+            return false;
+        };
+        self.is_inferred_error_constructor(owner, *member)
+    }
+
+    fn explicit_error_constructor_callee(&self, callee: &Expression) -> Option<(TypeId, TypeId)> {
+        let ExpressionKind::AssociatedAccess { owner, member } = &callee.kind else {
+            return None;
+        };
+        if self.module.text(*member).ok()? != "new" {
+            return None;
+        }
+        let owner_type = self.resolved_type_syntax(owner.id)?;
+        self.error_payload_type(owner_type)
+            .map(|payload| (owner_type, payload))
+    }
+
+    fn contextual_error_type(&self, expected: TypeId) -> Option<(TypeId, TypeId)> {
+        if let Some(payload) = self.error_payload_type(expected) {
+            return Some((expected, payload));
+        }
+        let members = self.union_members(expected)?;
+        let mut errors = members
+            .into_iter()
+            .filter_map(|member| self.error_payload_type(member).map(|payload| (member, payload)));
+        let selected = errors.next()?;
+        errors.next().is_none().then_some(selected)
+    }
+
+    fn error_payload_type(&self, type_id: TypeId) -> Option<TypeId> {
+        let SemanticType::Builtin {
+            builtin: BuiltinType::Error,
+            arguments,
+            ..
+        } = self.types.types().get(type_id)?
+        else {
+            return None;
+        };
+        let [payload] = arguments.as_slice() else {
+            return None;
+        };
+        Some(*payload)
+    }
+
+    fn synthesize_inferred_error_call(
+        &mut self,
+        call: &Expression,
+        callee: &Expression,
+        arguments: &[Expression],
+        contextual_error: Option<(TypeId, TypeId)>,
+    ) -> Option<TypedExpression> {
+        let arity_matches = arguments.len() == 1;
+        if !arity_matches {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                    expected: 1,
+                    found: arguments.len(),
+                },
+                span: call.span,
+            });
+        }
+        let inferred_payload = if let Some(payload) = arguments.first() {
+            let checked = if let Some((_, expected_payload)) = contextual_error {
+                self.check(payload, expected_payload)
+            } else {
+                self.synthesize(payload)
+            }?;
+            let payload_type = contextual_error.map_or(checked.type_id, |(_, payload)| payload);
+            let valid = !self.is_recovery(checked.type_id)
+                && self.validate_owning_transfer(payload, checked, true);
+            for surplus in arguments.get(1..).unwrap_or(&[]) {
+                let _ = self.synthesize(surplus);
+            }
+            if valid && arity_matches {
+                let mut tracked = Vec::new();
+                self.extend_tracked_lifetime_sources(&mut tracked, payload);
+                self.checking
+                    .borrow_containing_call_inputs
+                    .insert(call.id, tracked);
+                Some(payload_type)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let Some(payload_type) = inferred_payload else {
+            return Some(self.recovery_temporary());
+        };
+        let error_type = contextual_error.map_or_else(
+            || {
+                self.types.types_mut().builtin(
+                    BuiltinType::Error,
+                    vec![payload_type],
+                    AccessCapability::Const,
+                )
+            },
+            |(error, _)| error,
+        );
+        let inference = if contextual_error.is_some() {
+            ErrorConstructorInference::Expected
+        } else {
+            ErrorConstructorInference::Payload
+        };
+        self.record_inferred_error_constructor(callee, payload_type, error_type, inference);
+        Some(self.call_result(call, error_type, None))
+    }
+
+    fn synthesize_explicit_error_call(
+        &mut self,
+        call: &Expression,
+        arguments: &[Expression],
+        error_type: TypeId,
+        payload_type: TypeId,
+    ) -> Option<TypedExpression> {
+        let arity_matches = arguments.len() == 1;
+        if !arity_matches {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                    expected: 1,
+                    found: arguments.len(),
+                },
+                span: call.span,
+            });
+        }
+        let mut valid = arity_matches;
+        if let Some(payload) = arguments.first() {
+            let checked = self.check(payload, payload_type)?;
+            if self.is_recovery(checked.type_id)
+                || !self.validate_owning_transfer(payload, checked, true)
+            {
+                valid = false;
+            } else {
+                let mut tracked = Vec::new();
+                self.extend_tracked_lifetime_sources(&mut tracked, payload);
+                self.checking
+                    .borrow_containing_call_inputs
+                    .insert(call.id, tracked);
+            }
+        }
+        for surplus in arguments.get(1..).unwrap_or(&[]) {
+            let _ = self.synthesize(surplus);
+        }
+        if !valid {
+            return Some(self.recovery_temporary());
+        }
+        Some(self.call_result(call, error_type, None))
+    }
+
+    fn synthesize_contextual_error_constructor_value(
+        &mut self,
+        expression: &Expression,
+        expected: TypeId,
+    ) -> Option<TypedExpression> {
+        let SemanticType::Callable {
+            parameters,
+            return_type,
+            ..
+        } = self.types.types().get(expected)?
+        else {
+            return None;
+        };
+        let [payload_parameter] = parameters.as_slice() else {
+            return None;
+        };
+        let error_payload = self.error_payload_type(*return_type)?;
+        if self.types.types().has_same_shape(*payload_parameter, error_payload) != Some(true) {
+            return None;
+        }
+        self.checking.resolved_builtin_operations.insert(
+            expression.id,
+            ResolvedBuiltinOperation::Constructor {
+                builtin: BuiltinType::Error,
+                type_arguments: vec![error_payload],
+                error_inference: Some(ErrorConstructorInference::Expected),
+            },
+        );
+        Some(TypedExpression {
+            type_id: expected,
+            category: ValueCategory::FreshTemporary,
+        })
+    }
+
+    fn record_inferred_error_constructor(
+        &mut self,
+        callee: &Expression,
+        payload_type: TypeId,
+        error_type: TypeId,
+        inference: ErrorConstructorInference,
+    ) {
+        let callable_type = self.types.types_mut().callable(
+            vec![payload_type],
+            error_type,
+            AccessCapability::Const,
+        );
+        self.checking.expressions.insert(
+            callee.id,
+            TypedExpression {
+                type_id: callable_type,
+                category: ValueCategory::FreshTemporary,
+            },
+        );
+        self.checking.explicit_values.insert(callee.id, true);
+        self.checking.resolved_builtin_operations.insert(
+            callee.id,
+            ResolvedBuiltinOperation::Constructor {
+                builtin: BuiltinType::Error,
+                type_arguments: vec![payload_type],
+                error_inference: Some(inference),
+            },
+        );
     }
 
     /// Checks one explicit top-level template invocation. Compile-time type
@@ -16010,5 +16651,207 @@ fn main() {
                 == ExpressionCheckingErrorKind::ExpandingRuntimeTemplateSpecialization
         }), "{:#?}", checking.errors);
         assert_eq!(checking.runtime_specializations.len(), 1);
+    }
+
+    #[test]
+    fn checks_parameterized_builtin_constructors_and_first_class_selection() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const queue_new = Queue(int)::new;\n",
+            "    const vector_new = Vector(string)::new;\n",
+            "    const map_new = Map(string, int)::new;\n",
+            "    const queue = queue_new();\n",
+            "    const vector = vector_new();\n",
+            "    const map = map_new();\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let main = function(&program.declarations[0]);
+        for (statement, builtin) in main.body.statements[..3].iter().zip([
+            BuiltinType::Queue,
+            BuiltinType::Vector,
+            BuiltinType::Map,
+        ]) {
+            let selected = binding_initializer(statement);
+            assert!(matches!(
+                checking.resolved_builtin_operations.get(&selected.id),
+                Some(ResolvedBuiltinOperation::Constructor {
+                    builtin: found,
+                    error_inference: None,
+                    ..
+                }) if *found == builtin
+            ));
+        }
+        for (statement, builtin) in main.body.statements[3..].iter().zip([
+            BuiltinType::Queue,
+            BuiltinType::Vector,
+            BuiltinType::Map,
+        ]) {
+            let constructed = binding_initializer(statement);
+            let typed = checking.expressions[&constructed.id];
+            assert_eq!(typed.category, ValueCategory::FreshTemporary);
+            assert!(matches!(
+                types.types().get(typed.type_id),
+                Some(SemanticType::Builtin {
+                    builtin: found,
+                    capability: AccessCapability::Mut,
+                    ..
+                }) if *found == builtin
+            ));
+        }
+    }
+
+    #[test]
+    fn checks_explicit_payload_and_expected_error_constructor_inference() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const explicit = Error(string)::new(\"explicit\");\n",
+            "    const inferred = Error::new(\"inferred\");\n",
+            "    const expected: Error(int | string) = Error::new(1);\n",
+            "    const make: fn(string) -> Error(string) = Error::new;\n",
+            "    const made = make(\"made\");\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let main = function(&program.declarations[0]);
+        let explicit = binding_initializer(&main.body.statements[0]);
+        let inferred = binding_initializer(&main.body.statements[1]);
+        let expected = binding_initializer(&main.body.statements[2]);
+        let constructor_value = binding_initializer(&main.body.statements[3]);
+        for (constructed, inference) in [
+            (explicit, ErrorConstructorInference::Explicit),
+            (inferred, ErrorConstructorInference::Payload),
+            (expected, ErrorConstructorInference::Expected),
+        ] {
+            let (callee, _) = call(constructed);
+            assert!(matches!(
+                checking.resolved_builtin_operations.get(&callee.id),
+                Some(ResolvedBuiltinOperation::Constructor {
+                    builtin: BuiltinType::Error,
+                    error_inference: Some(found),
+                    ..
+                }) if *found == inference
+            ));
+        }
+        assert!(matches!(
+            checking.resolved_builtin_operations.get(&constructor_value.id),
+            Some(ResolvedBuiltinOperation::Constructor {
+                builtin: BuiltinType::Error,
+                error_inference: Some(ErrorConstructorInference::Expected),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn widens_error_payloads_and_exposes_only_const_value_access() {
+        let source = concat!(
+            "struct Io {}\n",
+            "struct Parse {}\n",
+            "struct Item {}\n",
+            "fn inspect(error: Error(*mut Item)) { const payload: *Item = error.value; }\n",
+            "fn main() {\n",
+            "    const narrow = Error(Io)::new(Io {});\n",
+            "    const wide: Error(Io | Parse) = narrow;\n",
+            "    wide.value;\n",
+            "    wide.value = Io {};\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert_eq!(checking.errors[0].kind, ExpressionCheckingErrorKind::ImmutableValue);
+
+        let main = function(&program.declarations[4]);
+        let widened = binding_initializer(&main.body.statements[1]);
+        assert!(checking.error_widenings.contains_key(&widened.id));
+        let accessed = expression(&main.body.statements[2]);
+        assert!(matches!(
+            checking.resolved_builtin_operations.get(&accessed.id),
+            Some(ResolvedBuiltinOperation::ErrorValue { .. })
+        ));
+        assert_eq!(
+            checking.places[&accessed.id].value_capability,
+            ValueCapability::Const
+        );
+
+        let inspect = function(&program.declarations[3]);
+        let payload = binding_initializer(&inspect.body.statements[0]);
+        let payload_type = checking.expressions[&payload.id].type_id;
+        assert!(matches!(
+            types.types().get(payload_type),
+            Some(SemanticType::Tracked {
+                capability: AccessCapability::Const,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn diagnoses_error_constructor_arity_payload_and_inference_once() {
+        let source = concat!(
+            "fn main() {\n",
+            "    const bad_queue = Queue(int)::new(1);\n",
+            "    const missing_explicit = Error(int)::new();\n",
+            "    const missing_inferred = Error::new();\n",
+            "    const wrong_payload = Error(int)::new(\"wrong\");\n",
+            "    const unknown = Error::new;\n",
+            "    const recovered: int = wrong_payload;\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 5, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 0,
+                found: 1,
+            }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 1,
+                found: 0,
+            }
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 1,
+                found: 0,
+            }
+        ));
+        assert!(matches!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert_eq!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::CannotInferErrorPayload
+        );
+    }
+
+    #[test]
+    fn preserves_tracked_payload_origins_through_error_construction_and_widening() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn wrap(value: *Item) -> Error(*Item) { Error::new(value) }\n",
+            "fn reduce(value: Error(*mut Item)) -> Error(*Item) { value }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+        let wrapped = body_value(function(&program.declarations[1]));
+        let reduced = body_value(function(&program.declarations[2]));
+        assert!(checking.tracked_lifetime_links.contains_key(&wrapped.id));
+        assert!(checking.tracked_lifetime_links.contains_key(&reduced.id));
+        assert!(checking.error_widenings.contains_key(&reduced.id));
     }
 }
