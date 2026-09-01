@@ -169,3 +169,6 @@ A queue object stores its length, capacity, head position, and a pointer to raw
 ring-buffer storage specialized for its element type. Its generated tracing
 function visits the occupied elements that contain references. Its runtime
 release function frees the raw buffer when the collector sweeps the queue.
+Queue elements are restricted to trivially copied inline values and explicit GC
+references, so the raw buffer never retains an ordinary non-escaping object
+borrow or tracked reference.

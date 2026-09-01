@@ -95,14 +95,20 @@ const message: int = loop {
 };
 ```
 
-The initial `Queue(T)` requires that `T` not contain `none`; otherwise an empty
-queue could not be distinguished from a successfully received `none` value.
-A future explicitly tagged receive-result type may remove this restriction.
+The initial `Queue(T)` permits only trivially copied inline values or explicitly
+GC-qualified references. It also requires that `T` not contain `none`;
+otherwise an empty queue could not be distinguished from a successfully
+received `none` value. Consequently `Queue(int)` and `Queue(&Item)` are valid,
+while `Queue(Item)`, `Queue(string)`, and `Queue(*Item)` are not. A future
+explicitly tagged receive-result type may remove the `none` restriction.
 
-Sending is an owning boundary. Fresh plain values may move into queue storage;
-named plain values require explicit `.copy()`, and nested `&T`
-members remain shared. GC-qualified values copy their stable reference and
-preserve the access capability admitted by `T`. Queue references may be shared
-between coroutines under SAO's existing aliasing and capability rules.
+Sending copies a trivial inline value or a stable GC reference into the queue.
+It never retains the implicit non-escaping borrow used to pass a plain
+object-like value to an ordinary parameter. GC-qualified values preserve the
+access capability admitted by `T`. A queue which itself must be shared between
+coroutines uses explicit GC storage, such as `&mut Queue(T)`; its stable
+reference may be copied into coroutine frames under SAO's existing aliasing and
+capability rules.
+
 Because scheduling never occurs during a queue operation, each operation
 completes before another coroutine can access the queue.

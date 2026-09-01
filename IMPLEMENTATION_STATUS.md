@@ -52,7 +52,10 @@ The parser currently supports:
 - Fixed-arity `Queue(T)`, `Vector(T)`, `Map(K, V)`, and `Error(T)` types, plus
   associated access on those types. Their constructors use ordinary associated
   calls such as `Queue(T)::new()`; both inferred `Error::new(value)` and explicit
-  `Error(T)::new(value)` forms are represented for later type checking.
+  `Error(T)::new(value)` forms are represented for later type checking. Queue
+  elements are restricted to trivially copied inline values and explicit GC
+  references; plain object-like, borrowed-view, tracked-reference, and other
+  recursively copied element types are rejected.
 - File-level and receiverless associated type factories returning `type`,
   generated nominal struct type expressions, `comptime` type parameters,
   explicit runtime-template calls, and named, intersected, or anonymous
@@ -213,7 +216,10 @@ templates. Top-level and method templates require explicit type arguments;
 method specialization identity includes the concrete named or generated owner.
 Specializations reuse exact recursion, reject expanding recursion, validate
 constraints before checking ordinary arguments, and retain per-specialization
-analysis metadata for later typed IR and lowering.
+analysis metadata for later typed IR and lowering. Queue `send` and
+`try_receive` calls resolve on plain, GC, and tracked queue receivers, record
+their concrete element transfers and receive-union layouts, and accept only the
+element categories admitted during source type resolution.
 
 Tuple checking includes contextual and inferred construction, ordered
 structural identity, numeric element places, transitive capability, owning

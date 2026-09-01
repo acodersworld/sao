@@ -106,7 +106,9 @@ Tracked-bearing values cannot cross storage boundaries which could outlive or
 relocate their backing storage. They cannot be GC allocated, nested beneath a GC
 field, or used as an element, key, or value in `Queue`, `Vector`, or `Map`
 external-buffer storage. `Error(T)`, tuples, unions, and plain structs remain
-inline and therefore propagate tracked origins transitively.
+inline and therefore propagate tracked origins transitively. Queue element
+types are stricter still: only trivially copied inline values and explicit GC
+references are accepted, independently of tracked-origin analysis.
 
 ## 21.6 Flow-sensitive validity and GC rooting
 

@@ -629,7 +629,7 @@ reviewable phases:
        explicitly and retain lowering-facing metadata rather than relying on
        later name or member lookup.
      - Change 1, parameterized built-in construction and `Error` values
-       (implementation ready for review):
+       (complete):
        - Check associated selection and calls for `Queue(T)::new()`,
          `Vector(T)::new()`, and `Map(K, V)::new()`. Each constructor takes no
          runtime arguments and produces a fresh mutable value of its exact
@@ -655,27 +655,39 @@ reviewable phases:
          cover the cases above. Verified with all 138 expression-analysis tests
          and the complete workspace suite: 445 library tests and 12 binary
          tests pass. No formatting was run.
-       - Stop for review and commit before implementing queue operations.
-     - Change 2, queue operations and external-buffer ownership:
+       - Reviewed and completed before queue operations began.
+     - Change 2, queue operations and external-buffer ownership
+       (complete):
        - Check `queue.send(value)` and `queue.try_receive()`, for a value of
-         type `Queue(T)`, including a
-         mutable receiver, exact method selection, argument counts, and the
-         `T | none` receive result. Retain the existing prohibition on `T`
-         containing `none`.
-       - Treat `send` as an owning boundary: move fresh plain values, require an
-         explicit copy for named nontrivial plain values, and copy GC references
-         with the capability admitted by `T`. Preserve the Phase 7.6 rejection
-         of transitively borrow-containing Queue, Vector, and Map storage.
+         type `Queue(T)` or a GC/tracked reference to one, including a mutable
+         receiver, exact method selection, argument counts, and the `T | none`
+         receive result. Retain the prohibition on `T` containing `none`.
+       - Restrict `T` to trivially copied inline values or explicit GC
+         references. Reject plain object-like, borrowed-view, tracked-reference,
+         and other recursively copied element types during source type
+         resolution. `send` copies the admitted trivial value or stable GC
+         reference and never retains an ordinary object-parameter borrow.
        - Record resolved queue-operation, receiver, element-transfer, and
          receive-union metadata. Do not add implicit scheduling, blocking
          receives, collection iteration, or references into relocatable
          buffers.
-       - Add focused tests for receiver mutability, sends of every storage
-         category, empty/nonempty receive typing, member misuse, recovery, and
-         source evaluation order.
-       - Stop for review and commit before implementing the remaining ordinary
-         compiler-known functions.
-     - Change 3, ASCII, output, panic, and yield built-ins:
+       - Add focused tests for receiver mutability, trivial and GC-reference
+         sends, invalid element applications, empty/nonempty receive typing,
+         member misuse, recovery, and source evaluation order.
+       - Implemented dedicated Queue method dispatch for `send` and
+         `try_receive`, including mutable-receiver validation, stable element
+         transfers, canonical `T | none` results, deterministic misuse and
+         arity recovery, and lowering-facing receiver, transfer, and union-tag
+         metadata. Plain, GC, and tracked queue receivers are recognized.
+         Focused source tests cover trivial and capability-reduced GC-reference
+         sends, receive typing, invalid calls, and early rejection of plain
+         nontrivial element types. Vector and Map retain their existing
+         transitive external-buffer borrow validation.
+       - Compilation and test execution were not requested for this change, so
+         verification is pending. No formatting was run.
+       - Reviewed and completed. Stop for commit before implementing the
+         remaining ordinary compiler-known functions.
+     - Change 3, ASCII, output, panic, and yield built-ins (next):
        - Resolve and check `ascii.encode(string) -> mut bytes`,
          `ascii.decode(bytes) -> string | Error(string)`,
          `print(string) -> ()`, `println(string) -> ()`,

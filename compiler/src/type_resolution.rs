@@ -19,7 +19,9 @@ use crate::{
         TypeKind, TypeSyntax, expression_as_type_syntax,
     },
     name_resolution::NameResolution,
-    semantic_types::{AccessCapability, SemanticType, TypeId, TypeStore},
+    semantic_types::{
+        AccessCapability, CopySemantics, SemanticType, StorageSemantics, TypeId, TypeStore,
+    },
     source::{SourceModule, Span},
     symbol_table::{SymbolId, SymbolKind},
 };
@@ -175,6 +177,9 @@ pub enum TypeResolutionErrorKind {
         found: usize,
     },
     QueueElementContainsNone,
+    InvalidQueueElementType {
+        found: TypeId,
+    },
     InvalidIntersectionMember,
     AliasCycle,
     InvalidTypeFactorySignature,
@@ -212,6 +217,11 @@ impl fmt::Display for TypeResolutionError {
             TypeResolutionErrorKind::QueueElementContainsNone => write!(
                 formatter,
                 "Queue element type cannot contain `none` as a top-level alternative at {}..{}",
+                self.span.start, self.span.end
+            ),
+            TypeResolutionErrorKind::InvalidQueueElementType { found } => write!(
+                formatter,
+                "Queue element type must be trivially copied or GC-qualified, but found {found:?} at {}..{}",
                 self.span.start, self.span.end
             ),
             TypeResolutionErrorKind::InvalidIntersectionMember => write!(
@@ -1514,6 +1524,17 @@ impl<'source, 'names> Resolver<'source, 'names> {
             self.error(TypeResolutionErrorKind::QueueElementContainsNone, span);
             return self.types.recovery();
         }
+        if builtin == BuiltinType::Queue
+            && !self.queue_element_is_supported(resolved_arguments[0])
+        {
+            self.error(
+                TypeResolutionErrorKind::InvalidQueueElementType {
+                    found: resolved_arguments[0],
+                },
+                span,
+            );
+            return self.types.recovery();
+        }
 
         self.types
             .builtin(builtin, resolved_arguments, AccessCapability::Const)
@@ -1564,6 +1585,14 @@ impl<'source, 'names> Resolver<'source, 'names> {
                 .any(|member| self.contains_plain_none_alternative(*member)),
             _ => false,
         }
+    }
+
+    fn queue_element_is_supported(&self, id: TypeId) -> bool {
+        self.types.get(id).is_some_and(|semantic| {
+            matches!(semantic, SemanticType::Recovery)
+                || semantic.storage_semantics() == Some(StorageSemantics::Gc)
+                || semantic.copy_semantics() == Some(CopySemantics::Trivial)
+        })
     }
 
     fn error(&mut self, kind: TypeResolutionErrorKind, span: Span) {
@@ -1825,7 +1854,7 @@ mod tests {
             "    entry: Entry,\n",
             "    pair: IntPair,\n",
             "    callback: fn(Entry) -> IntPair,\n",
-            "    queue: Queue(Entry),\n",
+            "    queue: Queue(&Entry),\n",
             "    vector: Vector((int,)),\n",
             "    table: Map(Entry, (bool,)),\n",
             "    failure: Error((Entry, IntPair)),\n",
@@ -1856,8 +1885,24 @@ mod tests {
                 ..
             }) if parameters.as_slice() == [resolved(0)] && *return_type == resolved(1)
         ));
+        let Some(SemanticType::Builtin {
+            builtin: BuiltinType::Queue,
+            arguments,
+            ..
+        }) = resolution.types().get(resolved(3))
+        else {
+            panic!("expected Queue with a GC-qualified tuple element")
+        };
+        assert!(matches!(
+            arguments.as_slice(),
+            [argument] if matches!(
+                resolution.types().get(*argument),
+                Some(SemanticType::Gc { target, .. })
+                    if matches!(resolution.types().get(*target), Some(SemanticType::Tuple { .. }))
+            )
+        ));
+
         for (index, builtin, arity) in [
-            (3, BuiltinType::Queue, 1),
             (4, BuiltinType::Vector, 1),
             (5, BuiltinType::Map, 2),
             (6, BuiltinType::Error, 1),
@@ -1984,6 +2029,43 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].span.start < pair[1].span.start)
         );
+    }
+
+    #[test]
+    fn restricts_queue_elements_to_trivial_values_and_gc_references() {
+        let (_, valid) = resolve(concat!(
+            "struct Item {}\n",
+            "fn main(\n",
+            "    integers: Queue(int),\n",
+            "    shared: Queue(&Item),\n",
+            "    mutable: Queue(&mut Item),\n",
+            ") {}\n",
+        ));
+        assert!(valid.syntax_types().values().all(|type_id| {
+            !matches!(valid.types().get(*type_id), Some(SemanticType::Recovery))
+        }));
+
+        let (module, program) = parse(concat!(
+            "struct Item {}\n",
+            "fn bad(\n",
+            "    item: Queue(Item),\n",
+            "    text: Queue(string),\n",
+            "    tuple: Queue((int, int)),\n",
+            "    tracked: Queue(*Item),\n",
+            ") {}\n",
+            "fn main() {}\n",
+        ));
+        let names = resolve_program(&module, &program).expect("test names should resolve");
+        let errors = resolve_types(&module, &program, &names)
+            .expect_err("plain nontrivial queue elements should be invalid");
+        assert_eq!(errors.len(), 4, "{errors:#?}");
+        assert!(errors.iter().all(|error| matches!(
+            error.kind,
+            TypeResolutionErrorKind::InvalidQueueElementType { .. }
+        )));
+        assert!(errors
+            .windows(2)
+            .all(|pair| pair[0].span.start < pair[1].span.start));
     }
 
     #[test]

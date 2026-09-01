@@ -479,6 +479,33 @@ enum ResolvedBuiltinOperation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOperationKind {
+    Send,
+    TryReceive,
+}
+
+/// Concrete queue behavior selected by expression checking. Queue methods are
+/// not ordinary source methods, so lowering needs their instantiated receiver,
+/// element, transfer, and result representation without repeating catalogue
+/// lookup or reconstructing canonical union member positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedQueueOperation {
+    kind: QueueOperationKind,
+    queue_type: TypeId,
+    element_type: TypeId,
+    receiver_transfer: Option<ValueTransfer>,
+    element_transfer: Option<ValueTransfer>,
+    receive_union: Option<QueueReceiveUnion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueueReceiveUnion {
+    type_id: TypeId,
+    element_member: usize,
+    none_member: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SequenceKind {
     String,
     Bytes,
@@ -760,6 +787,7 @@ struct ExpressionChecking {
     /// can consume these without repeating lookup from source names.
     resolved_members: HashMap<NodeId, ResolvedMember>,
     resolved_builtin_operations: HashMap<NodeId, ResolvedBuiltinOperation>,
+    resolved_queue_operations: HashMap<NodeId, ResolvedQueueOperation>,
     resolved_sequence_operations: HashMap<NodeId, ResolvedSequenceOperation>,
     sequence_runtime_checks: HashMap<NodeId, Vec<SequenceRuntimeCheck>>,
     primitive_conversions: HashMap<NodeId, PrimitiveConversion>,
@@ -6262,6 +6290,29 @@ impl<'semantic> Analyzer<'semantic> {
             .text(member)
             .expect("member name belongs to the source module")
             .to_string();
+        if self.queue_parts(typed_object.type_id).is_some() {
+            let selected = self.signatures.builtins().member(
+                BuiltinMemberOwner::Parameterized(BuiltinType::Queue),
+                &member_text,
+            );
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: match selected {
+                    Some(BuiltinMemberSignature::Callable(template))
+                        if template.receiver.is_some() =>
+                    {
+                        ExpressionCheckingErrorKind::MethodRequiresCall
+                    }
+                    Some(BuiltinMemberSignature::Callable(_)) => {
+                        ExpressionCheckingErrorKind::AssociatedFunctionRequiresType
+                    }
+                    Some(BuiltinMemberSignature::Field(_)) | None => {
+                        ExpressionCheckingErrorKind::UnknownMember
+                    }
+                },
+                span: member,
+            });
+            return Some(self.recovery_temporary());
+        }
         if let Some((builtin, arguments, _)) =
             self.parameterized_builtin_parts(typed_object.type_id)
         {
@@ -6283,6 +6334,21 @@ impl<'semantic> Analyzer<'semantic> {
             {
                 self.checking.errors.push(ExpressionCheckingError {
                     kind: ExpressionCheckingErrorKind::AssociatedFunctionRequiresType,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            }
+            if matches!(selected, Some(BuiltinMemberSignature::Callable(template)) if template.receiver.is_some())
+            {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::MethodRequiresCall,
+                    span: member,
+                });
+                return Some(self.recovery_temporary());
+            }
+            if selected.is_none() {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::UnknownMember,
                     span: member,
                 });
                 return Some(self.recovery_temporary());
@@ -6932,6 +6998,33 @@ impl<'semantic> Analyzer<'semantic> {
             return None;
         };
         Some((*builtin, arguments.clone(), *capability))
+    }
+
+    fn queue_parts(&self, type_id: TypeId) -> Option<(Vec<TypeId>, AccessCapability, bool)> {
+        match self.types.types().get(type_id)? {
+            SemanticType::Builtin {
+                builtin: BuiltinType::Queue,
+                arguments,
+                capability,
+            } => Some((arguments.clone(), *capability, false)),
+            SemanticType::Gc { target, capability }
+            | SemanticType::Tracked { target, capability } => {
+                let SemanticType::Builtin {
+                    builtin: BuiltinType::Queue,
+                    arguments,
+                    ..
+                } = self.types.types().get(*target)?
+                else {
+                    return None;
+                };
+                Some((
+                    arguments.clone(),
+                    *capability,
+                    matches!(self.types.types().get(type_id), Some(SemanticType::Gc { .. })),
+                ))
+            }
+            _ => None,
+        }
     }
 
     fn is_inferred_error_constructor(&self, owner: &TypeSyntax, member: Span) -> bool {
@@ -8723,6 +8816,22 @@ impl<'semantic> Analyzer<'semantic> {
                 arguments,
             ));
         }
+        if let Some((type_arguments, object_capability, is_gc)) =
+            self.queue_parts(typed_object.type_id)
+        {
+            return Some(self.synthesize_queue_member_call(
+                call,
+                callee,
+                object,
+                typed_object,
+                *member,
+                &name,
+                &type_arguments,
+                object_capability,
+                is_gc,
+                arguments,
+            ));
+        }
         if let Some((elements, _, _)) = self.tuple_parts(typed_object.type_id) {
             if name.bytes().all(|byte| byte.is_ascii_digit()) {
                 return None;
@@ -8954,6 +9063,167 @@ impl<'semantic> Analyzer<'semantic> {
                 signature.return_type,
             ),
         )))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_queue_member_call(
+        &mut self,
+        call: &Expression,
+        callee: &Expression,
+        object: &Expression,
+        typed_object: TypedExpression,
+        member: Span,
+        name: &str,
+        type_arguments: &[TypeId],
+        object_capability: AccessCapability,
+        is_gc: bool,
+        arguments: &[Expression],
+    ) -> Option<TypedExpression> {
+        let selected = self
+            .signatures
+            .builtins()
+            .member(
+                BuiltinMemberOwner::Parameterized(BuiltinType::Queue),
+                name,
+            )
+            .cloned();
+        let Some(BuiltinMemberSignature::Callable(template)) = selected else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::UnknownMember,
+                span: member,
+            });
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(self.recovery_temporary());
+        };
+        let Some(receiver) = template.receiver else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::AssociatedFunctionRequiresType,
+                span: member,
+            });
+            for argument in arguments {
+                let _ = self.synthesize(argument);
+            }
+            return Some(self.recovery_temporary());
+        };
+        let signature = template
+            .instantiate(type_arguments, self.types.types_mut())
+            .expect("resolved Queue application supplies one element type");
+        let receiver_valid = self.check_method_receiver(
+            object,
+            typed_object,
+            receiver,
+            object_capability,
+            is_gc,
+        );
+        let [element_type] = type_arguments else {
+            unreachable!("resolved Queue applications have one element type")
+        };
+
+        let (kind, arguments_valid, element_transfer, receive_union) = match name {
+            "send" => {
+                let (valid, transfer) =
+                    self.analyze_queue_send_argument(call, arguments, *element_type)?;
+                (QueueOperationKind::Send, valid, transfer, None)
+            }
+            "try_receive" => {
+                let valid = self.analyze_call_arguments(call, arguments, &signature.parameters)?;
+                let members = self
+                    .union_members(signature.return_type)
+                    .expect("Queue.try_receive returns an element-or-none union");
+                let none = self
+                    .types
+                    .types_mut()
+                    .primitive(PrimitiveType::None, AccessCapability::Const);
+                let element_member = members
+                    .iter()
+                    .position(|member| *member == *element_type)
+                    .expect("Queue receive union contains its element type");
+                let none_member = members
+                    .iter()
+                    .position(|member| *member == none)
+                    .expect("Queue receive union contains none");
+                (
+                    QueueOperationKind::TryReceive,
+                    valid,
+                    None,
+                    Some(QueueReceiveUnion {
+                        type_id: signature.return_type,
+                        element_member,
+                        none_member,
+                    }),
+                )
+            }
+            _ => unreachable!("the Queue catalogue exposes only known methods"),
+        };
+        self.checking.resolved_queue_operations.insert(
+            callee.id,
+            ResolvedQueueOperation {
+                kind,
+                queue_type: typed_object.type_id,
+                element_type: *element_type,
+                receiver_transfer: receiver_valid.then_some(ValueTransfer::Borrow),
+                element_transfer,
+                receive_union,
+            },
+        );
+        if !receiver_valid || !arguments_valid || self.is_recovery(signature.return_type) {
+            return Some(self.recovery_temporary());
+        }
+        Some(self.call_result(call, signature.return_type, None))
+    }
+
+    /// Queue elements have already been restricted by type resolution to
+    /// trivial inline values or stable GC references. Sending therefore never
+    /// retains an ordinary by-reference object argument in external storage.
+    fn analyze_queue_send_argument(
+        &mut self,
+        call: &Expression,
+        arguments: &[Expression],
+        element_type: TypeId,
+    ) -> Option<(bool, Option<ValueTransfer>)> {
+        let arity_matches = arguments.len() == 1;
+        if !arity_matches {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                    expected: 1,
+                    found: arguments.len(),
+                },
+                span: call.span,
+            });
+        }
+        let mut valid = arity_matches;
+        let mut element_transfer = None;
+        if let Some(argument) = arguments.first() {
+            let checked = self.check_call_argument(argument, element_type)?;
+            if self.is_recovery(checked.type_id) {
+                valid = false;
+            } else {
+                let semantic = self
+                    .types
+                    .types()
+                    .get(checked.type_id)
+                    .expect("Queue element type belongs to the program type store");
+                let transfer = if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+                    ValueTransfer::CopyGcReference
+                } else if semantic.copy_semantics() == Some(CopySemantics::Trivial) {
+                    ValueTransfer::TrivialCopy
+                } else {
+                    unreachable!("Queue elements are validated during type resolution")
+                };
+                self.checking.transfers.insert(argument.id, transfer);
+                element_transfer = Some(transfer);
+            }
+        }
+        for surplus in arguments.get(1..).unwrap_or(&[]) {
+            let _ = self.synthesize(surplus);
+        }
+        self.checking.tracked_call_inputs.insert(call.id, Vec::new());
+        self.checking
+            .borrow_containing_call_inputs
+            .insert(call.id, Vec::new());
+        Some((valid, element_transfer))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10963,6 +11233,13 @@ mod tests {
             panic!("expected call expression")
         };
         (callee, arguments)
+    }
+
+    fn member_object(expression: &Expression) -> &Expression {
+        let ExpressionKind::MemberAccess { object, .. } = &expression.kind else {
+            panic!("expected member-access expression")
+        };
+        object
     }
 
     fn gc(expression: &Expression) -> &Expression {
@@ -16853,5 +17130,142 @@ fn main() {
         assert!(checking.tracked_lifetime_links.contains_key(&wrapped.id));
         assert!(checking.tracked_lifetime_links.contains_key(&reduced.id));
         assert!(checking.error_widenings.contains_key(&reduced.id));
+    }
+
+    #[test]
+    fn checks_queue_sends_receives_and_lowering_metadata() {
+        let source = concat!(
+            "struct Item { value: int, }\n",
+            "fn use_queues(\n",
+            "    const vmut ints: Queue(int),\n",
+            "    const vmut heaps: &mut Queue(&Item),\n",
+            "    const vmut borrowed: *mut Queue(int),\n",
+            "    heap: &mut Item,\n",
+            ") {\n",
+            "    ints.send(1);\n",
+            "    heaps.send(heap);\n",
+            "    borrowed.send(2);\n",
+            "    const empty = ints.try_receive();\n",
+            "    const nonempty = heaps.try_receive();\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let use_queues = function(&program.declarations[1]);
+        for (statement, transfer) in [
+            (0, ValueTransfer::TrivialCopy),
+            (1, ValueTransfer::CopyGcReference),
+            (2, ValueTransfer::TrivialCopy),
+        ] {
+            let invoked = expression(&use_queues.body.statements[statement]);
+            let (callee, arguments) = call(invoked);
+            assert_eq!(checking.transfers[&arguments[0].id], transfer);
+            assert_eq!(checking.transfers[&member_object(callee).id], ValueTransfer::Borrow);
+            assert!(matches!(
+                checking.resolved_queue_operations.get(&callee.id),
+                Some(ResolvedQueueOperation {
+                    kind: QueueOperationKind::Send,
+                    receiver_transfer: Some(ValueTransfer::Borrow),
+                    element_transfer: Some(found),
+                    receive_union: None,
+                    ..
+                }) if *found == transfer
+            ));
+        }
+
+        for statement in &use_queues.body.statements[3..=4] {
+            let received = binding_initializer(statement);
+            let (callee, _) = call(received);
+            let operation = &checking.resolved_queue_operations[&callee.id];
+            assert_eq!(operation.kind, QueueOperationKind::TryReceive);
+            let receive = operation
+                .receive_union
+                .expect("try_receive should retain its union layout");
+            assert_eq!(checking.expressions[&received.id].type_id, receive.type_id);
+            let members = checking
+                .expressions
+                .get(&received.id)
+                .and_then(|typed| match types.types().get(typed.type_id) {
+                    Some(SemanticType::Union { members, .. }) => Some(members),
+                    _ => None,
+                })
+                .expect("try_receive should produce a union");
+            assert_eq!(members[receive.element_member], operation.element_type);
+            assert!(matches!(
+                types.types().get(members[receive.none_member]),
+                Some(SemanticType::Primitive {
+                    primitive: PrimitiveType::None,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn diagnoses_queue_receiver_transfer_arity_and_member_misuse() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn bad(\n",
+            "    readonly: Queue(int),\n",
+            "    const vmut references: Queue(&Item),\n",
+            "    heap: &Item,\n",
+            ") {\n",
+            "    readonly.send(1);\n",
+            "    references.send(Item {});\n",
+            "    references.send(heap, heap);\n",
+            "    references.try_receive(heap);\n",
+            "    references.unknown();\n",
+            "    references.send;\n",
+            "    Queue(&Item)::send;\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 7, "{:#?}", checking.errors);
+        assert_eq!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ReceiverCapabilityMismatch
+        );
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 1,
+                found: 2,
+            }
+        ));
+        assert!(matches!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 0,
+                found: 1,
+            }
+        ));
+        assert!(matches!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::UnknownMember
+        ));
+        assert_eq!(
+            checking.errors[5].kind,
+            ExpressionCheckingErrorKind::MethodRequiresCall
+        );
+        assert_eq!(
+            checking.errors[6].kind,
+            ExpressionCheckingErrorKind::MethodRequiresValue
+        );
+
+        let bad = function(&program.declarations[1]);
+        let wrong_arity = expression(&bad.body.statements[2]);
+        let (_, arguments) = call(wrong_arity);
+        assert!(arguments
+            .iter()
+            .all(|argument| checking.expressions.contains_key(&argument.id)));
     }
 }
