@@ -230,7 +230,13 @@ layout, success ownership, propagated return conversion and transfer, and the
 conditional callable-exit edge. Error propagation supports the built-in Error
 payload widening, preserves tracked origins, validates borrow-containing return
 sources, and releases active narrowing locks only on the error path. Lexical
-cleanup on this edge remains part of the later `defer` integration.
+cleanup on this edge remains part of the later `defer` integration. Coroutine
+starts type-check their wrapped call with the ordinary callee, receiver,
+argument, and transfer rules, produce a unit statement, and discard every
+eventual result. Successful starts retain the resolved call target and the
+source-ordered prepared callable value or receiver and runtime arguments,
+including their transfers, physical places, and tracked origins, for later
+coroutine-frame construction and post-type escape analysis.
 
 Tuple checking includes contextual and inferred construction, ordered
 structural identity, numeric element places, transitive capability, owning

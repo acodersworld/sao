@@ -754,7 +754,7 @@ reviewable phases:
          was run.
        - Reviewed and completed. Stop for commit before implementing coroutine
          starts.
-     - Change 5, coroutine starts:
+     - Change 5, coroutine starts (complete):
        - Type-check the call wrapped by `co` using ordinary receiver and
          argument evaluation and transfer rules, but give the statement type
          `()` and discard the callable's eventual result regardless of its
@@ -767,7 +767,26 @@ reviewable phases:
        - Add focused tests for functions, methods, callable values, argument
          and receiver failures, discarded Error and non-Error results,
          tracked/borrowed inputs, recovery, and metadata.
-       - Stop for review and commit before implementing lexical defer.
+       - Implemented `co` checking through the ordinary call path, while the
+         coroutine-start statement itself always completes with `()` and the
+         callable's eventual result, including Error and divergence, is
+         recorded only as discarded result metadata.
+       - Successful starts record the resolved static, first-class, member,
+         compiler-known, queue, sequence, or runtime-specialization target.
+         Prepared callable values or receivers and runtime arguments retain
+         source evaluation order, selected transfers, value categories,
+         physical places, and tracked-origin links for coroutine-frame
+         construction and post-type escape analysis. Compile-time template
+         arguments are not recorded as runtime values.
+       - Added focused source coverage for named functions, methods,
+         first-class callable values, source-ordered arguments, discarded
+         Error and non-Error results, tracked and ordinary borrowed inputs,
+         receiver/argument/callee failures, unit statement typing, recovery,
+         and lowering-facing metadata.
+       - Compilation and test execution were not requested for this change, so
+         verification is pending. No formatting was run.
+       - Reviewed and completed. Stop for commit before implementing lexical
+         defer.
      - Change 6, lexical defer:
        - Type-check the call wrapped by `defer`, evaluating and saving its
          function value or receiver and arguments immediately while discarding

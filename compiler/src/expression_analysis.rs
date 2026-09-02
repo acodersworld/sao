@@ -510,6 +510,54 @@ struct ResolvedErrorPropagation {
     return_transfer: ValueTransfer,
 }
 
+/// The callable selected by a checked coroutine start. Static targets retain
+/// their semantic identity, while a first-class callable retains the evaluated
+/// callee node and concrete callable type which must be saved in the frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedCoroutineCallTarget {
+    Function { declaration: NodeId, symbol: SymbolId },
+    CallableValue { callee: NodeId, callable_type: TypeId },
+    Member(ResolvedMember),
+    Builtin(ResolvedBuiltinOperation),
+    Queue(ResolvedQueueOperation),
+    Sequence(ResolvedSequenceOperation),
+    RuntimeSpecialization(RuntimeCallableSpecializationId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoroutinePreparedRole {
+    Callable,
+    Receiver,
+    Argument { index: usize },
+}
+
+/// One runtime value evaluated and retained while preparing a coroutine. The
+/// ordered list containing these records is the source evaluation order.
+/// Physical places and tracked sources let post-type escape analysis decide
+/// whether a value may safely outlive the starting call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoroutinePreparedValue {
+    role: CoroutinePreparedRole,
+    expression: NodeId,
+    type_id: TypeId,
+    category: ValueCategory,
+    transfer: Option<ValueTransfer>,
+    place: Option<PhysicalPlace>,
+    tracked_sources: Vec<PhysicalPlace>,
+}
+
+/// Complete type-checking result for one `co call(...)` statement. The
+/// eventual result is retained only as type information and is always
+/// discarded; the statement itself has unit type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedCoroutineStart {
+    call: NodeId,
+    target: ResolvedCoroutineCallTarget,
+    prepared: Vec<CoroutinePreparedValue>,
+    discarded_result: TypeId,
+    statement_type: TypeId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
     Print,
@@ -843,6 +891,7 @@ struct ExpressionChecking {
     resolved_members: HashMap<NodeId, ResolvedMember>,
     resolved_builtin_operations: HashMap<NodeId, ResolvedBuiltinOperation>,
     resolved_error_propagations: HashMap<NodeId, ResolvedErrorPropagation>,
+    resolved_coroutine_starts: HashMap<NodeId, ResolvedCoroutineStart>,
     resolved_queue_operations: HashMap<NodeId, ResolvedQueueOperation>,
     resolved_sequence_operations: HashMap<NodeId, ResolvedSequenceOperation>,
     sequence_runtime_checks: HashMap<NodeId, Vec<SequenceRuntimeCheck>>,
@@ -1822,8 +1871,200 @@ impl<'semantic> Analyzer<'semantic> {
             }
             StatementKind::Break(value) => self.analyze_break(statement, value.as_ref()),
             StatementKind::Continue => self.analyze_continue(statement),
-            StatementKind::Defer(_) | StatementKind::Coroutine(_) => StatementFlow::Completes,
+            StatementKind::Coroutine(call) => self.analyze_coroutine_start(statement, call),
+            StatementKind::Defer(_) => StatementFlow::Completes,
         }
+    }
+
+    /// Checks a coroutine start through the ordinary call path, then records
+    /// the values which must be retained without treating the call's eventual
+    /// result (including divergence or Error) as the statement result.
+    fn analyze_coroutine_start(
+        &mut self,
+        statement: &Statement,
+        call: &Expression,
+    ) -> StatementFlow {
+        let result = self.synthesize(call);
+        let statement_typed = self.fresh_primitive(PrimitiveType::Unit);
+        self.checking.expressions.insert(statement.id, statement_typed);
+        self.checking.explicit_values.insert(statement.id, false);
+
+        let Some(result) = result else {
+            return StatementFlow::Completes;
+        };
+        if self.is_recovery(result.type_id) {
+            return StatementFlow::Completes;
+        }
+        let ExpressionKind::Call { callee, arguments } = &call.kind else {
+            unreachable!("the parser restricts `co` to call expressions")
+        };
+        let Some(target) = self.resolved_coroutine_call_target(call, callee) else {
+            return StatementFlow::Completes;
+        };
+
+        let mut prepared = Vec::new();
+        let receiver = self.coroutine_receiver(callee);
+        if let Some(receiver) = receiver {
+            if let Some(value) = self.coroutine_prepared_value(
+                CoroutinePreparedRole::Receiver,
+                receiver,
+                None,
+            ) {
+                prepared.push(value);
+            }
+        } else if matches!(&target, ResolvedCoroutineCallTarget::CallableValue { .. })
+            && let Some(value) = self.coroutine_prepared_value(
+                CoroutinePreparedRole::Callable,
+                callee,
+                self.checking
+                    .expressions
+                    .get(&callee.id)
+                    .copied()
+                    .and_then(|typed| self.argument_transfer(typed)),
+            )
+        {
+            prepared.push(value);
+        }
+        for (index, argument) in arguments.iter().enumerate() {
+            // Compile-time template arguments are present in the source call
+            // but deliberately have no checked runtime expression.
+            if let Some(value) = self.coroutine_prepared_value(
+                CoroutinePreparedRole::Argument { index },
+                argument,
+                None,
+            ) {
+                prepared.push(value);
+            }
+        }
+
+        self.checking.resolved_coroutine_starts.insert(
+            statement.id,
+            ResolvedCoroutineStart {
+                call: call.id,
+                target,
+                prepared,
+                discarded_result: result.type_id,
+                statement_type: statement_typed.type_id,
+            },
+        );
+        StatementFlow::Completes
+    }
+
+    fn resolved_coroutine_call_target(
+        &self,
+        call: &Expression,
+        callee: &Expression,
+    ) -> Option<ResolvedCoroutineCallTarget> {
+        if let Some(specialization) = self
+            .runtime_specialization_calls
+            .get(&call.id)
+            .copied()
+        {
+            return Some(ResolvedCoroutineCallTarget::RuntimeSpecialization(
+                specialization,
+            ));
+        }
+        if let Some(operation) = self
+            .checking
+            .resolved_queue_operations
+            .get(&callee.id)
+            .cloned()
+        {
+            return Some(ResolvedCoroutineCallTarget::Queue(operation));
+        }
+        if let Some(operation) = self
+            .checking
+            .resolved_sequence_operations
+            .get(&callee.id)
+            .copied()
+        {
+            return Some(ResolvedCoroutineCallTarget::Sequence(operation));
+        }
+        if let Some(member) = self.checking.resolved_members.get(&callee.id).copied()
+            && !matches!(
+                member,
+                ResolvedMember::Field { .. } | ResolvedMember::TupleElement { .. }
+            )
+        {
+            return Some(ResolvedCoroutineCallTarget::Member(member));
+        }
+        if let Some(operation) = self
+            .checking
+            .resolved_builtin_operations
+            .get(&callee.id)
+            .cloned()
+        {
+            return Some(ResolvedCoroutineCallTarget::Builtin(operation));
+        }
+        if matches!(&callee.kind, ExpressionKind::Identifier)
+            && let Some(symbol) = self.names.symbol_for_reference(callee.id)
+            && self
+                .names
+                .symbols()
+                .symbol(symbol)
+                .is_some_and(|symbol| symbol.kind == SymbolKind::Function)
+        {
+            let declaration = self
+                .names
+                .declarations()
+                .iter()
+                .find_map(|(declaration, declared_symbol)| {
+                    (*declared_symbol == symbol).then_some(*declaration)
+                })
+                .expect("function symbol must have a declaration identity");
+            return Some(ResolvedCoroutineCallTarget::Function {
+                declaration,
+                symbol,
+            });
+        }
+        let typed = self.checking.expressions.get(&callee.id)?;
+        Some(ResolvedCoroutineCallTarget::CallableValue {
+            callee: callee.id,
+            callable_type: typed.type_id,
+        })
+    }
+
+    fn coroutine_receiver<'expression>(
+        &self,
+        callee: &'expression Expression,
+    ) -> Option<&'expression Expression> {
+        let ExpressionKind::MemberAccess { object, .. } = &callee.kind else {
+            return None;
+        };
+        let has_receiver = matches!(
+            self.checking.resolved_members.get(&callee.id),
+            Some(
+                ResolvedMember::Method { .. }
+                    | ResolvedMember::InterfaceMethod { .. }
+                    | ResolvedMember::Copy { .. }
+            )
+        ) || self
+            .checking
+            .resolved_queue_operations
+            .contains_key(&callee.id)
+            || self
+                .checking
+                .resolved_sequence_operations
+                .contains_key(&callee.id);
+        has_receiver.then_some(object.as_ref())
+    }
+
+    fn coroutine_prepared_value(
+        &self,
+        role: CoroutinePreparedRole,
+        expression: &Expression,
+        transfer: Option<ValueTransfer>,
+    ) -> Option<CoroutinePreparedValue> {
+        let typed = self.checking.expressions.get(&expression.id).copied()?;
+        Some(CoroutinePreparedValue {
+            role,
+            expression: expression.id,
+            type_id: typed.type_id,
+            category: typed.category,
+            transfer: transfer.or_else(|| self.checking.transfers.get(&expression.id).copied()),
+            place: self.checking.physical_places.get(&expression.id).cloned(),
+            tracked_sources: self.tracked_lifetime_sources(expression),
+        })
     }
 
     fn analyze_break(
@@ -11678,6 +11919,13 @@ mod tests {
         (callee, arguments)
     }
 
+    fn coroutine_call(statement: &Statement) -> &Expression {
+        let StatementKind::Coroutine(call) = &statement.kind else {
+            panic!("expected coroutine statement")
+        };
+        call
+    }
+
     fn member_object(expression: &Expression) -> &Expression {
         let ExpressionKind::MemberAccess { object, .. } = &expression.kind else {
             panic!("expected member-access expression")
@@ -18046,5 +18294,197 @@ fn main() {
             checking.errors[4].kind,
             ExpressionCheckingErrorKind::PropagatedErrorNotAccepted { .. }
         ));
+    }
+
+    #[test]
+    fn checks_coroutine_starts_and_records_prepared_values_in_source_order() {
+        let source = concat!(
+            "struct Worker {\n",
+            "    fn run(self, left: int, right: int) -> string { \"done\" }\n",
+            "}\n",
+            "struct Item {}\n",
+            "fn fallible(value: int) -> int | Error(string) { value }\n",
+            "fn consume(value: *Item, item: Item) {}\n",
+            "fn schedule(\n",
+            "    callback: fn(int) -> int,\n",
+            "    worker: Worker,\n",
+            "    tracked: *Item,\n",
+            "    item: Item,\n",
+            ") {\n",
+            "    co callback(1);\n",
+            "    co worker.run(2, 3);\n",
+            "    co fallible(4);\n",
+            "    co panic(\"later\");\n",
+            "    co consume(tracked, item);\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let schedule = function(&program.declarations[4]);
+        let callback_statement = &schedule.body.statements[0];
+        let callback_call = coroutine_call(callback_statement);
+        let (callback_callee, callback_arguments) = call(callback_call);
+        let callback = &checking.resolved_coroutine_starts[&callback_statement.id];
+        assert_eq!(callback.call, callback_call.id);
+        assert!(matches!(
+            &callback.target,
+            ResolvedCoroutineCallTarget::CallableValue {
+                callee,
+                callable_type,
+            } if *callee == callback_callee.id
+                && *callable_type == checking.expressions[&callback_callee.id].type_id
+        ));
+        assert_eq!(callback.prepared.len(), 2);
+        assert_eq!(callback.prepared[0].role, CoroutinePreparedRole::Callable);
+        assert_eq!(callback.prepared[0].expression, callback_callee.id);
+        assert_eq!(
+            callback.prepared[1].role,
+            CoroutinePreparedRole::Argument { index: 0 }
+        );
+        assert_eq!(callback.prepared[1].expression, callback_arguments[0].id);
+        assert!(matches!(
+            types.types().get(callback.discarded_result),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::Int,
+                ..
+            })
+        ));
+
+        let method_statement = &schedule.body.statements[1];
+        let method_call = coroutine_call(method_statement);
+        let (method_callee, method_arguments) = call(method_call);
+        let method = &checking.resolved_coroutine_starts[&method_statement.id];
+        assert!(matches!(
+            &method.target,
+            ResolvedCoroutineCallTarget::Member(ResolvedMember::Method { .. })
+        ));
+        let receiver = member_object(method_callee);
+        assert_eq!(method.prepared.len(), 3);
+        assert_eq!(method.prepared[0].role, CoroutinePreparedRole::Receiver);
+        assert_eq!(method.prepared[0].expression, receiver.id);
+        assert_eq!(method.prepared[0].transfer, Some(ValueTransfer::Borrow));
+        for (index, argument) in method_arguments.iter().enumerate() {
+            assert_eq!(
+                method.prepared[index + 1].role,
+                CoroutinePreparedRole::Argument { index }
+            );
+            assert_eq!(method.prepared[index + 1].expression, argument.id);
+        }
+        assert!(matches!(
+            types.types().get(method.discarded_result),
+            Some(SemanticType::Primitive {
+                primitive: PrimitiveType::String,
+                ..
+            })
+        ));
+
+        let fallible_statement = &schedule.body.statements[2];
+        let fallible = &checking.resolved_coroutine_starts[&fallible_statement.id];
+        assert!(matches!(
+            &fallible.target,
+            ResolvedCoroutineCallTarget::Function { .. }
+        ));
+        assert!(matches!(
+            types.types().get(fallible.discarded_result),
+            Some(SemanticType::Union { members, .. })
+                if members.iter().any(|member| matches!(
+                    types.types().get(*member),
+                    Some(SemanticType::Builtin {
+                        builtin: BuiltinType::Error,
+                        ..
+                    })
+                ))
+        ));
+
+        let panic_statement = &schedule.body.statements[3];
+        let panic_start = &checking.resolved_coroutine_starts[&panic_statement.id];
+        assert!(matches!(
+            &panic_start.target,
+            ResolvedCoroutineCallTarget::Builtin(ResolvedBuiltinOperation::Panic)
+        ));
+        assert!(matches!(
+            types.types().get(panic_start.discarded_result),
+            Some(SemanticType::Divergence)
+        ));
+
+        let retained_statement = &schedule.body.statements[4];
+        let retained = &checking.resolved_coroutine_starts[&retained_statement.id];
+        assert_eq!(retained.prepared.len(), 2);
+        assert!(!retained.prepared[0].tracked_sources.is_empty());
+        assert!(retained.prepared[0].place.is_some());
+        assert_eq!(retained.prepared[0].transfer, Some(ValueTransfer::Borrow));
+        assert!(retained.prepared[1].place.is_some());
+        assert_eq!(retained.prepared[1].transfer, Some(ValueTransfer::Borrow));
+
+        for statement in &schedule.body.statements {
+            let metadata = &checking.resolved_coroutine_starts[&statement.id];
+            assert_eq!(
+                checking.expressions[&statement.id].type_id,
+                metadata.statement_type
+            );
+            assert!(matches!(
+                types.types().get(metadata.statement_type),
+                Some(SemanticType::Primitive {
+                    primitive: PrimitiveType::Unit,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn diagnoses_invalid_coroutine_calls_and_recovers_with_unit_statements() {
+        let source = concat!(
+            "struct Worker { fn run(mut self, value: int) -> int { value } }\n",
+            "fn bad(value: int, worker: Worker) {\n",
+            "    co value();\n",
+            "    co worker.run(\"wrong\");\n",
+            "    co worker.run();\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 5, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::NotCallable { .. }
+        ));
+        assert_eq!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::ReceiverCapabilityMismatch
+        );
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::TypeMismatch { .. }
+        ));
+        assert_eq!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::ReceiverCapabilityMismatch
+        );
+        assert_eq!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 1,
+                found: 0,
+            }
+        );
+
+        let bad = function(&program.declarations[1]);
+        assert!(checking.resolved_coroutine_starts.is_empty());
+        for statement in &bad.body.statements {
+            assert!(matches!(
+                types.types().get(checking.expressions[&statement.id].type_id),
+                Some(SemanticType::Primitive {
+                    primitive: PrimitiveType::Unit,
+                    ..
+                })
+            ));
+        }
+        let wrong_argument = call(coroutine_call(&bad.body.statements[1])).1[0].id;
+        assert!(checking.expressions.contains_key(&wrong_argument));
     }
 }
