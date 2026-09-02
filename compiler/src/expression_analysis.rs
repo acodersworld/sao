@@ -280,6 +280,7 @@ enum NarrowingEdgeKind {
     Join,
     Invalidate,
     Return,
+    ErrorPropagation,
     Break,
     Continue,
     CallableCompletion,
@@ -488,6 +489,25 @@ enum ResolvedBuiltinOperation {
     },
     Panic,
     Yield,
+}
+
+/// One checked postfix `?`. The operand node is retained explicitly so typed
+/// IR evaluates it once and branches on that stored union rather than
+/// reconstructing either source expression or type lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedErrorPropagation {
+    operand: NodeId,
+    operand_type: TypeId,
+    success_type: TypeId,
+    success_category: ValueCategory,
+    success_members: Vec<(TypeId, usize)>,
+    propagated_error: TypeId,
+    return_error: TypeId,
+    error_member: usize,
+    callable_result: TypeId,
+    return_assignment: ContextualAssignment,
+    success_transfer: ValueTransfer,
+    return_transfer: ValueTransfer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,6 +732,22 @@ enum ExpressionCheckingErrorKind {
         category: ValueCategory,
     },
     CannotInferErrorPayload,
+    InvalidTryOperand {
+        found: TypeId,
+    },
+    TryMissingErrorMember {
+        operand: TypeId,
+    },
+    TryAmbiguousErrorMembers {
+        operand: TypeId,
+    },
+    TryRequiresSuccessMember {
+        operand: TypeId,
+    },
+    PropagatedErrorNotAccepted {
+        error: TypeId,
+        callable_result: TypeId,
+    },
     NamespaceRequiresMember,
     UnknownMember,
     InvalidMemberOwner {
@@ -806,6 +842,7 @@ struct ExpressionChecking {
     /// can consume these without repeating lookup from source names.
     resolved_members: HashMap<NodeId, ResolvedMember>,
     resolved_builtin_operations: HashMap<NodeId, ResolvedBuiltinOperation>,
+    resolved_error_propagations: HashMap<NodeId, ResolvedErrorPropagation>,
     resolved_queue_operations: HashMap<NodeId, ResolvedQueueOperation>,
     resolved_sequence_operations: HashMap<NodeId, ResolvedSequenceOperation>,
     sequence_runtime_checks: HashMap<NodeId, Vec<SequenceRuntimeCheck>>,
@@ -1249,6 +1286,9 @@ struct Analyzer<'semantic> {
     /// beginning of its enclosing block. Unreachable syntax is still checked,
     /// but its loop transfers cannot contribute runtime exits.
     current_path_reachable: bool,
+    /// Declared result of the callable whose body is currently being checked.
+    /// Nested named functions and lambdas save and restore this context.
+    current_callable_result: Option<TypeId>,
     /// Roots permitted to contribute to an escaping tracked result from the
     /// callable currently being checked.
     current_tracked_return_roots: HashSet<PhysicalPlaceRoot>,
@@ -1424,6 +1464,7 @@ impl<'semantic> Analyzer<'semantic> {
             current_tracked_bindings: HashMap::new(),
             current_narrowings: HashMap::new(),
             current_path_reachable: true,
+            current_callable_result: None,
             current_tracked_return_roots: HashSet::new(),
             current_borrow_containing_return_roots: HashSet::new(),
             current_specialized_owner: None,
@@ -1684,6 +1725,7 @@ impl<'semantic> Analyzer<'semantic> {
     /// reachable final expression supplies the callable result, while reachable
     /// completion without one supplies unit.
     fn visit_callable_body(&mut self, block: &crate::ast::Block, expected: TypeId) {
+        let enclosing_callable_result = self.current_callable_result.replace(expected);
         // A return or diverging statement prevents execution from reaching the
         // body's final value or implicit unit result.
         let can_reach_body_end = self.visit_block_statements(block);
@@ -1727,6 +1769,7 @@ impl<'semantic> Analyzer<'semantic> {
             (None, true) => self.check_absent_value(block.id, expected, block.span),
             (None, false) => {}
         }
+        self.current_callable_result = enclosing_callable_result;
     }
 
     fn visit_statement(&mut self, statement: &Statement) -> StatementFlow {
@@ -2202,12 +2245,34 @@ impl<'semantic> Analyzer<'semantic> {
             return;
         }
 
+        if let Some(transfer) = self.return_transfer(source) {
+            self.checking.transfers.insert(value.id, transfer);
+            return;
+        }
+
+        self.checking.errors.push(ExpressionCheckingError {
+            kind: ExpressionCheckingErrorKind::InvalidReturnSource {
+                found: source.type_id,
+                category: source.category,
+            },
+            span: value.span,
+        });
+        self.checking.expressions.insert(
+            value.id,
+            TypedExpression {
+                type_id: self.types.types().recovery(),
+                category: source.category,
+            },
+        );
+    }
+
+    fn return_transfer(&self, source: TypedExpression) -> Option<ValueTransfer> {
         let semantic = self
             .types
             .types()
             .get(source.type_id)
             .expect("return type belongs to the program type store");
-        let transfer = if semantic.storage_semantics() == Some(StorageSemantics::TrackedReference) {
+        if semantic.storage_semantics() == Some(StorageSemantics::TrackedReference) {
             Some(ValueTransfer::Borrow)
         } else if source.category == ValueCategory::BorrowedPlace
             && self.contains_non_escaping_erased_view(source.type_id)
@@ -2237,26 +2302,7 @@ impl<'semantic> Analyzer<'semantic> {
                     unreachable!("GC return storage was handled above")
                 }
             }
-        };
-        if let Some(transfer) = transfer {
-            self.checking.transfers.insert(value.id, transfer);
-            return;
         }
-
-        self.checking.errors.push(ExpressionCheckingError {
-            kind: ExpressionCheckingErrorKind::InvalidReturnSource {
-                found: source.type_id,
-                category: source.category,
-            },
-            span: value.span,
-        });
-        self.checking.expressions.insert(
-            value.id,
-            TypedExpression {
-                type_id: self.types.types().recovery(),
-                category: source.category,
-            },
-        );
     }
 
     /// Checks an implicit unit result, such as a bare return or a callable body
@@ -3820,6 +3866,9 @@ impl<'semantic> Analyzer<'semantic> {
                 start.as_deref(),
                 end.as_deref(),
             )?,
+            ExpressionKind::Try { expression: operand } => {
+                self.synthesize_error_propagation(expression, operand)?
+            }
             ExpressionKind::TypeAscription { value, type_syntax } => {
                 self.synthesize_type_ascription(expression, value, type_syntax)?
             }
@@ -4702,20 +4751,6 @@ impl<'semantic> Analyzer<'semantic> {
             });
         }
 
-        if self
-            .types
-            .types()
-            .get(found.type_id)
-            .is_some_and(|semantic| {
-                semantic.storage_semantics() == Some(StorageSemantics::TrackedReference)
-            })
-        {
-            return Err(ExpressionCheckingErrorKind::TypeMismatch {
-                expected,
-                found: found.type_id,
-            });
-        }
-
         if let Some(destination_members) = self.union_members(expected) {
             if !self.value_capability_is_compatible(found, expected, allow_recursive_copy) {
                 return Err(ExpressionCheckingErrorKind::TypeMismatch {
@@ -4729,6 +4764,26 @@ impl<'semantic> Analyzer<'semantic> {
                 destination_members,
                 allow_recursive_copy,
             );
+        }
+
+        // An existing tracked reference cannot be converted to its plain
+        // target or to an interface view. It may still be injected unchanged
+        // into a destination union containing that exact tracked type. Union
+        // classification above probes its members through
+        // `classify_non_union_assignment`, whose exact-type path preserves
+        // this restriction while admitting the matching member.
+        if self
+            .types
+            .types()
+            .get(found.type_id)
+            .is_some_and(|semantic| {
+                semantic.storage_semantics() == Some(StorageSemantics::TrackedReference)
+            })
+        {
+            return Err(ExpressionCheckingErrorKind::TypeMismatch {
+                expected,
+                found: found.type_id,
+            });
         }
 
         if let Some(source_members) = self.union_members(found.type_id) {
@@ -8246,6 +8301,225 @@ impl<'semantic> Analyzer<'semantic> {
             return None;
         };
         Some(*payload)
+    }
+
+    /// Checks postfix error propagation as a projection plus a conditional
+    /// callable return. The operand is synthesized exactly once; both branch
+    /// descriptions retain its node and canonical member positions.
+    fn synthesize_error_propagation(
+        &mut self,
+        expression: &Expression,
+        operand: &Expression,
+    ) -> Option<TypedExpression> {
+        let found = self.synthesize(operand)?;
+        if self.is_recovery(found.type_id) || self.is_divergence(found.type_id) {
+            return Some(found);
+        }
+        let Some(members) = self.union_members(found.type_id) else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: if self.error_payload_type(found.type_id).is_some() {
+                    ExpressionCheckingErrorKind::TryRequiresSuccessMember {
+                        operand: found.type_id,
+                    }
+                } else {
+                    ExpressionCheckingErrorKind::InvalidTryOperand {
+                        found: found.type_id,
+                    }
+                },
+                span: operand.span,
+            });
+            return Some(self.recovery_temporary());
+        };
+        let error_members: Vec<_> = members
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, member)| self.error_payload_type(*member).is_some())
+            .collect();
+        let (error_member, propagated_error) = match error_members.as_slice() {
+            [] => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::TryMissingErrorMember {
+                        operand: found.type_id,
+                    },
+                    span: operand.span,
+                });
+                return Some(self.recovery_temporary());
+            }
+            [selected] => *selected,
+            _ => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::TryAmbiguousErrorMembers {
+                        operand: found.type_id,
+                    },
+                    span: operand.span,
+                });
+                return Some(self.recovery_temporary());
+            }
+        };
+        let success_members: Vec<_> = members
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, _)| *index != error_member)
+            .map(|(index, member)| (member, index))
+            .collect();
+        if success_members.is_empty() {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::TryRequiresSuccessMember {
+                    operand: found.type_id,
+                },
+                span: operand.span,
+            });
+            return Some(self.recovery_temporary());
+        }
+        let capability = self
+            .types
+            .types()
+            .get(found.type_id)
+            .and_then(SemanticType::capability)
+            .expect("a normalized try union has an outer capability");
+        let success_type = self.types.types_mut().union(
+            success_members.iter().map(|(member, _)| *member).collect(),
+            capability,
+        );
+        let success_category = if success_members.len() == 1
+            && self
+                .types
+                .types()
+                .get(success_type)
+                .is_some_and(|semantic| {
+                    semantic.storage_semantics() == Some(StorageSemantics::TrackedReference)
+                })
+        {
+            ValueCategory::BorrowedPlace
+        } else if success_members.len() == 1 {
+            self.union_member_category(found.category, success_members[0].0)
+        } else {
+            found.category
+        };
+        let success = TypedExpression {
+            type_id: success_type,
+            category: success_category,
+        };
+        let propagated = TypedExpression {
+            type_id: propagated_error,
+            category: self.union_member_category(found.category, propagated_error),
+        };
+        let callable_result = self
+            .current_callable_result
+            .expect("postfix error propagation is checked inside a callable body");
+        let return_assignment = match self.classify_contextual_assignment(
+            propagated,
+            callable_result,
+            true,
+        ) {
+            Ok(assignment) => assignment,
+            Err(_) => {
+                self.checking.errors.push(ExpressionCheckingError {
+                    kind: ExpressionCheckingErrorKind::PropagatedErrorNotAccepted {
+                        error: propagated_error,
+                        callable_result,
+                    },
+                    span: expression.span,
+                });
+                return Some(self.recovery_temporary());
+            }
+        };
+        let return_error = match &return_assignment {
+            ContextualAssignment::UnionInjection { member_type, .. } => *member_type,
+            ContextualAssignment::ErrorWidening(widening) => widening.destination_error,
+            ContextualAssignment::Exact => propagated_error,
+            ContextualAssignment::TrackedBorrow { .. }
+            | ContextualAssignment::InterfaceView(_)
+            | ContextualAssignment::UnionWidening(_) => callable_result,
+        };
+        if self.type_contains_tracked_reference(return_error)
+            && !self.validate_tracked_return_source(operand)
+        {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidTrackedReturnSource,
+                span: expression.span,
+            });
+            return Some(self.recovery_temporary());
+        }
+        let Some(success_transfer) = self.projection_transfer(success) else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidOwningSource {
+                    found: success.type_id,
+                    category: success.category,
+                },
+                span: expression.span,
+            });
+            return Some(self.recovery_temporary());
+        };
+        let Some(return_transfer) = self.return_transfer(propagated) else {
+            self.checking.errors.push(ExpressionCheckingError {
+                kind: ExpressionCheckingErrorKind::InvalidReturnSource {
+                    found: propagated.type_id,
+                    category: propagated.category,
+                },
+                span: expression.span,
+            });
+            return Some(self.recovery_temporary());
+        };
+
+        let tracked_sources = self.tracked_lifetime_sources(operand);
+        if self.type_contains_tracked_reference(success_type) {
+            self.record_tracked_lifetime_link(expression.id, tracked_sources);
+        }
+        if let Some(place) = self.checking.physical_places.get(&operand.id).cloned() {
+            self.checking.physical_places.insert(expression.id, place);
+        }
+        let current_narrowings = self.current_narrowings.clone();
+        self.record_narrowing_transition(
+            expression.id,
+            NarrowingEdgeKind::ErrorPropagation,
+            &current_narrowings,
+            &HashMap::new(),
+        );
+        self.checking.resolved_error_propagations.insert(
+            expression.id,
+            ResolvedErrorPropagation {
+                operand: operand.id,
+                operand_type: found.type_id,
+                success_type,
+                success_category,
+                success_members,
+                propagated_error,
+                return_error,
+                error_member,
+                callable_result,
+                return_assignment,
+                success_transfer,
+                return_transfer,
+            },
+        );
+        Some(success)
+    }
+
+    fn projection_transfer(&self, projected: TypedExpression) -> Option<ValueTransfer> {
+        let semantic = self.types.types().get(projected.type_id)?;
+        if semantic.storage_semantics() == Some(StorageSemantics::TrackedReference) {
+            return Some(ValueTransfer::Borrow);
+        }
+        if semantic.storage_semantics() == Some(StorageSemantics::Gc) {
+            return Some(ValueTransfer::CopyGcReference);
+        }
+        match semantic.copy_semantics()? {
+            CopySemantics::Trivial => Some(ValueTransfer::TrivialCopy),
+            CopySemantics::Recursive => Some(
+                if projected.category == ValueCategory::FreshTemporary {
+                    ValueTransfer::MoveTemporary
+                } else {
+                    ValueTransfer::Borrow
+                },
+            ),
+            CopySemantics::NonEscapingErasedView | CopySemantics::TrackedPayload => {
+                Some(ValueTransfer::Borrow)
+            }
+            CopySemantics::GcPayload => None,
+        }
     }
 
     fn synthesize_inferred_error_call(
@@ -17619,5 +17893,158 @@ fn main() {
             checking.resolved_builtin_operations[&panic_callee.id],
             ResolvedBuiltinOperation::Panic
         );
+    }
+
+    #[test]
+    fn checks_postfix_error_propagation_metadata_and_widening() {
+        let source = concat!(
+            "fn varied(which: bool) -> int | string | Error(string) {\n",
+            "    if which { 1 } else if false { \"ok\" } else { Error::new(\"failed\") }\n",
+            "}\n",
+            "fn caller() -> int | string | Error(string) { varied(true)? }\n",
+            "fn narrow() -> int | Error(string) { 1 }\n",
+            "fn widened() -> int | Error(int | string) { narrow()? }\n",
+            "struct Item {}\n",
+            "fn make() -> Item | Error(string) { Item {} }\n",
+            "fn moved() -> Item | Error(string) { make()? }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let caller_try = function(&program.declarations[1])
+            .body
+            .value
+            .as_deref()
+            .expect("caller has a final propagation expression");
+        let ExpressionKind::Try { expression: caller_operand } = &caller_try.kind else {
+            panic!("expected caller try expression")
+        };
+        let caller_metadata = &checking.resolved_error_propagations[&caller_try.id];
+        assert_eq!(caller_metadata.operand, caller_operand.id);
+        assert_eq!(caller_metadata.success_members.len(), 2);
+        assert!(matches!(
+            types.types().get(caller_metadata.success_type),
+            Some(SemanticType::Union { members, .. }) if members.len() == 2
+        ));
+        assert_eq!(caller_metadata.success_transfer, ValueTransfer::MoveTemporary);
+        assert_eq!(caller_metadata.return_transfer, ValueTransfer::MoveTemporary);
+
+        let widened_try = function(&program.declarations[3])
+            .body
+            .value
+            .as_deref()
+            .expect("widened has a final propagation expression");
+        let widened_metadata = &checking.resolved_error_propagations[&widened_try.id];
+        assert!(matches!(
+            &widened_metadata.return_assignment,
+            ContextualAssignment::UnionInjection {
+                error_widening: Some(_),
+                ..
+            }
+        ));
+
+        let moved_try = function(&program.declarations[6])
+            .body
+            .value
+            .as_deref()
+            .expect("moved has a final propagation expression");
+        assert_eq!(
+            checking.resolved_error_propagations[&moved_try.id].success_transfer,
+            ValueTransfer::MoveTemporary
+        );
+        assert_eq!(checking.expressions[&moved_try.id].category, ValueCategory::FreshTemporary);
+    }
+
+    #[test]
+    fn propagates_tracked_origins_and_releases_narrowing_locks_on_error() {
+        let source = concat!(
+            "struct Item {}\n",
+            "fn borrow(value: *Item) -> *Item | Error(string) { value }\n",
+            "fn pass(value: *Item) -> *Item | Error(string) { borrow(value)? }\n",
+            "fn status() -> () | Error(string) { () }\n",
+            "fn checked(tag: int | string) -> () | Error(string) {\n",
+            "    if tag is int { status()?; }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let pass_try = function(&program.declarations[2])
+            .body
+            .value
+            .as_deref()
+            .expect("pass has a final propagation expression");
+        assert!(checking.tracked_lifetime_links.contains_key(&pass_try.id));
+        assert_eq!(
+            checking.resolved_error_propagations[&pass_try.id].success_transfer,
+            ValueTransfer::Borrow
+        );
+        assert_eq!(
+            checking.resolved_error_propagations[&pass_try.id].success_category,
+            ValueCategory::BorrowedPlace
+        );
+        assert!(!checking.tracked_lifetime_links[&pass_try.id].sources.is_empty());
+
+        let checked = function(&program.declarations[4]);
+        let conditional = checked
+            .body
+            .value
+            .as_deref()
+            .expect("checked has a final statement-like conditional");
+        let ExpressionKind::If { then_branch, .. } = &conditional.kind else {
+            panic!("expected narrowing conditional")
+        };
+        let propagation = expression(&then_branch.statements[0]);
+        assert!(checking.narrowing_edges.iter().any(|edge| {
+            edge.source == propagation.id
+                && edge.kind == NarrowingEdgeKind::ErrorPropagation
+                && edge
+                    .operations
+                    .iter()
+                    .any(|operation| operation.kind == NarrowingLockKind::Release)
+        }));
+        assert_narrowing_locks_balance(&checking);
+    }
+
+    #[test]
+    fn diagnoses_invalid_postfix_error_propagation_without_parent_cascades() {
+        let source = concat!(
+            "fn no_error() -> int | string { 1 }\n",
+            "fn ambiguous() -> int | Error(string) | Error(int) { 1 }\n",
+            "fn fallible() -> int | Error(string) { 1 }\n",
+            "fn invalid_operand() -> int | Error(string) { const bad: bool = 1?; 1 }\n",
+            "fn missing_error() -> int | Error(string) { no_error()?; 1 }\n",
+            "fn ambiguous_error() -> int | Error(string) | Error(int) { ambiguous()?; 1 }\n",
+            "fn no_success() -> Error(string) { Error::new(\"failed\")? }\n",
+            "fn incompatible() -> int { fallible()? }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 5, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::InvalidTryOperand { .. }
+        ));
+        assert!(matches!(
+            checking.errors[1].kind,
+            ExpressionCheckingErrorKind::TryMissingErrorMember { .. }
+        ));
+        assert!(matches!(
+            checking.errors[2].kind,
+            ExpressionCheckingErrorKind::TryAmbiguousErrorMembers { .. }
+        ));
+        assert!(matches!(
+            checking.errors[3].kind,
+            ExpressionCheckingErrorKind::TryRequiresSuccessMember { .. }
+        ));
+        assert!(matches!(
+            checking.errors[4].kind,
+            ExpressionCheckingErrorKind::PropagatedErrorNotAccepted { .. }
+        ));
     }
 }

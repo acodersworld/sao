@@ -717,7 +717,7 @@ reviewable phases:
          verification is pending. No formatting was run.
        - Reviewed and completed. Stop for commit before implementing error
          propagation.
-     - Change 4, postfix error propagation (next):
+     - Change 4, postfix error propagation (complete):
        - Check `operand?` only for a normalized `S | Error(E)` operand. Evaluate
          the operand once, produce the complete non-error remainder `S`, and
          model the error alternative as an early return from the current
@@ -732,7 +732,28 @@ reviewable phases:
          transfer, single-evaluation, and control-flow-edge metadata. Integrate
          the propagation edge with narrowing-lock release and flow-sensitive
          borrow validity; lexical defer cleanup is attached in Change 6.
-       - Stop for review and commit before implementing coroutine starts.
+       - Implemented postfix `?` checking for one normalized Error member and
+         the complete non-error remainder. The checker evaluates and records
+         one operand, preserves canonical union member positions, projects the
+         success type and ownership category, classifies the propagated Error
+         against the enclosing callable result (including Error payload
+         widening), and records both success and return transfers.
+       - Propagation retains tracked-origin links on the success path, validates
+         borrow-containing error returns against the callable's permitted
+         roots, and records a conditional early-return edge which releases all
+         active narrowing locks without changing the continuing success path.
+         Contextual assignment now permits an existing tracked reference to be
+         injected unchanged into a union containing that exact tracked member;
+         the prohibition on converting `*T` to plain `T` or an interface view
+         remains in force.
+         Focused source tests cover multi-member success, widening, fresh
+         temporary moves, tracked origins, lock cleanup, invalid/missing/
+         ambiguous Error shapes, an empty success remainder, incompatible
+         callable results, and recovery without parent cascades.
+       - Review-time compilation and test feedback was addressed. No formatting
+         was run.
+       - Reviewed and completed. Stop for commit before implementing coroutine
+         starts.
      - Change 5, coroutine starts:
        - Type-check the call wrapped by `co` using ordinary receiver and
          argument evaluation and transfer rules, but give the statement type

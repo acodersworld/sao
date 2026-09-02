@@ -145,8 +145,12 @@ fn worker(value: int) {
     yield();
 }
 
-fn checked(value: int) -> Error(int) {
-    Error::new(value)
+fn checked(value: int) -> int | Error(int) {
+    if value < 0 { Error::new(value) } else { value }
+}
+
+fn propagate_checked(value: int) -> int | Error(int) {
+    checked(value)?
 }
 
 fn apply(value: int, operation: fn(int) -> int) -> int {
@@ -234,8 +238,7 @@ fn main() {
     const queue: Queue(int) = Queue(int)::new();
     const vector: Vector(int) = Vector(int)::new();
     const table: Map(string, int) = Map(string, int)::new();
-    const failure: Error(int) = checked(initial);
-    const recovered = failure?;
+    const recovered = initial;
 
     const integer = 1.5: int;
     const decimal = integer: float;
@@ -293,6 +296,7 @@ fn main() {
     first_character;
     character;
     announce(character_code);
+    propagate_checked(initial);
     println(formatted);
     println(inline_inspection);
     println(named_inspection);
@@ -307,7 +311,6 @@ fn main() {
     if tuple_choice is Metric {
         announce(tuple_choice.0);
     };
-    tuple_vector.length();
     announce(heap_tuple.0);
     heap_formatter.format(text);
     heap_scale(initial);
@@ -322,8 +325,6 @@ fn main() {
     formatter_only.format("reduced: ");
     formatter_view.format("union: ");
     wider_numeric;
-    queue.length();
-    table.length();
 
     if comparison && numeric is int {
         announce(numeric);

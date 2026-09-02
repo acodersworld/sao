@@ -224,6 +224,13 @@ output, panic, and yield calls use the shared argument and transfer rules while
 recording explicit compiler-known operation identities. ASCII decode retains
 its canonical string-or-Error result layout, output distinguishes newline mode,
 panic preserves divergence flow, and yield is identified as a scheduling point.
+Postfix `?` accepts exactly one Error alternative in a normalized union,
+projects the complete non-error remainder, and records single-evaluation union
+layout, success ownership, propagated return conversion and transfer, and the
+conditional callable-exit edge. Error propagation supports the built-in Error
+payload widening, preserves tracked origins, validates borrow-containing return
+sources, and releases active narrowing locks only on the error path. Lexical
+cleanup on this edge remains part of the later `defer` integration.
 
 Tuple checking includes contextual and inferred construction, ordered
 structural identity, numeric element places, transitive capability, owning
