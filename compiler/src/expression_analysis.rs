@@ -1590,7 +1590,31 @@ impl<'semantic> Analyzer<'semantic> {
         self.validate_borrow_storage_fields();
         self.checking.runtime_specialization_calls = self.runtime_specialization_calls;
         self.checking.runtime_specializations = self.runtime_specializations;
+        Self::sort_checking_diagnostics(&mut self.checking);
         self.checking
+    }
+
+    /// Finishes one checking result in deterministic source order. Generated
+    /// methods and runtime specializations are analyzed on demand in isolated
+    /// result sets, so their diagnostics can otherwise be appended after later
+    /// source declarations merely because their concrete types were reached
+    /// later. Stable sorting preserves emission order for diagnostics attached
+    /// to the same source range while making every result independently ready
+    /// for reporting.
+    fn sort_checking_diagnostics(checking: &mut ExpressionChecking) {
+        checking.errors.sort_by_key(|error| {
+            (
+                error.span.module_id.as_u32(),
+                error.span.start,
+                error.span.end,
+            )
+        });
+        for method in checking.generated_methods.values_mut() {
+            Self::sort_checking_diagnostics(&mut method.checking);
+        }
+        for specialization in &mut checking.runtime_specializations {
+            Self::sort_checking_diagnostics(&mut specialization.checking);
+        }
     }
 
     fn visit_declaration(&mut self, declaration: &Declaration) {
@@ -1659,7 +1683,8 @@ impl<'semantic> Analyzer<'semantic> {
                 let parent_specialization_calls =
                     std::mem::take(&mut self.runtime_specialization_calls);
                 self.visit_function(&function);
-                let local_checking = std::mem::take(&mut self.checking);
+                let mut local_checking = std::mem::take(&mut self.checking);
+                Self::sort_checking_diagnostics(&mut local_checking);
                 let method_specialization_calls =
                     std::mem::take(&mut self.runtime_specialization_calls);
                 self.checking = parent_checking;
@@ -9480,15 +9505,16 @@ impl<'semantic> Analyzer<'semantic> {
             .zip(type_arguments.iter().copied())
             .map(|(parameter, concrete)| (parameter.id, concrete))
             .collect();
-        let generated_signatures: Vec<_> = self
+        let mut generated_signatures: Vec<_> = self
             .signatures
             .generated_structs()
             .values()
             .filter(|signature| self.type_contains_template_parameter(signature.type_id))
             .cloned()
             .collect();
+        generated_signatures.sort_by_key(|signature| signature.type_id.as_usize());
         for source in generated_signatures {
-            let callable_declarations: Vec<_> = source
+            let mut callable_declarations: Vec<_> = source
                 .members()
                 .values()
                 .filter_map(|member| match member.kind {
@@ -9500,6 +9526,8 @@ impl<'semantic> Analyzer<'semantic> {
                     | StructMemberSignatureKind::AssociatedTypeFactory { .. } => None,
                 })
                 .collect();
+            callable_declarations
+                .sort_by_key(|declaration| (declaration.module_id.as_u32(), declaration.node_id));
             let specialized = source.substitute_template_parameters(
                 &substitutions,
                 self.types.types_mut(),
@@ -9581,6 +9609,7 @@ impl<'semantic> Analyzer<'semantic> {
         let parent_calls = std::mem::take(&mut self.runtime_specialization_calls);
         self.visit_function(function);
         let mut local_checking = std::mem::take(&mut self.checking);
+        Self::sort_checking_diagnostics(&mut local_checking);
         let local_calls = std::mem::take(&mut self.runtime_specialization_calls);
         self.checking = parent_checking;
         for error in &local_checking.errors {
@@ -19115,5 +19144,193 @@ fn main() {
         let specialization = &checking.runtime_specializations[0];
         assert_eq!(specialization.checking.resolved_deferred_calls.len(), 1);
         assert_eq!(specialization.checking.deferred_cleanup_edges.len(), 1);
+    }
+
+    #[test]
+    fn integrates_phase_7_7_operations_across_all_callable_kinds() {
+        let source = concat!(
+            "fn Box(comptime T: type) -> type {\n",
+            "    struct {\n",
+            "        inner: T,\n",
+            "        fn process(self) -> T {\n",
+            "            const vmut local = Queue(int)::new();\n",
+            "            defer yield();\n",
+            "            local.send(1);\n",
+            "            self.inner\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+            "fn generic(comptime T: type, value: T) -> T {\n",
+            "    defer yield();\n",
+            "    co println(\"later\");\n",
+            "    value\n",
+            "}\n",
+            "fn decode(data: bytes, fail: bool) -> string | Error(string | int) {\n",
+            "    defer println(\"decoded\");\n",
+            "    if fail { Error(int)::new(1) } else { ascii.decode(data)? }\n",
+            "}\n",
+            "fn worker(const vmut queue: &mut Queue(int), value: int) {\n",
+            "    defer yield();\n",
+            "    queue.send(value);\n",
+            "    yield();\n",
+            "}\n",
+            "fn main() {\n",
+            "    const vmut queue: &mut Queue(int) = &Queue(int)::new();\n",
+            "    defer println(\"main\");\n",
+            "    {\n",
+            "        defer print(\"nested\");\n",
+            "        const encoded = ascii.encode(\"A\");\n",
+            "        const decoded = decode(encoded, false);\n",
+            "        decoded;\n",
+            "    };\n",
+            "    co worker(queue, 7);\n",
+            "    const received = queue.try_receive();\n",
+            "    if received is int { print(\"received\"); };\n",
+            "    Box(int) { inner: 1 }.process();\n",
+            "    generic(int, 1);\n",
+            "    co panic(\"later\");\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        assert!(checking.resolved_builtin_operations.values().any(|operation| {
+            matches!(operation, ResolvedBuiltinOperation::AsciiEncode)
+        }));
+        assert!(checking.resolved_builtin_operations.values().any(|operation| {
+            matches!(operation, ResolvedBuiltinOperation::AsciiDecode { .. })
+        }));
+        assert!(checking.resolved_builtin_operations.values().any(|operation| {
+            matches!(operation, ResolvedBuiltinOperation::Output { .. })
+        }));
+        assert!(checking.resolved_builtin_operations.values().any(|operation| {
+            matches!(operation, ResolvedBuiltinOperation::Panic)
+        }));
+        assert!(checking.resolved_builtin_operations.values().any(|operation| {
+            matches!(operation, ResolvedBuiltinOperation::Yield)
+        }));
+        for builtin in [BuiltinType::Queue, BuiltinType::Error] {
+            assert!(checking.resolved_builtin_operations.values().any(|operation| {
+                matches!(
+                    operation,
+                    ResolvedBuiltinOperation::Constructor {
+                        builtin: found,
+                        ..
+                    } if *found == builtin
+                )
+            }));
+        }
+        assert!(checking.error_widenings.len() >= 1);
+        assert_eq!(checking.resolved_error_propagations.len(), 1);
+        assert!(checking.resolved_queue_operations.values().any(|operation| {
+            operation.kind == QueueOperationKind::Send
+        }));
+        assert!(checking.resolved_queue_operations.values().any(|operation| {
+            operation.kind == QueueOperationKind::TryReceive
+        }));
+        assert_eq!(checking.resolved_coroutine_starts.len(), 2);
+        assert_eq!(checking.resolved_deferred_calls.len(), 4);
+        assert!(checking.deferred_cleanup_edges.iter().any(|edge| {
+            edge.kind == DeferredCleanupEdgeKind::ErrorPropagation
+        }));
+        assert!(checking.deferred_cleanup_edges.iter().any(|edge| {
+            edge.kind == DeferredCleanupEdgeKind::Normal && edge.exited_blocks.len() == 1
+        }));
+
+        assert!(checking.generated_methods.values().any(|method| {
+            method.checking.resolved_queue_operations.values().any(|operation| {
+                operation.kind == QueueOperationKind::Send
+            }) && method.checking.resolved_deferred_calls.len() == 1
+                && method.checking.deferred_cleanup_edges.len() == 1
+        }));
+        assert!(checking.runtime_specializations.iter().any(|specialization| {
+            specialization.checking.resolved_deferred_calls.len() == 1
+                && specialization.checking.resolved_coroutine_starts.len() == 1
+                && specialization
+                    .checking
+                    .resolved_builtin_operations
+                    .values()
+                    .any(|operation| matches!(operation, ResolvedBuiltinOperation::Output { .. }))
+        }));
+
+        for declaration in &program.declarations {
+            if let Declaration::Function(function) = declaration
+                && !matches!(
+                    function.return_type.as_ref().map(|syntax| &syntax.kind),
+                    Some(crate::ast::TypeKind::ComptimeType)
+                )
+            {
+                assert!(signatures.callable(function.id).is_some());
+            }
+        }
+        assert!(checking.bindings.len() >= 8);
+        assert!(checking
+            .expressions
+            .values()
+            .all(|typed| !matches!(types.types().get(typed.type_id), Some(SemanticType::Recovery))));
+    }
+
+    #[test]
+    fn orders_final_diagnostics_and_preserves_independent_recovery() {
+        let source = concat!(
+            "fn Box(comptime T: type) -> type {\n",
+            "    struct { inner: T, fn invalid(self) { print(); } }\n",
+            "}\n",
+            "fn failures(const vmut queue: Queue(int)) {\n",
+            "    Queue(int)::new(1);\n",
+            "    queue.send(\"wrong\");\n",
+            "    ascii.decode(\"wrong\");\n",
+            "    const bad: bool = Error::new(1);\n",
+            "    1?;\n",
+            "    co 1();\n",
+            "    defer 2();\n",
+            "    print();\n",
+            "}\n",
+            "fn main() { Box(int) { inner: 1 }.invalid(); }\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 9, "{:#?}", checking.errors);
+        assert!(checking.errors.windows(2).all(|errors| {
+            let left = errors[0].span;
+            let right = errors[1].span;
+            (left.module_id.as_u32(), left.start, left.end)
+                <= (right.module_id.as_u32(), right.start, right.end)
+        }));
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::ArgumentCountMismatch {
+                expected: 1,
+                found: 0,
+            }
+        ));
+
+        let failures = function(&program.declarations[1]);
+        for statement in &failures.body.statements {
+            let semantic_node = match &statement.kind {
+                StatementKind::Expression(expression) => expression.id,
+                StatementKind::Binding { initializer, .. } => initializer.id,
+                StatementKind::Coroutine(_) | StatementKind::Defer(_) => statement.id,
+                StatementKind::Function(_)
+                | StatementKind::Return(_)
+                | StatementKind::Break(_)
+                | StatementKind::Continue => continue,
+            };
+            assert!(checking.expressions.contains_key(&semantic_node));
+        }
+        let coroutine = &failures.body.statements[5];
+        let deferred = &failures.body.statements[6];
+        for statement in [coroutine, deferred] {
+            assert!(matches!(
+                types.types().get(checking.expressions[&statement.id].type_id),
+                Some(SemanticType::Primitive {
+                    primitive: PrimitiveType::Unit,
+                    ..
+                })
+            ));
+        }
+        assert!(checking.resolved_coroutine_starts.is_empty());
+        assert!(checking.resolved_deferred_calls.is_empty());
     }
 }

@@ -8,7 +8,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-09-02
+Last reviewed: 2026-09-03
 
 ## Lexer status
 
@@ -243,6 +243,25 @@ eventual result. Successful starts retain the resolved call target and the
 source-ordered prepared callable value or receiver and runtime arguments,
 including their transfers, physical places, and tracked origins, for later
 coroutine-frame construction and post-type escape analysis.
+
+Expression-checking diagnostics are finalized in stable source order after
+ordinary declarations, generated methods, finite-layout and borrow-storage
+validation, and runtime specializations have all contributed their results.
+Generated-method and runtime-specialization snapshots are independently
+ordered as well. Concrete generated signatures and callable declarations are
+visited deterministically, so on-demand specialization does not make
+diagnostic or lowering-facing metadata depend on hash-map iteration order.
+Recovery continues checking later arguments, statements, declarations, and
+callable instances while withholding successful operation metadata from an
+invalid call.
+
+Phase 7.7 integration coverage combines parameterized construction, Queue send
+and receive, Error payload widening and postfix propagation, ASCII conversion,
+output, panic, yield, coroutine starts, and nested lexical defer. It also
+checks the corresponding expression, binding, transfer, operation, cleanup,
+generated-method, and runtime-specialization metadata. Vector and Map
+operations beyond empty construction remain deferred. Authoritative capture
+and escape decisions and typed IR emission remain post-type semantic work.
 
 Tuple checking includes contextual and inferred construction, ordered
 structural identity, numeric element places, transitive capability, owning

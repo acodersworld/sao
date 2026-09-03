@@ -153,6 +153,10 @@ fn propagate_checked(value: int) -> int | Error(int) {
     checked(value)?
 }
 
+fn decode_wide(data: bytes) -> string | Error(string | int) {
+    ascii.decode(data)?
+}
+
 fn apply(value: int, operation: fn(int) -> int) -> int {
     operation(value)
 }
@@ -235,7 +239,7 @@ fn main() {
     const formatter_view: Formatter = formatter_choice;
     const optional: int | none = none;
 
-    const queue: Queue(int) = Queue(int)::new();
+    const vmut queue: Queue(int) = Queue(int)::new();
     const vector: Vector(int) = Vector(int)::new();
     const table: Map(string, int) = Map(string, int)::new();
     const recovered = initial;
@@ -253,6 +257,8 @@ fn main() {
     const character = 65: char;
     const character_code = character: int;
     const text = "A";
+    const encoded = ascii.encode(text);
+    const decoded = decode_wide(encoded);
     const middle = text[0..1];
     const text_length = text.length();
     const literal_middle = "sequence"[1..4];
@@ -286,6 +292,9 @@ fn main() {
 
     defer cleanup(summary);
     co worker(initial);
+    co panic("scheduled failure");
+    queue.send(initial);
+    const received = queue.try_receive();
     announce(grouped_initial);
     announce(indexed);
     announce_if_integer(wider_numeric);
@@ -297,6 +306,7 @@ fn main() {
     character;
     announce(character_code);
     propagate_checked(initial);
+    decoded;
     println(formatted);
     println(inline_inspection);
     println(named_inspection);
@@ -364,6 +374,7 @@ fn main() {
 
     {
         const scoped = "done";
+        defer println(scoped);
         println(scoped);
     };
 

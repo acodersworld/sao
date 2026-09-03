@@ -15,9 +15,9 @@ later documentation-only pass.
 
 ## Current phase
 
-Frontend syntax work is complete for the currently designed language. The
-active work is type-checking Phase 7.7, remaining built-ins and completion,
-followed by post-type semantic analysis, typed IR, and lowering.
+Frontend syntax and expression type checking are complete for the currently
+designed language. The next active work is post-type semantic analysis,
+followed by typed IR and lowering.
 
 For the semantic-analysis phase, use a hands-on, guided workflow. The project
 owner should write a substantial portion of the implementation in small,
@@ -619,7 +619,7 @@ reviewable phases:
          review the completed integration, and mark Phase 7.6 complete.
        - Implementation and documentation ready for review. Stop for review and
          commit before Phase 7.7.
-   - Phase 7.7, remaining built-ins and completion (in progress):
+   - Phase 7.7, remaining built-ins and completion (complete):
      - Implement this phase as seven independently reviewable changes. Stop
        after each change so it can be reviewed and committed before beginning
        the next one. The compiler-known signature catalogue is already
@@ -827,7 +827,7 @@ reviewable phases:
          verification is pending. No formatting was run.
        - Reviewed and completed. Stop for commit before final type-checking
          integration.
-     - Change 7, diagnostics and type-checking completion:
+     - Change 7, diagnostics and type-checking completion (complete):
        - Audit all Phase 7.7 paths for deterministic source-ordered diagnostics
          and complete successful semantic metadata for expressions, bindings,
          declarations, callable signatures, generated methods, and runtime
@@ -842,8 +842,32 @@ reviewable phases:
          review the completed semantic pass, and mark Phase 7.7 complete.
          Continue to leave authoritative capture/escape decisions and typed IR
          emission to post-type semantic analysis.
-       - Stop for review and commit before beginning post-type semantic
-         analysis.
+       - Implemented stable final source ordering for diagnostics in the root
+         checking result and every isolated generated-method and runtime-
+         specialization result. Concrete generated signatures and their
+         callable declarations are also traversed deterministically before
+         specialization metadata is produced.
+       - Added focused recovery coverage spanning generated methods,
+         parameterized construction, queues, ASCII, Error construction,
+         postfix `?`, `co`, `defer`, and output. The test verifies that a
+         generated-method diagnostic discovered late is reported at its true
+         source position, every independent later failure remains diagnosed,
+         recovery expressions remain available, and invalid coroutine/defer
+         calls do not acquire successful lowering metadata.
+       - Added end-to-end semantic coverage combining Queue and Error
+         construction, queue send/receive, Error widening and propagation,
+         ASCII encode/decode, print/println, panic, yield, coroutine starts,
+         and nested lexical defer. The same test audits successful metadata in
+         ordinary callables, generated methods, and runtime specializations,
+         including binding, expression, declaration-signature, transfer, and
+         cleanup facts.
+       - Extended the complex-program frontend fixture with the designed
+         Phase 7.7 operations while leaving Vector and Map APIs beyond empty
+         construction out of scope.
+       - Compilation and test execution were not requested for this change, so
+         verification is pending. No formatting was run.
+       - Reviewed and completed. Stop for commit before beginning post-type
+         semantic analysis.
 Type checking consumes successful name and context resolution. Capture analysis
 and typed IR remain separate post-type work. Do not begin a later phase until
 the current phase and its focused tests have been reviewed.
