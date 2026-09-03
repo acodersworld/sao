@@ -99,6 +99,7 @@ struct LoopResultPath {
 /// accidentally contribute a break or continue to an outer loop.
 struct ActiveLoop {
     expression: NodeId,
+    body: NodeId,
     expected_result_type: Option<TypeId>,
     breaks: Vec<LoopResultPath>,
     continues: Vec<(
@@ -510,9 +511,9 @@ struct ResolvedErrorPropagation {
     return_transfer: ValueTransfer,
 }
 
-/// The callable selected by a checked coroutine start. Static targets retain
-/// their semantic identity, while a first-class callable retains the evaluated
-/// callee node and concrete callable type which must be saved in the frame.
+/// The callable selected by a checked coroutine start or deferred call. Static
+/// targets retain their semantic identity, while a first-class callable retains
+/// the evaluated callee node and concrete callable type which must be saved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedCoroutineCallTarget {
     Function { declaration: NodeId, symbol: SymbolId },
@@ -531,8 +532,8 @@ enum CoroutinePreparedRole {
     Argument { index: usize },
 }
 
-/// One runtime value evaluated and retained while preparing a coroutine. The
-/// ordered list containing these records is the source evaluation order.
+/// One runtime value evaluated and retained while preparing a coroutine start
+/// or deferred call. The ordered list is the source evaluation order.
 /// Physical places and tracked sources let post-type escape analysis decide
 /// whether a value may safely outlive the starting call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,6 +557,51 @@ struct ResolvedCoroutineStart {
     prepared: Vec<CoroutinePreparedValue>,
     discarded_result: TypeId,
     statement_type: TypeId,
+}
+
+/// Complete type-checking result for one lexical `defer call(...)`
+/// registration. Preparation uses the same source-ordered value description
+/// as coroutine starts because both constructs evaluate the callable or
+/// receiver and every runtime argument at the statement, then invoke later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedDeferredCall {
+    call: NodeId,
+    target: ResolvedCoroutineCallTarget,
+    prepared: Vec<CoroutinePreparedValue>,
+    discarded_result: TypeId,
+    statement_type: TypeId,
+    block: NodeId,
+    registration_order: usize,
+    reachable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredCleanupEdgeKind {
+    Normal,
+    Return,
+    Break(NodeId),
+    Continue(NodeId),
+    ErrorPropagation,
+}
+
+/// One control-flow edge which leaves lexical scopes containing live defer
+/// registrations. Blocks and registrations are ordered innermost-first, with
+/// each block's registrations in reverse source order. `transfer_value`, when
+/// present, is evaluated and saved before any cleanup call runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredCleanupEdge {
+    source: NodeId,
+    kind: DeferredCleanupEdgeKind,
+    exited_blocks: Vec<NodeId>,
+    registrations: Vec<NodeId>,
+    transfer_value: Option<NodeId>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDeferredBlock {
+    block: NodeId,
+    registrations: Vec<NodeId>,
+    next_registration_order: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,6 +938,8 @@ struct ExpressionChecking {
     resolved_builtin_operations: HashMap<NodeId, ResolvedBuiltinOperation>,
     resolved_error_propagations: HashMap<NodeId, ResolvedErrorPropagation>,
     resolved_coroutine_starts: HashMap<NodeId, ResolvedCoroutineStart>,
+    resolved_deferred_calls: HashMap<NodeId, ResolvedDeferredCall>,
+    deferred_cleanup_edges: Vec<DeferredCleanupEdge>,
     resolved_queue_operations: HashMap<NodeId, ResolvedQueueOperation>,
     resolved_sequence_operations: HashMap<NodeId, ResolvedSequenceOperation>,
     sequence_runtime_checks: HashMap<NodeId, Vec<SequenceRuntimeCheck>>,
@@ -1364,6 +1412,9 @@ struct Analyzer<'semantic> {
     /// Loops whose bodies are currently being checked. Resolved transfer
     /// targets select an entry here, so nested-loop breaks never leak outward.
     active_loops: Vec<ActiveLoop>,
+    /// Executable lexical blocks in the current callable. Nested callables
+    /// isolate this stack just as they isolate loop transfer contexts.
+    active_deferred_blocks: Vec<ActiveDeferredBlock>,
     checking: ExpressionChecking,
 }
 
@@ -1525,6 +1576,7 @@ impl<'semantic> Analyzer<'semantic> {
             runtime_specialization_calls: HashMap::new(),
             runtime_specializations: Vec::new(),
             active_loops: Vec::new(),
+            active_deferred_blocks: Vec::new(),
             checking: ExpressionChecking::default(),
         }
     }
@@ -1637,6 +1689,7 @@ impl<'semantic> Analyzer<'semantic> {
         let enclosing_narrowings = std::mem::take(&mut self.current_narrowings);
         let enclosing_reachability = self.current_path_reachable;
         let enclosing_loops = std::mem::take(&mut self.active_loops);
+        let enclosing_deferred_blocks = std::mem::take(&mut self.active_deferred_blocks);
         let enclosing_tracked_roots = std::mem::take(&mut self.current_tracked_return_roots);
         let enclosing_borrow_containing_roots =
             std::mem::take(&mut self.current_borrow_containing_return_roots);
@@ -1714,6 +1767,7 @@ impl<'semantic> Analyzer<'semantic> {
         self.current_narrowings = enclosing_narrowings;
         self.current_path_reachable = enclosing_reachability;
         self.active_loops = enclosing_loops;
+        self.active_deferred_blocks = enclosing_deferred_blocks;
         self.current_tracked_return_roots = enclosing_tracked_roots;
         self.current_borrow_containing_return_roots = enclosing_borrow_containing_roots;
     }
@@ -1775,9 +1829,11 @@ impl<'semantic> Analyzer<'semantic> {
     /// completion without one supplies unit.
     fn visit_callable_body(&mut self, block: &crate::ast::Block, expected: TypeId) {
         let enclosing_callable_result = self.current_callable_result.replace(expected);
+        self.enter_deferred_block(block.id);
         // A return or diverging statement prevents execution from reaching the
         // body's final value or implicit unit result.
         let can_reach_body_end = self.visit_block_statements(block);
+        let mut completes_normally = can_reach_body_end;
         match (&block.value, can_reach_body_end) {
             (Some(value), true) if matches!(&value.kind, ExpressionKind::If { .. }) => {
                 let outcome = self.analyze_conditional_expression(
@@ -1786,29 +1842,37 @@ impl<'semantic> Analyzer<'semantic> {
                     ConditionalUse::CallableCompletion,
                     true,
                 );
-                if let Some(outcome) = outcome
-                    && outcome.explicitly_produces_value
-                {
-                    if self.type_contains_tracked_reference(expected)
-                        && !self.validate_tracked_return_source(value)
-                    {
-                        self.checking.errors.push(ExpressionCheckingError {
-                            kind: ExpressionCheckingErrorKind::InvalidTrackedReturnSource,
-                            span: value.span,
-                        });
-                        self.checking.expressions.insert(
-                            value.id,
-                            TypedExpression {
-                                type_id: self.types.types().recovery(),
-                                category: outcome.typed.category,
-                            },
-                        );
-                    } else {
-                        self.record_return_transfer(value, outcome.typed);
+                if let Some(outcome) = outcome {
+                    completes_normally &= !self.is_divergence(outcome.typed.type_id);
+                    if outcome.explicitly_produces_value {
+                        if self.type_contains_tracked_reference(expected)
+                            && !self.validate_tracked_return_source(value)
+                        {
+                            self.checking.errors.push(ExpressionCheckingError {
+                                kind: ExpressionCheckingErrorKind::InvalidTrackedReturnSource,
+                                span: value.span,
+                            });
+                            self.checking.expressions.insert(
+                                value.id,
+                                TypedExpression {
+                                    type_id: self.types.types().recovery(),
+                                    category: outcome.typed.category,
+                                },
+                            );
+                        } else {
+                            self.record_return_transfer(value, outcome.typed);
+                        }
                     }
                 }
             }
-            (Some(value), true) => self.analyze_return_value(value, expected),
+            (Some(value), true) => {
+                self.analyze_return_value(value, expected);
+                completes_normally &= self
+                    .checking
+                    .expressions
+                    .get(&value.id)
+                    .is_none_or(|typed| !self.is_divergence(typed.type_id));
+            }
             (Some(value), false) => {
                 let enclosing_reachability = self.current_path_reachable;
                 self.current_path_reachable = false;
@@ -1818,6 +1882,12 @@ impl<'semantic> Analyzer<'semantic> {
             (None, true) => self.check_absent_value(block.id, expected, block.span),
             (None, false) => {}
         }
+        self.leave_deferred_block(
+            block.id,
+            block.value.as_deref().map_or(block.id, |value| value.id),
+            block.value.as_deref().map(|value| value.id),
+            completes_normally,
+        );
         self.current_callable_result = enclosing_callable_result;
     }
 
@@ -1863,17 +1933,119 @@ impl<'semantic> Analyzer<'semantic> {
                 let expected = self.resolved_callable_signature(callable).return_type;
                 if let Some(value) = value {
                     self.analyze_return_value(value, expected);
+                    if self
+                        .checking
+                        .expressions
+                        .get(&value.id)
+                        .is_some_and(|typed| self.is_divergence(typed.type_id))
+                    {
+                        return StatementFlow::Diverges;
+                    }
                 } else {
                     self.check_absent_value(statement.id, expected, statement.span);
                 }
+                self.record_deferred_exit(
+                    statement.id,
+                    DeferredCleanupEdgeKind::Return,
+                    None,
+                    value.as_ref().map(|value| value.id),
+                );
                 self.release_all_narrowings(statement.id, NarrowingEdgeKind::Return);
                 StatementFlow::Returns
             }
             StatementKind::Break(value) => self.analyze_break(statement, value.as_ref()),
             StatementKind::Continue => self.analyze_continue(statement),
             StatementKind::Coroutine(call) => self.analyze_coroutine_start(statement, call),
-            StatementKind::Defer(_) => StatementFlow::Completes,
+            StatementKind::Defer(call) => self.analyze_deferred_call(statement, call),
         }
+    }
+
+    /// Checks a deferred call now, retaining every value needed to invoke it
+    /// when the innermost executable lexical block exits.
+    fn analyze_deferred_call(
+        &mut self,
+        statement: &Statement,
+        call: &Expression,
+    ) -> StatementFlow {
+        let result = self.synthesize(call);
+        let statement_typed = self.fresh_primitive(PrimitiveType::Unit);
+        self.checking.expressions.insert(statement.id, statement_typed);
+        self.checking.explicit_values.insert(statement.id, false);
+
+        let ExpressionKind::Call { callee, arguments } = &call.kind else {
+            unreachable!("the parser restricts `defer` to call expressions")
+        };
+        if self.call_preparation_diverges(callee, arguments) {
+            return StatementFlow::Diverges;
+        }
+        let Some(result) = result else {
+            return StatementFlow::Completes;
+        };
+        if self.is_recovery(result.type_id) {
+            return StatementFlow::Completes;
+        }
+        let Some(target) = self.resolved_coroutine_call_target(call, callee) else {
+            return StatementFlow::Completes;
+        };
+
+        let mut prepared = Vec::new();
+        let receiver = self.coroutine_receiver(callee);
+        if let Some(receiver) = receiver {
+            if let Some(value) = self.coroutine_prepared_value(
+                CoroutinePreparedRole::Receiver,
+                receiver,
+                None,
+            ) {
+                prepared.push(value);
+            }
+        } else if matches!(&target, ResolvedCoroutineCallTarget::CallableValue { .. })
+            && let Some(value) = self.coroutine_prepared_value(
+                CoroutinePreparedRole::Callable,
+                callee,
+                self.checking
+                    .expressions
+                    .get(&callee.id)
+                    .copied()
+                    .and_then(|typed| self.argument_transfer(typed)),
+            )
+        {
+            prepared.push(value);
+        }
+        for (index, argument) in arguments.iter().enumerate() {
+            if let Some(value) = self.coroutine_prepared_value(
+                CoroutinePreparedRole::Argument { index },
+                argument,
+                None,
+            ) {
+                prepared.push(value);
+            }
+        }
+
+        let active = self
+            .active_deferred_blocks
+            .last_mut()
+            .expect("a defer statement is checked inside an executable block");
+        let block = active.block;
+        let registration_order = active.next_registration_order;
+        active.next_registration_order += 1;
+        let reachable = self.current_path_reachable;
+        if reachable {
+            active.registrations.push(statement.id);
+        }
+        self.checking.resolved_deferred_calls.insert(
+            statement.id,
+            ResolvedDeferredCall {
+                call: call.id,
+                target,
+                prepared,
+                discarded_result: result.type_id,
+                statement_type: statement_typed.type_id,
+                block,
+                registration_order,
+                reachable,
+            },
+        );
+        StatementFlow::Completes
     }
 
     /// Checks a coroutine start through the ordinary call path, then records
@@ -1889,15 +2061,18 @@ impl<'semantic> Analyzer<'semantic> {
         self.checking.expressions.insert(statement.id, statement_typed);
         self.checking.explicit_values.insert(statement.id, false);
 
+        let ExpressionKind::Call { callee, arguments } = &call.kind else {
+            unreachable!("the parser restricts `co` to call expressions")
+        };
+        if self.call_preparation_diverges(callee, arguments) {
+            return StatementFlow::Diverges;
+        }
         let Some(result) = result else {
             return StatementFlow::Completes;
         };
         if self.is_recovery(result.type_id) {
             return StatementFlow::Completes;
         }
-        let ExpressionKind::Call { callee, arguments } = &call.kind else {
-            unreachable!("the parser restricts `co` to call expressions")
-        };
         let Some(target) = self.resolved_coroutine_call_target(call, callee) else {
             return StatementFlow::Completes;
         };
@@ -2067,6 +2242,101 @@ impl<'semantic> Analyzer<'semantic> {
         })
     }
 
+    /// The target body runs later for `co` and `defer`, but evaluating a
+    /// first-class callee, receiver, or runtime argument still happens now.
+    /// Divergence during that preparation prevents the registration/start and
+    /// follows panic's non-unwinding behavior.
+    fn call_preparation_diverges(
+        &self,
+        callee: &Expression,
+        arguments: &[Expression],
+    ) -> bool {
+        let prepared_callee = self.coroutine_receiver(callee).unwrap_or(callee);
+        self.checking
+            .expressions
+            .get(&prepared_callee.id)
+            .is_some_and(|typed| self.is_divergence(typed.type_id))
+            || arguments.iter().any(|argument| {
+                self.checking
+                    .expressions
+                    .get(&argument.id)
+                    .is_some_and(|typed| self.is_divergence(typed.type_id))
+            })
+    }
+
+    fn enter_deferred_block(&mut self, block: NodeId) {
+        self.active_deferred_blocks.push(ActiveDeferredBlock {
+            block,
+            registrations: Vec::new(),
+            next_registration_order: 0,
+        });
+    }
+
+    /// Leaves one lexical block after its optional result has been evaluated.
+    /// A divergent tail, including panic, has no normal cleanup edge.
+    fn leave_deferred_block(
+        &mut self,
+        block: NodeId,
+        normal_source: NodeId,
+        transfer_value: Option<NodeId>,
+        completes_normally: bool,
+    ) {
+        let active = self
+            .active_deferred_blocks
+            .pop()
+            .expect("executable block analysis must retain defer context");
+        assert_eq!(active.block, block, "defer blocks must remain lexical");
+        if completes_normally && self.current_path_reachable && !active.registrations.is_empty() {
+            self.checking.deferred_cleanup_edges.push(DeferredCleanupEdge {
+                source: normal_source,
+                kind: DeferredCleanupEdgeKind::Normal,
+                exited_blocks: vec![block],
+                registrations: active.registrations.into_iter().rev().collect(),
+                transfer_value,
+            });
+        }
+    }
+
+    /// Records the active registrations executed by a non-local transfer. A
+    /// loop transfer stops after its target body; callable exits consume every
+    /// active lexical block. Empty scopes remain in `exited_blocks` so typed IR
+    /// can preserve the exact scope boundary independently of cleanup count.
+    fn record_deferred_exit(
+        &mut self,
+        source: NodeId,
+        kind: DeferredCleanupEdgeKind,
+        target_body: Option<NodeId>,
+        transfer_value: Option<NodeId>,
+    ) {
+        if !self.current_path_reachable {
+            return;
+        }
+        let first = target_body.map_or(0, |target| {
+            self.active_deferred_blocks
+                .iter()
+                .rposition(|active| active.block == target)
+                .expect("loop transfer target body must have an active defer scope")
+        });
+        let exited: Vec<_> = self.active_deferred_blocks[first..]
+            .iter()
+            .rev()
+            .collect();
+        let registrations: Vec<_> = exited
+            .iter()
+            .flat_map(|active| active.registrations.iter().rev().copied())
+            .collect();
+        if registrations.is_empty() {
+            return;
+        }
+        self.checking.deferred_cleanup_edges.push(DeferredCleanupEdge {
+            source,
+            kind,
+            exited_blocks: exited.iter().map(|active| active.block).collect(),
+            registrations,
+            transfer_value,
+        });
+    }
+
     fn analyze_break(
         &mut self,
         statement: &Statement,
@@ -2099,6 +2369,17 @@ impl<'semantic> Analyzer<'semantic> {
                 .expect("break statement must be checked inside an active loop")
                 .entry_narrowings
                 .clone();
+            let target_body = self
+                .active_loops
+                .last()
+                .expect("break statement must be checked inside an active loop")
+                .body;
+            self.record_deferred_exit(
+                statement.id,
+                DeferredCleanupEdgeKind::Break(target),
+                Some(target_body),
+                value.map(|value| value.id),
+            );
             self.transition_current_narrowings(
                 statement.id,
                 NarrowingEdgeKind::Break,
@@ -2141,6 +2422,17 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("break statement must be checked inside an active loop")
             .entry_narrowings
             .clone();
+        let target_body = self
+            .active_loops
+            .last()
+            .expect("break statement must be checked inside an active loop")
+            .body;
+        self.record_deferred_exit(
+            statement.id,
+            DeferredCleanupEdgeKind::Break(target),
+            Some(target_body),
+            value.map(|value| value.id),
+        );
         self.transition_current_narrowings(statement.id, NarrowingEdgeKind::Break, destination);
         StatementFlow::Breaks(target)
     }
@@ -2183,6 +2475,17 @@ impl<'semantic> Analyzer<'semantic> {
             .expect("continue statement must be checked inside an active loop")
             .entry_narrowings
             .clone();
+        let target_body = self
+            .active_loops
+            .last()
+            .expect("continue statement must be checked inside an active loop")
+            .body;
+        self.record_deferred_exit(
+            statement.id,
+            DeferredCleanupEdgeKind::Continue(target),
+            Some(target_body),
+            None,
+        );
         self.transition_current_narrowings(statement.id, NarrowingEdgeKind::Continue, destination);
         StatementFlow::Continues(target)
     }
@@ -2577,60 +2880,70 @@ impl<'semantic> Analyzer<'semantic> {
         tail_use: ConditionalUse,
         allow_recursive_copy: bool,
     ) -> Option<BlockOutcome> {
+        self.enter_deferred_block(block.id);
         let can_reach_block_end = self.visit_block_statements(block);
-
-        if !can_reach_block_end {
-            if let Some(value) = &block.value {
-                let enclosing_reachability = self.current_path_reachable;
-                self.current_path_reachable = false;
-                let _ = self.synthesize_discarded(value);
-                self.current_path_reachable = enclosing_reachability;
-            }
-            self.release_block_local_narrowings(block);
-            return Some(BlockOutcome {
-                typed: TypedExpression {
-                    type_id: self.types.types().divergence(),
-                    category: ValueCategory::FreshTemporary,
-                },
-                explicit_value: None,
-            });
-        }
-
-        let Some(value) = &block.value else {
-            self.release_block_local_narrowings(block);
-            return Some(BlockOutcome {
-                typed: self.fresh_primitive(PrimitiveType::Unit),
-                explicit_value: None,
-            });
-        };
-        let outcome = if let ExpressionKind::If { .. } = &value.kind {
-            match expected {
-                Some(expected) => self.analyze_conditional_expression(
-                    value,
-                    Some(expected),
-                    tail_use,
-                    allow_recursive_copy,
-                )?,
-                None => self.synthesize_conditional_expression(value, tail_use)?,
-            }
-        } else {
-            let typed = match expected {
-                Some(expected) => {
-                    self.check_with_capability(value, expected, allow_recursive_copy)?
+        let outcome = (|| {
+            if !can_reach_block_end {
+                if let Some(value) = &block.value {
+                    let enclosing_reachability = self.current_path_reachable;
+                    self.current_path_reachable = false;
+                    let _ = self.synthesize_discarded(value);
+                    self.current_path_reachable = enclosing_reachability;
                 }
-                None => self.synthesize(value)?,
-            };
-            ExpressionOutcome {
-                typed,
-                explicitly_produces_value: self.explicitly_produces_value(value),
+                return Some(BlockOutcome {
+                    typed: TypedExpression {
+                        type_id: self.types.types().divergence(),
+                        category: ValueCategory::FreshTemporary,
+                    },
+                    explicit_value: None,
+                });
             }
-        };
-        let outcome = BlockOutcome {
-            typed: outcome.typed,
-            explicit_value: outcome.explicitly_produces_value.then_some(value.id),
-        };
+
+            let Some(value) = &block.value else {
+                return Some(BlockOutcome {
+                    typed: self.fresh_primitive(PrimitiveType::Unit),
+                    explicit_value: None,
+                });
+            };
+            let outcome = if let ExpressionKind::If { .. } = &value.kind {
+                match expected {
+                    Some(expected) => self.analyze_conditional_expression(
+                        value,
+                        Some(expected),
+                        tail_use,
+                        allow_recursive_copy,
+                    )?,
+                    None => self.synthesize_conditional_expression(value, tail_use)?,
+                }
+            } else {
+                let typed = match expected {
+                    Some(expected) => {
+                        self.check_with_capability(value, expected, allow_recursive_copy)?
+                    }
+                    None => self.synthesize(value)?,
+                };
+                ExpressionOutcome {
+                    typed,
+                    explicitly_produces_value: self.explicitly_produces_value(value),
+                }
+            };
+            Some(BlockOutcome {
+                typed: outcome.typed,
+                explicit_value: outcome.explicitly_produces_value.then_some(value.id),
+            })
+        })();
+        let completes_normally = can_reach_block_end
+            && outcome
+                .as_ref()
+                .is_none_or(|outcome| !self.is_divergence(outcome.typed.type_id));
+        self.leave_deferred_block(
+            block.id,
+            block.value.as_deref().map_or(block.id, |value| value.id),
+            block.value.as_deref().map(|value| value.id),
+            completes_normally,
+        );
         self.release_block_local_narrowings(block);
-        Some(outcome)
+        outcome
     }
 
     fn release_block_local_narrowings(&mut self, block: &Block) {
@@ -3759,6 +4072,7 @@ impl<'semantic> Analyzer<'semantic> {
                 .then(|| self.current_tracked_bindings.clone());
             self.active_loops.push(ActiveLoop {
                 expression,
+                body: body.id,
                 expected_result_type,
                 breaks: Vec::new(),
                 continues: Vec::new(),
@@ -3829,15 +4143,24 @@ impl<'semantic> Analyzer<'semantic> {
     /// Checks an iteration body as discarded syntax. Its final expression is
     /// evaluated on each iteration but never contributes the loop's result.
     fn visit_loop_iteration_body(&mut self, body: &Block) -> bool {
+        self.enter_deferred_block(body.id);
         let can_reach_value = self.visit_block_statements(body);
-        let Some(value) = &body.value else {
-            return can_reach_value;
-        };
-        let enclosing_reachability = self.current_path_reachable;
-        self.current_path_reachable &= can_reach_value;
-        let typed = self.synthesize_discarded(value);
-        self.current_path_reachable = enclosing_reachability;
-        can_reach_value && typed.map_or(true, |typed| !self.is_divergence(typed.type_id))
+        let typed = body.value.as_deref().and_then(|value| {
+            let enclosing_reachability = self.current_path_reachable;
+            self.current_path_reachable &= can_reach_value;
+            let typed = self.synthesize_discarded(value);
+            self.current_path_reachable = enclosing_reachability;
+            typed
+        });
+        let completes_normally = can_reach_value
+            && typed.is_none_or(|typed| !self.is_divergence(typed.type_id));
+        self.leave_deferred_block(
+            body.id,
+            body.value.as_deref().map_or(body.id, |value| value.id),
+            body.value.as_deref().map(|value| value.id),
+            completes_normally,
+        );
+        completes_normally
     }
 
     fn finish_loop_result(
@@ -4330,6 +4653,7 @@ impl<'semantic> Analyzer<'semantic> {
         let enclosing_narrowings = std::mem::take(&mut self.current_narrowings);
         let enclosing_reachability = self.current_path_reachable;
         let enclosing_loops = std::mem::take(&mut self.active_loops);
+        let enclosing_deferred_blocks = std::mem::take(&mut self.active_deferred_blocks);
         let enclosing_tracked_roots =
             std::mem::take(&mut self.current_tracked_return_roots);
         let enclosing_borrow_containing_roots =
@@ -4360,6 +4684,7 @@ impl<'semantic> Analyzer<'semantic> {
         self.current_narrowings = enclosing_narrowings;
         self.current_path_reachable = enclosing_reachability;
         self.active_loops = enclosing_loops;
+        self.active_deferred_blocks = enclosing_deferred_blocks;
         self.current_tracked_return_roots = enclosing_tracked_roots;
         self.current_borrow_containing_return_roots = enclosing_borrow_containing_roots;
         if borrow_containing_capture || self.checking.errors.len() != first_body_error {
@@ -8712,6 +9037,12 @@ impl<'semantic> Analyzer<'semantic> {
         if let Some(place) = self.checking.physical_places.get(&operand.id).cloned() {
             self.checking.physical_places.insert(expression.id, place);
         }
+        self.record_deferred_exit(
+            expression.id,
+            DeferredCleanupEdgeKind::ErrorPropagation,
+            None,
+            Some(operand.id),
+        );
         let current_narrowings = self.current_narrowings.clone();
         self.record_narrowing_transition(
             expression.id,
@@ -11922,6 +12253,13 @@ mod tests {
     fn coroutine_call(statement: &Statement) -> &Expression {
         let StatementKind::Coroutine(call) = &statement.kind else {
             panic!("expected coroutine statement")
+        };
+        call
+    }
+
+    fn deferred_call(statement: &Statement) -> &Expression {
+        let StatementKind::Defer(call) = &statement.kind else {
+            panic!("expected defer statement")
         };
         call
     }
@@ -18486,5 +18824,296 @@ fn main() {
         }
         let wrong_argument = call(coroutine_call(&bad.body.statements[1])).1[0].id;
         assert!(checking.expressions.contains_key(&wrong_argument));
+    }
+
+    #[test]
+    fn checks_lexical_defer_preparation_and_normal_lifo_cleanup() {
+        let source = concat!(
+            "struct Worker { fn run(self, value: int) -> string { \"done\" } }\n",
+            "struct Item {}\n",
+            "fn clean(value: *Item) {}\n",
+            "fn schedule(callback: fn(int) -> int, worker: Worker, tracked: *Item) {\n",
+            "    defer callback(1);\n",
+            "    defer worker.run(2);\n",
+            "    if true {\n",
+            "        defer clean(tracked);\n",
+            "        defer yield();\n",
+            "    }\n",
+            "}\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let schedule = function(&program.declarations[3]);
+        let callback_statement = &schedule.body.statements[0];
+        let callback_call = deferred_call(callback_statement);
+        let (callback_callee, callback_arguments) = call(callback_call);
+        let callback = &checking.resolved_deferred_calls[&callback_statement.id];
+        assert_eq!(callback.block, schedule.body.id);
+        assert_eq!(callback.registration_order, 0);
+        assert!(callback.reachable);
+        assert!(matches!(
+            &callback.target,
+            ResolvedCoroutineCallTarget::CallableValue { callee, .. }
+                if *callee == callback_callee.id
+        ));
+        assert_eq!(callback.prepared.len(), 2);
+        assert_eq!(callback.prepared[0].role, CoroutinePreparedRole::Callable);
+        assert_eq!(callback.prepared[0].expression, callback_callee.id);
+        assert_eq!(callback.prepared[1].expression, callback_arguments[0].id);
+
+        let method_statement = &schedule.body.statements[1];
+        let method_call = deferred_call(method_statement);
+        let (method_callee, _) = call(method_call);
+        let method = &checking.resolved_deferred_calls[&method_statement.id];
+        assert_eq!(method.registration_order, 1);
+        assert!(matches!(
+            &method.target,
+            ResolvedCoroutineCallTarget::Member(ResolvedMember::Method { .. })
+        ));
+        assert_eq!(method.prepared[0].role, CoroutinePreparedRole::Receiver);
+        assert_eq!(method.prepared[0].expression, member_object(method_callee).id);
+
+        let conditional = expression(&schedule.body.statements[2]);
+        let ExpressionKind::If { then_branch, .. } = &conditional.kind else {
+            panic!("expected conditional defer scope")
+        };
+        let tracked_statement = &then_branch.statements[0];
+        let tracked = &checking.resolved_deferred_calls[&tracked_statement.id];
+        assert_eq!(tracked.block, then_branch.id);
+        assert!(!tracked.prepared[0].tracked_sources.is_empty());
+        assert!(tracked.prepared[0].place.is_some());
+        let yielding_statement = &then_branch.statements[1];
+        assert!(matches!(
+            &checking.resolved_deferred_calls[&yielding_statement.id].target,
+            ResolvedCoroutineCallTarget::Builtin(ResolvedBuiltinOperation::Yield)
+        ));
+
+        let branch_edge = checking
+            .deferred_cleanup_edges
+            .iter()
+            .find(|edge| {
+                edge.kind == DeferredCleanupEdgeKind::Normal
+                    && edge.exited_blocks == [then_branch.id]
+            })
+            .expect("the conditional block should clean up normally");
+        assert_eq!(
+            branch_edge.registrations,
+            [yielding_statement.id, tracked_statement.id]
+        );
+        let callable_edge = checking
+            .deferred_cleanup_edges
+            .iter()
+            .find(|edge| {
+                edge.kind == DeferredCleanupEdgeKind::Normal
+                    && edge.exited_blocks == [schedule.body.id]
+            })
+            .expect("the callable body should clean up normally");
+        assert_eq!(
+            callable_edge.registrations,
+            [method_statement.id, callback_statement.id]
+        );
+        assert_eq!(callable_edge.transfer_value, None);
+
+        for statement in [
+            callback_statement,
+            method_statement,
+            tracked_statement,
+            yielding_statement,
+        ] {
+            let deferred = &checking.resolved_deferred_calls[&statement.id];
+            assert_eq!(checking.expressions[&statement.id].type_id, deferred.statement_type);
+            assert!(matches!(
+                types.types().get(deferred.statement_type),
+                Some(SemanticType::Primitive {
+                    primitive: PrimitiveType::Unit,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn records_defer_cleanup_for_callable_error_and_loop_exits_but_not_panic() {
+        let source = concat!(
+            "fn clean(value: int) {}\n",
+            "fn fallible() -> () | Error(string) { () }\n",
+            "fn exits(flag: bool) -> () | Error(string) {\n",
+            "    defer clean(0);\n",
+            "    if flag { defer clean(1); return (); }\n",
+            "    fallible()?;\n",
+            "}\n",
+            "fn looped(flag: bool) {\n",
+            "    loop {\n",
+            "        defer clean(2);\n",
+            "        if flag { defer clean(3); continue; }\n",
+            "        break;\n",
+            "    };\n",
+            "}\n",
+            "fn stopped() { defer clean(4); panic(\"stop\"); }\n",
+            "fn preparation_panics() { defer clean(5); defer clean(panic(\"arg\")); }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        let exits = function(&program.declarations[2]);
+        let outer = &exits.body.statements[0];
+        let conditional = expression(&exits.body.statements[1]);
+        let ExpressionKind::If { then_branch, .. } = &conditional.kind else {
+            panic!("expected return branch")
+        };
+        let inner = &then_branch.statements[0];
+        let return_statement = &then_branch.statements[1];
+        let return_edge = checking
+            .deferred_cleanup_edges
+            .iter()
+            .find(|edge| edge.source == return_statement.id)
+            .expect("return should unwind both lexical scopes");
+        assert_eq!(return_edge.kind, DeferredCleanupEdgeKind::Return);
+        assert_eq!(return_edge.exited_blocks, [then_branch.id, exits.body.id]);
+        assert_eq!(return_edge.registrations, [inner.id, outer.id]);
+        let return_value = match &return_statement.kind {
+            StatementKind::Return(Some(value)) => value.id,
+            _ => panic!("expected valued return"),
+        };
+        assert_eq!(return_edge.transfer_value, Some(return_value));
+
+        let propagation = expression(&exits.body.statements[2]);
+        let ExpressionKind::Try { expression: operand } = &propagation.kind else {
+            panic!("expected error propagation")
+        };
+        let error_edge = checking
+            .deferred_cleanup_edges
+            .iter()
+            .find(|edge| edge.source == propagation.id)
+            .expect("error propagation should unwind the callable scope");
+        assert_eq!(error_edge.kind, DeferredCleanupEdgeKind::ErrorPropagation);
+        assert_eq!(error_edge.registrations, [outer.id]);
+        assert_eq!(error_edge.transfer_value, Some(operand.id));
+
+        let looped = function(&program.declarations[3]);
+        let loop_expression = expression(&looped.body.statements[0]);
+        let ExpressionKind::Loop { body } = &loop_expression.kind else {
+            panic!("expected loop expression")
+        };
+        let iteration_defer = &body.statements[0];
+        let branch = expression(&body.statements[1]);
+        let ExpressionKind::If { then_branch, .. } = &branch.kind else {
+            panic!("expected continue branch")
+        };
+        let branch_defer = &then_branch.statements[0];
+        let continue_statement = &then_branch.statements[1];
+        let continue_edge = checking
+            .deferred_cleanup_edges
+            .iter()
+            .find(|edge| edge.source == continue_statement.id)
+            .expect("continue should clean the current iteration");
+        assert_eq!(
+            continue_edge.kind,
+            DeferredCleanupEdgeKind::Continue(loop_expression.id)
+        );
+        assert_eq!(continue_edge.exited_blocks, [then_branch.id, body.id]);
+        assert_eq!(
+            continue_edge.registrations,
+            [branch_defer.id, iteration_defer.id]
+        );
+        let break_statement = &body.statements[2];
+        let break_edge = checking
+            .deferred_cleanup_edges
+            .iter()
+            .find(|edge| edge.source == break_statement.id)
+            .expect("break should clean the current iteration");
+        assert_eq!(
+            break_edge.kind,
+            DeferredCleanupEdgeKind::Break(loop_expression.id)
+        );
+        assert_eq!(break_edge.exited_blocks, [body.id]);
+        assert_eq!(break_edge.registrations, [iteration_defer.id]);
+
+        let stopped = function(&program.declarations[4]);
+        let stopped_defer = &stopped.body.statements[0];
+        assert!(checking.resolved_deferred_calls.contains_key(&stopped_defer.id));
+        assert!(!checking
+            .deferred_cleanup_edges
+            .iter()
+            .any(|edge| edge.exited_blocks.contains(&stopped.body.id)));
+
+        let preparation_panics = function(&program.declarations[5]);
+        let earlier = &preparation_panics.body.statements[0];
+        let diverging = &preparation_panics.body.statements[1];
+        assert!(checking.resolved_deferred_calls.contains_key(&earlier.id));
+        assert!(!checking.resolved_deferred_calls.contains_key(&diverging.id));
+        assert!(!checking
+            .deferred_cleanup_edges
+            .iter()
+            .any(|edge| edge.exited_blocks.contains(&preparation_panics.body.id)));
+    }
+
+    #[test]
+    fn diagnoses_invalid_deferred_calls_and_excludes_unreachable_registrations() {
+        let source = concat!(
+            "fn clean(value: int) {}\n",
+            "fn recover(value: int) { defer value(); defer clean(1); }\n",
+            "fn unreachable() { panic(\"stop\"); defer clean(2); }\n",
+            "fn main() {}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert_eq!(checking.errors.len(), 1, "{:#?}", checking.errors);
+        assert!(matches!(
+            checking.errors[0].kind,
+            ExpressionCheckingErrorKind::NotCallable { .. }
+        ));
+
+        let recover = function(&program.declarations[1]);
+        let invalid = &recover.body.statements[0];
+        let valid = &recover.body.statements[1];
+        assert!(!checking.resolved_deferred_calls.contains_key(&invalid.id));
+        assert!(checking.resolved_deferred_calls[&valid.id].reachable);
+        let recovery_edge = checking
+            .deferred_cleanup_edges
+            .iter()
+            .find(|edge| edge.exited_blocks == [recover.body.id])
+            .expect("a later valid defer should survive earlier call recovery");
+        assert_eq!(recovery_edge.registrations, [valid.id]);
+
+        let unreachable = function(&program.declarations[2]);
+        let unreachable_defer = &unreachable.body.statements[1];
+        assert!(!checking.resolved_deferred_calls[&unreachable_defer.id].reachable);
+        assert!(!checking
+            .deferred_cleanup_edges
+            .iter()
+            .any(|edge| edge.registrations.contains(&unreachable_defer.id)));
+    }
+
+    #[test]
+    fn retains_defer_metadata_for_generated_methods_and_runtime_specializations() {
+        let source = concat!(
+            "fn clean() {}\n",
+            "fn Box(comptime T: type) -> type {\n",
+            "    struct { inner: T, fn dispose(self) { defer clean(); } }\n",
+            "}\n",
+            "fn generic(comptime T: type) { defer clean(); }\n",
+            "fn main() {\n",
+            "    Box(int) { inner: 1 }.dispose();\n",
+            "    generic(int);\n",
+            "}\n",
+        );
+        let (module, program, names, context, mut types, signatures) = prepare(source);
+        let checking = check(&module, &program, &names, &context, &mut types, &signatures);
+        assert!(checking.errors.is_empty(), "{:#?}", checking.errors);
+
+        assert!(checking.generated_methods.values().any(|method| {
+            method.checking.resolved_deferred_calls.len() == 1
+                && method.checking.deferred_cleanup_edges.len() == 1
+        }));
+        assert_eq!(checking.runtime_specializations.len(), 1);
+        let specialization = &checking.runtime_specializations[0];
+        assert_eq!(specialization.checking.resolved_deferred_calls.len(), 1);
+        assert_eq!(specialization.checking.deferred_cleanup_edges.len(), 1);
     }
 }

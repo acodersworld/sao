@@ -5,7 +5,7 @@ follow it. The stable inventory of implemented features lives in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the design documents
 remain the language specification.
 
-Last reviewed: 2026-09-01
+Last reviewed: 2026-09-03
 
 Maintenance rule: update this file as part of completing every phase or
 independently reviewable change. Mark the completed item accurately, summarize
@@ -787,7 +787,7 @@ reviewable phases:
          verification is pending. No formatting was run.
        - Reviewed and completed. Stop for commit before implementing lexical
          defer.
-     - Change 6, lexical defer:
+     - Change 6, lexical defer (complete):
        - Type-check the call wrapped by `defer`, evaluating and saving its
          function value or receiver and arguments immediately while discarding
          the eventual result. Associate each registration with its innermost
@@ -803,7 +803,30 @@ reviewable phases:
        - Add focused tests for nested scopes, conditional registration, LIFO
          order, each exit kind, loop iterations, yielding cleanup calls,
          panic/non-unwinding behavior, recovery, and lowering-facing metadata.
-       - Stop for review and commit before final type-checking integration.
+       - Implemented deferred-call checking through the ordinary call path.
+         Successful registrations are associated with the innermost executable
+         block, produce unit statements, discard the eventual result, and retain
+         the resolved target plus source-ordered callable or receiver and
+         argument values, transfers, physical places, and tracked origins.
+       - Cleanup metadata records innermost-first exited blocks and LIFO
+         registrations for normal completion, return, break, continue, and the
+         Error path of postfix `?`. Return, break, block-result, and propagation
+         operands are identified for evaluation before cleanup; panic and other
+         divergence have no cleanup edge.
+       - Callable and lambda analysis isolate defer stacks, loop transfers stop
+         at the target iteration body, speculative loop checking retains only
+         the stable metadata pass, and unreachable registrations remain typed
+         but are excluded from runtime cleanup lists. Generated-method and
+         runtime-specialization checking retain the same local metadata.
+       - Added focused source coverage for callable values, methods, tracked
+         arguments, yielding calls, nested and conditional scopes, LIFO order,
+         normal/return/break/continue/Error exits, transfer ordering,
+         panic/non-unwinding behavior, diagnostics, recovery, unreachable code,
+         unit statement typing, and lowering-facing metadata.
+       - Compilation and test execution were not requested for this change, so
+         verification is pending. No formatting was run.
+       - Reviewed and completed. Stop for commit before final type-checking
+         integration.
      - Change 7, diagnostics and type-checking completion:
        - Audit all Phase 7.7 paths for deterministic source-ordered diagnostics
          and complete successful semantic metadata for expressions, bindings,

@@ -8,7 +8,7 @@ The design documents remain the language specification, and the source remains
 the implementation. Periodically compare all three and update this file when
 their status diverges.
 
-Last reviewed: 2026-09-01
+Last reviewed: 2026-09-02
 
 ## Lexer status
 
@@ -230,8 +230,14 @@ layout, success ownership, propagated return conversion and transfer, and the
 conditional callable-exit edge. Error propagation supports the built-in Error
 payload widening, preserves tracked origins, validates borrow-containing return
 sources, and releases active narrowing locks only on the error path. Lexical
-cleanup on this edge remains part of the later `defer` integration. Coroutine
-starts type-check their wrapped call with the ordinary callee, receiver,
+`defer` registrations type-check their wrapped calls immediately, retain the
+resolved target and source-ordered saved callable or receiver and arguments,
+and discard the eventual result. Cleanup metadata preserves block ownership and
+LIFO order on normal completion, return, break, continue, and Error propagation,
+with transfer values evaluated first and no unwinding edge for panic. Saved
+values retain transfers, physical places, and tracked origins for post-type
+escape analysis and later lowering. Coroutine starts type-check their wrapped
+call with the ordinary callee, receiver,
 argument, and transfer rules, produce a unit statement, and discard every
 eventual result. Successful starts retain the resolved call target and the
 source-ordered prepared callable value or receiver and runtime arguments,
